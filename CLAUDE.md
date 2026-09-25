@@ -34,6 +34,26 @@ over TLS с ACL) через `ufw`. Правила `1883/tcp` и `9001/tcp` в `u
 трогать firewall/сервисы за пределами `home-proxy` без явного запроса
 нельзя.
 
+## Правила публичного репозитория
+
+Этот каталог — основной рабочий и одновременно публичный клон
+github.com/sinushkin/home-proxy. Всё, что попадает в git, видят все:
+
+- В коммитируемых файлах (код, доки, конфиги, тесты) **никаких реальных IP,
+  ключей, GUID'ов, сертификатов**. Вместо адресов — документационные
+  плейсхолдеры: `203.0.113.10` (`profit`), `203.0.113.20` (`ruhor`),
+  `198.51.100.7` (домашний WAN). Реальные адреса лежат только в SSH-алиасах
+  (`~/.ssh/config`) и в игнорируемых файлах.
+- Локальные секреты живут в `.gitignore`-путях: `hp-backend/{peer,server}/.env`,
+  `cert/out/`, `wireguard/out/`, `android-vpn/local.properties`,
+  `android-vpn/app/src/main/{assets,jniLibs}/`. Перед `git add` смотреть
+  `git status`, не использовать `git add -A` вслепую.
+- Коммиты — с публичной личностью, глобальный git config не менять:
+  `git -c user.name=sinushkin -c user.email=sinushkin@users.noreply.github.com commit ...`.
+- Коммитить и пушить только по явной просьбе.
+- Старый репозиторий `~/home-proxy` (полная история, без remote) — архив,
+  не удалять и не править.
+
 ## Структура репозитория
 
 - `hp-backend/` — Cargo workspace (корень — `hp-backend/Cargo.toml`). Все
