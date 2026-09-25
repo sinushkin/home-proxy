@@ -195,7 +195,8 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   служба после туннеля, обход VPN для STUN), `uninstall.ps1`, `stun-bypass.ps1`
   (если маршрут до STUN идёт не через физический адаптер, добавляет /32-маршрут
   через физический шлюз; `-WhatIf`, `-Remove`). PowerShell-файлы — UTF-8 **с BOM**
-  (иначе PowerShell 5.1 ломает кириллицу). `windows/README.md`.
+  (иначе PowerShell 5.1 ломает кириллицу); NAT — `New-NetNat` или ICS (`-Nat`). `windows/README.md`,
+  `server/WINDOWS.md`.
 - `wireguard/` — схема «телефон -> дыры -> этот ПК -> интернет» без роутера:
   `gen.sh` (ключи и конфиги WireGuard, GUID'ы; результат в `wireguard/out/`, в git
   не попадает) и README по пунктам (WireGuard `wghp` на ПК, прокси-служба
@@ -326,9 +327,9 @@ NAT/провайдерами.
   тестовая Windows-машина: Rust MSVC и git есть, `protoc` лежит в
   `C:\Users\user\tools\protoc`, исходники синхронизируем `tar` через ssh в
   `C:\Users\user\home-proxy` и собираем там (`set PROTOC=…`, `cargo build --release -p server`).
-  WireGuard для Windows установлен, но `New-NetNat` не работает (нет WMI-провайдера
-  NetNat даже с включённым Containers), поэтому `install.ps1` проверялся с
-  `-SkipNat`; выход в интернет через NAT на этой ВМ не проверен. Сквозная проверка с телефоном на этой ВМ
+  WireGuard для Windows установлен, `New-NetNat` не работает (нет WMI-провайдера NetNat),
+  поэтому NAT на ВМ — через ICS (`install.ps1 -Nat Auto` выбирает его сам). Ловушки и выводы —
+  `server/WINDOWS.md`. Сквозная проверка с телефоном на этой ВМ
   проходила (дыры 10/10, рукопожатие WireGuard, ping туннеля) с отдельной парой из
   `wireguard/out/win/` (`WG_OUT_DIR=out/win ./gen.sh`). Скрипты для
   PowerShell через ssh запускаем как `-File` (stdin-режим ломает многострочные блоки).

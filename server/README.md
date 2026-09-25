@@ -55,7 +55,7 @@ cp .env.example .env     # MY_ID, PEER_ID, адреса, ca.crt
 (`server install --config server.env`, `server uninstall`). Настройки службы — файл
 `server.env` (`--config`, по умолчанию `server.env` рядом с бинарником; переменные окружения
 главнее файла, относительные пути — от каталога файла). Установка целиком (WireGuard, NAT,
-обход VPN для STUN) — `../windows/README.md`.
+обход VPN для STUN) — `../windows/README.md`, ловушки и выводы — [`WINDOWS.md`](WINDOWS.md).
 
 ## Проверка
 

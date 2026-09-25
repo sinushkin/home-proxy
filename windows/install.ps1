@@ -11,7 +11,11 @@
   (там приватный ключ). PostUp/PostDown из wghp.conf отбрасываются: WireGuard для Windows
   скрипты не запускает, NAT настраивает этот скрипт (New-NetNat).
 
-  Требования: права администратора, WireGuard для Windows (wireguard.exe), NetNat.
+  NAT: -Nat Auto (по умолчанию) берёт New-NetNat, а если он недоступен (на некоторых
+  системах нет WMI-провайдера NetNat), общий доступ к интернету (ICS: подсеть туннеля
+  должна быть /24). -Nat None (или -SkipNat) — NAT настроен иначе.
+
+  Требования: права администратора, WireGuard для Windows (wireguard.exe).
   Скрипт можно запускать повторно: старая установка заменяется.
 #>
 #Requires -RunAsAdministrator
@@ -19,6 +23,7 @@
 param(
     [string]$SourceDir = $PSScriptRoot,
     [string]$InstallDir = (Join-Path $env:ProgramData 'homeproxy'),
+    [ValidateSet('Auto', 'NetNat', 'Ics', 'None')][string]$Nat = 'Auto',
     [switch]$SkipNat,
     [switch]$SkipStunBypass
 )
@@ -26,6 +31,47 @@ $ErrorActionPreference = 'Stop'
 $wireguard = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
 $tunnel = 'wghp'
 $serviceName = 'homeproxy-server'
+
+$icsKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters'
+
+function Get-IcsConnections {
+    $share = New-Object -ComObject HNetCfg.HNetShare
+    foreach ($connection in @($share.EnumEveryConnection)) {
+        [pscustomobject]@{
+            Name   = $share.NetConnectionProps.Invoke($connection).Name
+            Config = $share.INetSharingConfigurationForINetConnection.Invoke($connection)
+        }
+    }
+}
+
+# Общий доступ к интернету (ICS) как NAT, когда New-NetNat недоступен. Адрес ICS
+# (ScopeAddress) задаём равным адресу туннеля, подсеть у ICS всегда /24.
+function Enable-HomeproxyIcs([string]$publicName, [string]$privateName, [string]$address) {
+    Set-ItemProperty $icsKey -Name ScopeAddress -Value $address
+    Set-ItemProperty $icsKey -Name ScopeAddressBackup -Value $address
+    $connections = @(Get-IcsConnections)
+    foreach ($c in $connections | Where-Object { $_.Name -in $publicName, $privateName -and $_.Config.SharingEnabled }) {
+        $c.Config.DisableSharing()
+    }
+    $public = $connections | Where-Object Name -eq $publicName
+    $private = $connections | Where-Object Name -eq $privateName
+    if (-not $public -or -not $private) { throw "ICS: не нашёл подключения '$publicName' и '$privateName'" }
+    try {
+        $public.Config.EnableSharing(0)
+        $private.Config.EnableSharing(1)
+    } catch {
+        throw "ICS не включился ($($_.Exception.Message)). Возможно, общий доступ уже настроен на другом подключении."
+    }
+}
+
+function Disable-HomeproxyIcs([string]$privateName) {
+    $connections = @(Get-IcsConnections)
+    $private = $connections | Where-Object { $_.Name -eq $privateName -and $_.Config.SharingEnabled }
+    if (-not $private) { return }
+    foreach ($c in $connections | Where-Object { $_.Config.SharingEnabled }) { $c.Config.DisableSharing() }
+    Set-ItemProperty $icsKey -Name ScopeAddress -Value '192.168.137.1' -ErrorAction SilentlyContinue
+    Set-ItemProperty $icsKey -Name ScopeAddressBackup -Value '192.168.137.1' -ErrorAction SilentlyContinue
+}
 
 function Remove-HomeproxyService {
     $service = Get-Service $serviceName -ErrorAction SilentlyContinue
@@ -41,11 +87,16 @@ foreach ($name in 'server.exe', 'server.env', 'wghp.conf') {
 if (-not (Test-Path $wireguard)) {
     throw "Нет WireGuard для Windows ($wireguard). Установите: winget install WireGuard.WireGuard (или MSI с wireguard.com)"
 }
-if (-not $SkipNat) {
-    try { Get-NetNat -ErrorAction Stop | Out-Null }
-    catch {
-        throw 'NAT недоступен (Get-NetNat не работает). Обычно он есть в Windows 10/11 Pro; если нет, включите компонент Hyper-V. Либо -SkipNat, если NAT для подсети WireGuard настроен иначе.'
+if ($SkipNat) { $Nat = 'None' }
+if ($Nat -in 'Auto', 'NetNat') {
+    $netnat = $true
+    try { Get-NetNat -ErrorAction Stop | Out-Null } catch { $netnat = $false }
+    if ($netnat) { $Nat = 'NetNat' }
+    elseif ($Nat -eq 'Auto') {
+        $Nat = 'Ics'
+        Write-Warning 'New-NetNat недоступен (нет WMI-провайдера NetNat), использую общий доступ к интернету (ICS)'
     }
+    else { throw 'NAT недоступен (Get-NetNat не работает). Используйте -Nat Ics или -Nat None.' }
 }
 $envText = Get-Content (Join-Path $SourceDir 'server.env') -Raw
 $caLine = [regex]::Match($envText, '(?m)^\s*(?:export\s+)?MQTT_CA\s*=\s*(.+?)\s*$')
@@ -57,6 +108,7 @@ if (-not [IO.Path]::IsPathRooted($ca) -and -not (Test-Path (Join-Path $SourceDir
 
 # 2. Убираем прежнюю установку.
 Remove-HomeproxyService
+Disable-HomeproxyIcs $tunnel
 if (Get-Service "WireGuardTunnel`$$tunnel" -ErrorAction SilentlyContinue) {
     & $wireguard /uninstalltunnelservice $tunnel
 }
@@ -89,7 +141,7 @@ for ($i = 0; $i -lt 30 -and -not $adapter; $i++) {
 if (-not $adapter) { throw "Адаптер $tunnel не появился: проверьте конфиг $confPath и журнал службы WireGuardTunnel`$$tunnel" }
 
 # 5. Пересылка и NAT для подсети туннеля.
-if (-not $SkipNat) {
+if ($Nat -ne 'None') {
     $address = [regex]::Match(($conf -join "`n"), '(?m)^\s*Address\s*=\s*(\d+\.\d+\.\d+\.\d+)/(\d+)')
     if (-not $address.Success) { throw 'В wghp.conf нет Address = ip/маска' }
     $prefixLength = [int]$address.Groups[2].Value
@@ -102,11 +154,19 @@ if (-not $SkipNat) {
     $exit = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 |
         Where-Object { $_.ifIndex -ne $adapter.ifIndex -and $_.NextHop -ne '0.0.0.0' } |
         Sort-Object RouteMetric | Select-Object -First 1
-    foreach ($index in $adapter.ifIndex, $exit.ifIndex) {
-        Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -Forwarding Enabled
+    if ($Nat -eq 'NetNat') {
+        foreach ($index in $adapter.ifIndex, $exit.ifIndex) {
+            Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -Forwarding Enabled
+        }
+        New-NetNat -Name homeproxy -InternalIPInterfaceAddressPrefix "$network/$prefixLength" | Out-Null
+        Write-Host "NAT (NetNat): $network/$prefixLength наружу через интерфейс $($exit.ifIndex)"
     }
-    New-NetNat -Name homeproxy -InternalIPInterfaceAddressPrefix "$network/$prefixLength" | Out-Null
-    Write-Host "NAT: $network/$prefixLength наружу через интерфейс $($exit.ifIndex)"
+    else {
+        if ($prefixLength -ne 24) { throw "ICS работает только с подсетью /24, а в wghp.conf /$prefixLength" }
+        $publicName = (Get-NetAdapter -InterfaceIndex $exit.ifIndex).Name
+        Enable-HomeproxyIcs $publicName $tunnel $address.Groups[1].Value
+        Write-Host "NAT (ICS): '$tunnel' -> '$publicName', адрес $($address.Groups[1].Value)"
+    }
 }
 
 # 6. Брандмауэр: входящий UDP для server.exe (ответы пира на дыры).

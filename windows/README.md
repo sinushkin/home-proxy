@@ -17,9 +17,9 @@
 
 - Windows 10/11 Pro, права администратора, PowerShell 5.1 (штатный).
 - [WireGuard для Windows](https://www.wireguard.com/install/): `winget install WireGuard.WireGuard`.
-- NAT-модуль `NetNat` (`New-NetNat`). На обычной Windows он есть; проверка:
-  `Get-NetNat` не должен падать с «Недопустимый класс». Если падает, включите компонент
-  Windows **Hyper-V** или запустите `install.ps1 -SkipNat` и настройте NAT сами.
+- NAT: `New-NetNat` (на обычной Windows он есть, проверка: `Get-NetNat` не должен падать с
+  «Недопустимый класс»). Если его нет, `install.ps1` сам возьмёт общий доступ к интернету
+  (ICS, подсеть туннеля должна быть `/24`). Режим задаёт `-Nat Auto|NetNat|Ics|None`.
 - Ключи и GUID'ы: `wireguard/gen.sh` на Linux (нужен `wg`), результат в `wireguard/out/`.
 - `server.exe`. Собирается на самой Windows: Rust (MSVC), [`protoc`](https://github.com/protocolbuffers/protobuf/releases)
   в `PATH` или в `PROTOC`, затем из корня репозитория:
@@ -51,7 +51,7 @@ Get-Content C:\ProgramData\homeproxy\server.log -Tail 20 -Wait
 ```
 
 Всё копируется в `C:\ProgramData\homeproxy` (доступ только SYSTEM и администраторам:
-там приватный ключ). Параметры: `-InstallDir`, `-SkipNat` (NAT настроен иначе),
+там приватный ключ). Параметры: `-InstallDir`, `-Nat` (по умолчанию `Auto`), `-SkipNat` = `-Nat None` (NAT настроен иначе),
 `-SkipStunBypass`. Скрипт можно запускать повторно (обновление конфигов и `server.exe`).
 
 Сама служба управляется и без скриптов: `server.exe install --config C:\путь\server.env`
@@ -104,6 +104,10 @@ powershell -ExecutionPolicy Bypass -File C:\ProgramData\homeproxy\uninstall.ps1
   рукопожатие через дыры (`wg show wghp`: `latest handshake`, `endpoint: 127.0.0.1:<порт клиента>`),
   `ping 10.77.0.1` с телефона — 4 из 4, `ttl=128`.
 
-**Не проверено:** NAT и выход в интернет. На тестовой ВМ `New-NetNat` не работает (нет
-WMI-провайдера NetNat даже с компонентом Containers), поэтому `install.ps1` запускался с
-`-SkipNat`: трафик доходит до туннеля на ПК, но дальше в интернет не выходит.
+- NAT через ICS (на ВМ `New-NetNat` недоступен): с телефона через туннель проходят
+  `ping 8.8.8.8` и `ping google.com`; настройки ICS переживают перезагрузку, `uninstall.ps1`
+  их снимает.
+
+**Не проверено:** путь через `New-NetNat` (на ВМ его нет) и устойчивость дыр на точке доступа
+iPhone (симметричный NAT): в части прогонов дыры пропадали. Подробности и ловушки — в
+[`../server/WINDOWS.md`](../server/WINDOWS.md).
