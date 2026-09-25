@@ -97,6 +97,16 @@
 
 ## Тестовая ВМ `win`
 
+- **WSL2 внутри ВМ.** При `<cpu mode='host-passthrough'>` на i7-14700HX компонент
+  `VirtualMachinePlatform` откатывался после каждой перезагрузки (а первая загрузка после
+  включения зависала на логотипе), WSL2 не создавал ВМ (`CreateVm/HCS/ERROR_NOT_SUPPORTED`). Помогла
+  замена процессора ВМ на `<cpu mode='custom' match='exact' check='partial'><model
+  fallback='allow'>Skylake-Client-noTSX-IBRS</model><feature policy='require'
+  name='vmx'/></cpu>` (серверные модели Skylake на этом хосте недоступны: нет AVX-512; исходный XML
+  сохранён в `~/rudesktop-win.xml.bak-*`). После этого `VirtualMachinePlatform` держится, WSL2
+  работает. Подсказка нашлась в разборе Red Pill Linpro: на моделях выше Broadwell вложенный
+  Hyper-V может не идти дальше логотипа.
+
 - libvirt-ВМ (`rudesktop-win`) на этом ПК, SSH-алиас `win` (ключ добавлен в
   `C:\ProgramData\ssh\administrators_authorized_keys`), оболочка `cmd`.
 - PowerShell-скрипты запускайте как `-File` (передача многострочных блоков через stdin

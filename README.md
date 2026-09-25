@@ -90,6 +90,8 @@ sequenceDiagram
 |---|---|
 | `hp-backend/` | Rust-библиотеки: протокол и пробив (`connection`), логи, ядро и JNI для Android; `peer` для живых проверок |
 | `server/`, `router/` | исполняемые файлы: служба на домашнем ПК (дыры → WireGuard) и релей для OpenWrt |
+| `control/` | (описание) пульт управления: протокол по TCP, трей на Slint, сопряжение по QR с Android |
+| `wsl/` | лёгкий образ Alpine для WSL2: WireGuard, NAT и `server` внутри WSL |
 | `windows/` | установка службы на Windows (WireGuard, NAT, обход VPN для STUN) |
 | `android-vpn/` | приложение для Android (Kotlin) |
 | `wireguard/` | ключи, конфиги и служба на домашнем ПК |

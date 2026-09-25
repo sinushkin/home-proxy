@@ -1,0 +1,24 @@
+#!/bin/sh
+# Запускается WSL при старте дистрибутива ([boot] в /etc/wsl.conf): поднимает WireGuard
+# с NAT и следит за службой server (перезапуск при падении). Настройки — /etc/homeproxy.
+CONF=/etc/homeproxy
+LOG=/var/log/homeproxy.log
+
+[ -f "$CONF/server.env" ] && [ -f "$CONF/wghp.conf" ] || {
+    echo "home-proxy: нет $CONF/server.env и $CONF/wghp.conf, служба не запущена" >> "$LOG"
+    exit 0
+}
+
+sysctl -qw net.ipv4.ip_forward=1
+mkdir -p /etc/wireguard
+install -m 600 "$CONF/wghp.conf" /etc/wireguard/wghp.conf
+wg-quick down wghp >/dev/null 2>&1
+wg-quick up wghp >> "$LOG" 2>&1 || echo "home-proxy: wg-quick up не удался (см. выше)" >> "$LOG"
+
+(
+    while true; do
+        /usr/local/bin/homeproxy-server --config "$CONF/server.env" >> "$LOG" 2>&1
+        echo "home-proxy: server завершился ($?), перезапуск через 5 с" >> "$LOG"
+        sleep 5
+    done
+) &

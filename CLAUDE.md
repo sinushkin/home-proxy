@@ -192,6 +192,14 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   `server install --config …` / `uninstall` / `--service` (запуск диспетчером служб,
   остановка по SCM). Читатель ответов моста переживает рестарт WireGuard
   (`ConnectionReset`/`ConnectionRefused` — не конец клиента). `server/README.md`.
+- `control/` — только описание (`README.md`): протокол управления (тот же protobuf, без XOR, TCP в
+  «демилитаризованной зоне»: loopback или доверенная LAN), трей на Slint, показ QR с пакетом
+  сопряжения и его сканирование в Android. Кода пока нет; `server`/`router` от него не зависят.
+- `wsl/` — образ для WSL2 (Alpine + `wireguard-tools` + `iptables` + статический `server`): `Dockerfile`,
+  `build.sh` (→ `wsl/out/homeproxy-wsl.tar.gz`, в git нет), `rootfs/` (`wsl.conf` с `[boot] command`,
+  `homeproxy-start`/`homeproxy-stop`). Настройки — `/etc/homeproxy/{server.env,wghp.conf,ca.crt}`.
+  Проверен в контейнере и в настоящем WSL2 на тестовой ВМ (пробив 10/10 с VPS); дистрибутив надо
+  удерживать сессией `wsl.exe`, иначе WSL останавливает его вместе со `server`. `wsl/README.md`.
 - `windows/` — установка службы на Windows: `install.ps1` (WireGuard-туннель `wghp`
   из `wghp.conf` без PostUp/PostDown, NAT через `New-NetNat`, правило брандмауэра,
   служба после туннеля, обход VPN для STUN), `uninstall.ps1`, `stun-bypass.ps1`
