@@ -1,0 +1,23 @@
+.env
+
+# Rust
+hp-backend/target/
+
+# Лок-файлы сессий Claude Code
+.claude/*.lock
+cert/out/
+
+# Android
+hp-backend/target-android/
+android-vpn/.gradle/
+android-vpn/build/
+android-vpn/app/build/
+android-vpn/local.properties
+android-vpn/app/src/main/jniLibs/
+android-vpn/app/src/main/assets/ca.crt
+*.iml
+android-vpn/.kotlin/
+
+# WireGuard: ключи и конфиги (секретные)
+wireguard/out/
+android-vpn/app/src/main/assets/wg.conf

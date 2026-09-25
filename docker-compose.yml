@@ -1,0 +1,30 @@
+services:
+  stun:
+    image: coturn/coturn:latest
+    container_name: stun-server
+    restart: unless-stopped
+    ports:
+      - "${STUN_PORT:-3499}:3499/udp"
+      - "${STUN_PORT:-3499}:3499/tcp"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+
+  mqtt:
+    image: eclipse-mosquitto:2.1.2-alpine
+    container_name: mosquitto-server
+    restart: unless-stopped
+    ports:
+      - "${MQTT_TLS_PORT:-8883}:8883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config:ro
+      # Файлами, а не каталогом: ca.key в контейнер попадать не должен.
+      - ./cert/out/ca.crt:/mosquitto/certs/ca.crt:ro
+      - ./cert/out/server.crt:/mosquitto/certs/server.crt:ro
+      - ./cert/out/server.key:/mosquitto/certs/server.key:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:

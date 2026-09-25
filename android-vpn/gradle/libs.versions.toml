@@ -1,0 +1,15 @@
+[versions]
+agp = "8.13.1"
+kotlin = "2.0.21"
+wireguard = "1.0.20260102"
+junit = "4.13.2"
+desugar = "2.1.5"
+
+[libraries]
+wireguard-tunnel = { group = "com.wireguard.android", name = "tunnel", version.ref = "wireguard" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+desugar-jdk-libs = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

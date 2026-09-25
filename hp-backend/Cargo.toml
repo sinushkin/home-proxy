@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["connection", "peer", "router", "server", "logging", "client", "android-lib"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+prost = "0.13"
+prost-build = "0.13"
+rumqttc = "0.24"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+# Без дефолтной фичи regex (фильтр логов по тексту): фильтр по модулям в RUST_LOG остаётся,
+# а regex-крейты (~четверть кода бинарника) не линкуются.
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+anyhow = "1"
+libc = "0.2"
+jni = "0.21"
+# Без дефолтной фичи regex (как у env_logger): фильтр по модулям остаётся, размер меньше.
+android_logger = { version = "0.15", default-features = false }

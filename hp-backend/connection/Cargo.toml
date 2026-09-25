@@ -1,0 +1,16 @@
+[package]
+name = "connection"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+prost = { workspace = true }
+rumqttc = { workspace = true }
+uuid = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
