@@ -26,3 +26,4 @@ android-vpn/app/src/main/assets/wg.conf
 
 # Образ WSL2 (сборка wsl/build.sh)
 wsl/out/
+/target-musl/

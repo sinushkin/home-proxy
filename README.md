@@ -98,6 +98,8 @@ sequenceDiagram
 | `cert/`, `mosquitto/`, `coturn/` | TLS, MQTT-брокер и STUN для рандеву-сервера |
 | `OpenWRT/`, `iPhone/` | сборка под роутеры; заметки про iOS |
 
+Замеры скорости и восстановление порядка пакетов — [`Performance.md`](Performance.md).
+
 Устройство протокола — [`hp-backend/connection/README.md`](hp-backend/connection/README.md) и [`CLAUDE.md`](CLAUDE.md).
 
 ## TODO

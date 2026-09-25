@@ -58,6 +58,8 @@ fn parse_config(
         my_id: my_id.trim().parse::<Uuid>().context("мой GUID некорректен")?,
         peer_id: peer_id.trim().parse::<Uuid>().context("GUID роутера некорректен")?,
         local_port: u16::try_from(local_port).context("локальный порт вне 0..=65535")?,
+        reorder_wait_ms: hp_client::DEFAULT_REORDER_WAIT.as_millis() as u32,
+        data_holes: 0,
     })
 }
 
@@ -145,12 +147,14 @@ pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeStart<'local>(
     my_id: JString<'local>,
     peer_id: JString<'local>,
     local_port: jint,
+    reorder_ms: jint,
+    data_holes: jint,
 ) -> jstring {
     init_logging();
     let outcome: Result<()> = guarded(
         |message| Err(anyhow::anyhow!(message)),
         || {
-            let config = parse_config(
+            let mut config = parse_config(
                 &read(&mut env, &stun)?,
                 &read(&mut env, &mqtt)?,
                 &read(&mut env, &ca_pem)?,
@@ -158,6 +162,8 @@ pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeStart<'local>(
                 &read(&mut env, &peer_id)?,
                 local_port,
             )?;
+            config.reorder_wait_ms = u32::try_from(reorder_ms).context("reorderMs: ожидается 0 или больше")?;
+            config.data_holes = u8::try_from(data_holes).context("dataHoles: ожидается 0..=255")?;
             start(config)
         },
     );

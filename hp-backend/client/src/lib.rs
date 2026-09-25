@@ -4,6 +4,7 @@
 
 pub mod bridge;
 
+pub use connection::multilink::DEFAULT_REORDER_WAIT;
 pub use connection::stun::parse_servers as parse_stun_servers;
 
 use std::fmt;
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use bridge::Bridge;
-use connection::multilink::{MultiLink, TARGET_LINKS};
+use connection::multilink::{MultiLink, MultiLinkOptions, TARGET_LINKS};
 use connection::relay::PlainOut;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -31,6 +32,11 @@ pub struct ClientConfig {
     pub peer_id: Uuid,
     /// Порт локального моста на 127.0.0.1 (0 — любой свободный).
     pub local_port: u16,
+    /// Сколько миллисекунд ждать недостающий пакет WireGuard при восстановлении порядка
+    /// (0 — не восстанавливать).
+    pub reorder_wait_ms: u32,
+    /// Через сколько дыр слать данные (0 — через все живые).
+    pub data_holes: u8,
 }
 
 /// Снимок состояния для показа пользователю.
@@ -67,13 +73,19 @@ impl Client {
             .await
             .with_context(|| format!("не удалось занять локальный порт {}", config.local_port))?;
 
-        let (multilink, incoming) = MultiLink::start(
+        let options = MultiLinkOptions {
+            reorder_wait: std::time::Duration::from_millis(u64::from(config.reorder_wait_ms)),
+            data_holes: config.data_holes,
+            local_port_base: 0,
+        };
+        let (multilink, incoming) = MultiLink::start_with(
             "",
             config.stun_addrs,
             config.mqtt_addr,
             config.mqtt_ca_pem,
             config.my_id,
             config.peer_id,
+            options,
         )
         .await?;
         let multilink = Arc::new(multilink);

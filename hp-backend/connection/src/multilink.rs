@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
@@ -32,6 +32,7 @@ use crate::label::Label;
 use crate::link_id::PeerLinkId;
 use crate::port_utils;
 use crate::proto::{LinkStat, Rendezvous, WrappedData};
+use crate::reorder::{ReorderStats, Resequencer};
 use crate::punch::{self, LinkEvent, LinkSender, PeerIdentity, PeerLinkStat, PunchConfig};
 use crate::rendezvous::{self, PeerSession, Registrar};
 use crate::stun;
@@ -267,12 +268,52 @@ enum Announce {
 }
 
 /// Запущенный менеджер.
+/// Сколько ждём недостающий пакет WireGuard, прежде чем отдать накопленное дальше.
+pub const DEFAULT_REORDER_WAIT: Duration = Duration::from_millis(8);
+
+/// Настройки `MultiLink`.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiLinkOptions {
+    /// Начальное ожидание недостающего пакета при восстановлении порядка на приёме
+    /// (`reorder`), дальше оно подстраивается под сеть в пределах 3–30 мс; ноль отключает
+    /// буфер порядка.
+    pub reorder_wait: Duration,
+    /// Сколько дыр использовать для отправки данных: 0 — все живые, `N` — только `N` живых
+    /// дыр с наименьшими номерами слотов (`1` — всё через одну дыру, для замеров и
+    /// отладки; поток тогда не перемешивается).
+    pub data_holes: u8,
+    /// Первый локальный UDP-порт слотов: слот `k` занимает `base + k`. 0 — порты выбирает ОС.
+    /// Нужен, когда брандмауэр пропускает входящий UDP только в известном диапазоне.
+    pub local_port_base: u16,
+}
+
+impl Default for MultiLinkOptions {
+    fn default() -> Self {
+        Self { reorder_wait: DEFAULT_REORDER_WAIT, data_holes: 0, local_port_base: 0 }
+    }
+}
+
+/// Локальный порт слота: `base + slot` или 0 (выбирает ОС), если `base` не задан.
+fn slot_port(base: u16, slot: u8) -> u16 {
+    if base == 0 { 0 } else { base.saturating_add(u16::from(slot)) }
+}
+
+/// Оставляет для отправки не больше `max` слотов с наименьшими номерами (0 — все).
+fn limit_slots(mut slots: Vec<u8>, max: u8) -> Vec<u8> {
+    slots.sort_unstable();
+    if max > 0 {
+        slots.truncate(usize::from(max));
+    }
+    slots
+}
+
 pub struct MultiLink {
     registry: Arc<Mutex<LinkRegistry>>,
     my_peer_id: Uuid,
     peer_id: Uuid,
     picker: Mutex<SlotPicker>,
     wrap_seq: Mutex<SeqCounters>,
+    data_holes: u8,
 }
 
 impl MultiLink {
@@ -286,6 +327,20 @@ impl MultiLink {
         mqtt_ca_pem: Vec<u8>,
         my_peer_id: Uuid,
         peer_id: Uuid,
+    ) -> Result<(Self, mpsc::Receiver<Incoming>)> {
+        Self::start_with(label, stun_addrs, mqtt_addr, mqtt_ca_pem, my_peer_id, peer_id, MultiLinkOptions::default())
+            .await
+    }
+
+    /// То же, что `start`, с явными настройками.
+    pub async fn start_with(
+        label: &str,
+        stun_addrs: Vec<SocketAddr>,
+        mqtt_addr: SocketAddr,
+        mqtt_ca_pem: Vec<u8>,
+        my_peer_id: Uuid,
+        peer_id: Uuid,
+        options: MultiLinkOptions,
     ) -> Result<(Self, mpsc::Receiver<Incoming>)> {
         let label = Label::new(label);
         let (registrar, peer_rx) =
@@ -303,7 +358,7 @@ impl MultiLink {
         let mut redrop_txs: Vec<mpsc::Sender<()>> = Vec::new();
         for slot in 0..TARGET_LINKS {
             let socket = Arc::new(
-                UdpSocket::bind(("0.0.0.0", 0))
+                UdpSocket::bind(("0.0.0.0", slot_port(options.local_port_base, slot)))
                     .await
                     .with_context(|| format!("не удалось создать сокет для слота {slot}"))?,
             );
@@ -336,7 +391,15 @@ impl MultiLink {
         tokio::spawn(demux(peer_rx, slot_txs.clone()));
         tokio::spawn(keepalive_loop(registry.clone()));
         tokio::spawn(stats_loop(registry.clone()));
-        tokio::spawn(control_loop(label.clone(), events_rx, registry.clone(), redrop_txs, slot_txs, incoming_tx));
+        tokio::spawn(control_loop(
+            label.clone(),
+            events_rx,
+            registry.clone(),
+            redrop_txs,
+            slot_txs,
+            incoming_tx,
+            options.reorder_wait,
+        ));
 
         let multilink = Self {
             registry,
@@ -344,6 +407,7 @@ impl MultiLink {
             peer_id,
             picker: Mutex::new(SlotPicker::default()),
             wrap_seq: Mutex::new(SeqCounters::default()),
+            data_holes: options.data_holes,
         };
         Ok((multilink, incoming_rx))
     }
@@ -357,7 +421,7 @@ impl MultiLink {
         );
         let mut links = self.registry.lock().unwrap().links();
         links.sort_by_key(|l| l.slot);
-        let slots: Vec<u8> = links.iter().map(|l| l.slot).collect();
+        let slots = limit_slots(links.iter().map(|l| l.slot).collect(), self.data_holes);
         let picked = self.picker.lock().unwrap().pick(&slots, random_below);
         let Some(slot) = picked else {
             anyhow::bail!("нет живых дыр");
@@ -451,7 +515,8 @@ async fn stats_loop(registry: Arc<Mutex<LinkRegistry>>) {
     }
 }
 
-/// Разбирает события с дыр: статистику пира, `DeleteLink`, `Rendezvous` пира.
+/// Разбирает события с дыр: статистику пира, `DeleteLink`, `Rendezvous` пира. Данные пира
+/// проходят через буфер порядка (`reorder`), если `reorder_wait` не ноль.
 async fn control_loop(
     label: Label,
     mut events: mpsc::Receiver<LinkEvent>,
@@ -459,8 +524,39 @@ async fn control_loop(
     redrop_txs: Vec<mpsc::Sender<()>>,
     slot_txs: Vec<mpsc::Sender<PeerSession>>,
     incoming: mpsc::Sender<Incoming>,
+    reorder_wait: Duration,
 ) {
-    while let Some(event) = events.recv().await {
+    let mut reorder = (!reorder_wait.is_zero()).then(|| Resequencer::adaptive(reorder_wait));
+    let mut stats_tick = tokio::time::interval(REORDER_STATS_INTERVAL);
+    let mut logged = ReorderStats::default();
+    loop {
+        let deadline = reorder.as_ref().and_then(Resequencer::next_deadline);
+        let sleep_until = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        let event = tokio::select! {
+            event = events.recv() => event,
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(sleep_until)), if deadline.is_some() => {
+                if let Some(reorder) = reorder.as_mut() {
+                    for packet in reorder.expire(Instant::now()) {
+                        let _ = incoming.send(packet).await;
+                    }
+                }
+                continue;
+            }
+            _ = stats_tick.tick() => {
+                if let Some(reorder) = reorder.as_ref() {
+                    let now = reorder.stats();
+                    if now != logged {
+                        log::info!(
+                            "{label}порядок пакетов: ожидание {} мс, по порядку {}, переставлено {}, по таймауту {}, опоздавших {}, принудительно {}, прочих {}, макс. придержано {}",
+                            now.wait_ms, now.in_order, now.reordered, now.timed_out, now.late, now.forced, now.passthrough, now.max_held
+                        );
+                        logged = now;
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(event) = event else { break };
         match event {
             LinkEvent::PeerStats(peer_stats) => {
                 log::debug!("получена статистика пира: {} дыр", peer_stats.len());
@@ -482,19 +578,19 @@ async fn control_loop(
                 request_redrop(&redrop_txs, slot);
             }
             LinkEvent::PeerData { slot, payload } => {
-                let _ = incoming.send(Incoming { slot, payload, wrapped: None }).await;
+                deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None }).await;
             }
             LinkEvent::PeerWrapped { slot, wrapped } => {
                 let Ok(client_id) = u8::try_from(wrapped.client_id) else {
                     log::warn!("{label}слот {slot}: WrappedData с client_id {} вне 0..=255", wrapped.client_id);
                     continue;
                 };
-                let incoming_packet = Incoming {
+                let packet = Incoming {
                     slot,
                     payload: wrapped.payload,
                     wrapped: Some(WrappedInfo { client_id, seq: wrapped.seq }),
                 };
-                let _ = incoming.send(incoming_packet).await;
+                deliver(&incoming, &mut reorder, packet).await;
             }
             LinkEvent::PeerRendezvous(r) => {
                 match rendezvous::peer_session_from(&r) {
@@ -505,6 +601,19 @@ async fn control_loop(
         }
     }
 }
+
+/// Отдаёт пакет приложению: через буфер порядка (если включён) или сразу.
+async fn deliver(incoming: &mpsc::Sender<Incoming>, reorder: &mut Option<Resequencer>, packet: Incoming) {
+    let ready = match reorder {
+        Some(reorder) => reorder.push(packet, Instant::now()),
+        None => vec![packet],
+    };
+    for packet in ready {
+        let _ = incoming.send(packet).await;
+    }
+}
+
+const REORDER_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
 fn is_link_bad(registry: &Arc<Mutex<LinkRegistry>>, stat: &PeerLinkStat) -> bool {
     let my_received = registry.lock().unwrap().received_on(stat.slot);
@@ -922,5 +1031,92 @@ mod tests {
     fn jitter_stays_in_bounds() {
         let d = jittered(KEEPALIVE_MIN, KEEPALIVE_MAX);
         assert!(d >= KEEPALIVE_MIN && d < KEEPALIVE_MAX);
+    }
+
+    fn wg_event(counter: u64) -> LinkEvent {
+        let mut payload = vec![0u8; 48];
+        payload[0] = 4;
+        payload[4..8].copy_from_slice(&7u32.to_le_bytes());
+        payload[8..16].copy_from_slice(&counter.to_le_bytes());
+        LinkEvent::PeerData { slot: (counter % 10) as u8, payload }
+    }
+
+    fn counter_of(packet: &Incoming) -> u64 {
+        crate::reorder::parse_transport(&packet.payload).unwrap().1
+    }
+
+    /// Пакеты WireGuard, пришедшие по разным дырам не по порядку, выходят к приложению
+    /// по порядку; пропавший пакет ждём `reorder_wait`, потом отдаём остальное.
+    #[tokio::test]
+    async fn control_loop_restores_wireguard_order_and_skips_a_missing_packet() {
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        let wait = Duration::from_millis(60);
+        tokio::spawn(control_loop(
+            Label::new(""),
+            events_rx,
+            Arc::new(Mutex::new(LinkRegistry::default())),
+            Vec::new(),
+            Vec::new(),
+            incoming_tx,
+            wait,
+        ));
+
+        for counter in [0u64, 2, 1, 3] {
+            events_tx.send(wg_event(counter)).await.unwrap();
+        }
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(counter_of(&tokio::time::timeout(Duration::from_millis(30), incoming_rx.recv()).await.unwrap().unwrap()));
+        }
+        assert_eq!(got, vec![0, 1, 2, 3], "порядок восстановлен без ожидания таймаута");
+
+        // 4 пропал: 5 и 6 придерживаются и выходят только после ожидания
+        events_tx.send(wg_event(5)).await.unwrap();
+        events_tx.send(wg_event(6)).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), incoming_rx.recv()).await.is_err());
+        let first = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv()).await.unwrap().unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(50), incoming_rx.recv()).await.unwrap().unwrap();
+        assert_eq!((counter_of(&first), counter_of(&second)), (5, 6));
+    }
+
+    /// `reorder_wait = 0` отключает буфер: пакеты идут как пришли.
+    #[tokio::test]
+    async fn control_loop_without_reorder_forwards_in_arrival_order() {
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        tokio::spawn(control_loop(
+            Label::new(""),
+            events_rx,
+            Arc::new(Mutex::new(LinkRegistry::default())),
+            Vec::new(),
+            Vec::new(),
+            incoming_tx,
+            Duration::ZERO,
+        ));
+        for counter in [0u64, 2, 1] {
+            events_tx.send(wg_event(counter)).await.unwrap();
+        }
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(counter_of(&tokio::time::timeout(Duration::from_millis(100), incoming_rx.recv()).await.unwrap().unwrap()));
+        }
+        assert_eq!(got, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn limit_slots_keeps_the_lowest_numbers_and_zero_means_all() {
+        assert_eq!(limit_slots(vec![5, 1, 9, 3], 0), vec![1, 3, 5, 9]);
+        assert_eq!(limit_slots(vec![5, 1, 9, 3], 1), vec![1]);
+        assert_eq!(limit_slots(vec![5, 1, 9, 3], 2), vec![1, 3]);
+        assert_eq!(limit_slots(vec![4], 3), vec![4]);
+        assert_eq!(limit_slots(vec![], 1), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn slot_ports_follow_the_base_or_stay_random() {
+        assert_eq!(slot_port(0, 3), 0);
+        assert_eq!(slot_port(51410, 0), 51410);
+        assert_eq!(slot_port(51410, 9), 51419);
     }
 }

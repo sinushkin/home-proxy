@@ -14,6 +14,7 @@ object HomeProxy {
 
     @JvmStatic private external fun nativeStart(
         stun: String, mqtt: String, caPem: String, myId: String, peerId: String, localPort: Int,
+        reorderMs: Int, dataHoles: Int,
     ): String?
 
     @JvmStatic private external fun nativeStop()
@@ -23,7 +24,7 @@ object HomeProxy {
 
     /** Запускает клиента. Возвращает null при успехе, иначе текст ошибки. */
     fun start(config: Config): String? = nativeStart(
-        config.stun, config.mqtt, config.caPem, config.myId, config.peerId, config.localPort,
+        config.stun, config.mqtt, config.caPem, config.myId, config.peerId, config.localPort, config.reorderMs, config.dataHoles,
     )
 
     fun stop() = nativeStop()
@@ -48,5 +49,9 @@ object HomeProxy {
         val peerId: String,
         /** 0 — любой свободный порт. */
         val localPort: Int,
+        /** Сколько мс ждать недостающий пакет WireGuard при восстановлении порядка (0 — не восстанавливать). */
+        val reorderMs: Int,
+        /** Через сколько дыр слать данные (0 — через все живые). */
+        val dataHoles: Int,
     )
 }

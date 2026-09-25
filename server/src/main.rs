@@ -10,7 +10,10 @@
 //!   MY_ID / PEER_ID — GUID сервера и GUID пира: роутера (набор «server» роутера)
 //!   либо телефона, если он подключается напрямую;
 //!   WG_ADDR — адрес WireGuard (по умолчанию 127.0.0.1:51820);
-//!   CLIENT_TIMEOUT_SECS — через сколько секунд тишины клиент удаляется (300).
+//!   CLIENT_TIMEOUT_SECS — через сколько секунд тишины клиент удаляется (300);
+//!   REORDER_WAIT_MS — сколько мс ждать недостающий пакет WireGuard при восстановлении
+//!   порядка на приёме (8; 0 — выключить);
+//!   DATA_HOLES — через сколько дыр слать данные (0 — через все живые, 1 — через одну).
 //!
 //! Логи: `RUST_LOG` (по умолчанию `info`), `LOG_TARGET=syslog` — в syslog,
 //! `LOG_FILE=путь` — в файл.
@@ -32,7 +35,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bridge::{Bridge, ClientKey, Reply};
-use connection::multilink::{MultiLink, TARGET_LINKS};
+use connection::multilink::{MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
 use settings::Settings;
 use uuid::Uuid;
 
@@ -60,6 +63,8 @@ struct Config {
     peer_id: Uuid,
     wg_addr: SocketAddr,
     client_timeout: Duration,
+    reorder_wait: Duration,
+    data_holes: u8,
 }
 
 impl Config {
@@ -81,6 +86,14 @@ impl Config {
                 .parse()
                 .context("WG_ADDR: ожидается ip:порт")?,
             client_timeout: Duration::from_secs(client_timeout_secs),
+            reorder_wait: match get("REORDER_WAIT_MS") {
+                Some(value) => Duration::from_millis(value.parse().context("REORDER_WAIT_MS: ожидается число миллисекунд")?),
+                None => DEFAULT_REORDER_WAIT,
+            },
+            data_holes: match get("DATA_HOLES") {
+                Some(value) => value.parse().context("DATA_HOLES: ожидается число дыр 0..=255")?,
+                None => 0,
+            },
         })
     }
 }
@@ -164,20 +177,23 @@ async fn serve(config: Config) -> Result<()> {
         .with_context(|| format!("не удалось прочитать CA-сертификат {}", config.mqtt_ca.display()))?;
 
     log::info!(
-        "сервер: я {} ищу пира {} (роутер или телефон), WireGuard {}, клиент удаляется через {} с тишины",
+        "сервер: я {} ищу пира {} (роутер или телефон), WireGuard {}, клиент удаляется через {} с тишины, порядок пакетов: ожидание {} мс, дыр для данных: {}",
         config.my_id,
         config.peer_id,
         config.wg_addr,
-        config.client_timeout.as_secs()
+        config.client_timeout.as_secs(),
+        config.reorder_wait.as_millis(),
+        if config.data_holes == 0 { "все".to_string() } else { config.data_holes.to_string() }
     );
 
-    let (link, mut incoming) = MultiLink::start(
+    let (link, mut incoming) = MultiLink::start_with(
         "",
         config.stun_addrs,
         config.mqtt_addr,
         ca_pem,
         config.my_id,
         config.peer_id,
+        MultiLinkOptions { reorder_wait: config.reorder_wait, data_holes: config.data_holes, local_port_base: 0 },
     )
     .await?;
     let link = Arc::new(link);

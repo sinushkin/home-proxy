@@ -49,7 +49,7 @@ class Settings(context: Context) {
     /**
      * Принимает настройки из intent (для проверки из adb):
      * `am start -n ru.homeproxy/.MainActivity --es stun ip:порт --es mqtt ip:порт
-     * --es peerId GUID [--es myId GUID] --ei localPort 51821 [--es wgConfigB64 …]
+     * --es peerId GUID [--es myId GUID] --ei localPort 51821 [--ei reorderMs 8] [--ei dataHoles 1] [--es wgConfigB64 …]
      * --ez autostart true [--ez vpn true]`.
      */
     fun applyExtras(intent: android.content.Intent) {
@@ -62,13 +62,25 @@ class Settings(context: Context) {
             wgConfig = String(android.util.Base64.decode(it, android.util.Base64.DEFAULT))
         }
         if (intent.hasExtra("localPort")) localPort = intent.getIntExtra("localPort", DEFAULT_LOCAL_PORT)
+        if (intent.hasExtra("reorderMs")) reorderMs = intent.getIntExtra("reorderMs", DEFAULT_REORDER_MS)
+        if (intent.hasExtra("dataHoles")) dataHoles = intent.getIntExtra("dataHoles", 0)
     }
+
+    var reorderMs: Int
+        get() = prefs.getInt("reorderMs", DEFAULT_REORDER_MS)
+        set(value) = prefs.edit().putInt("reorderMs", value).apply()
+
+    var dataHoles: Int
+        get() = prefs.getInt("dataHoles", 0)
+        set(value) = prefs.edit().putInt("dataHoles", value).apply()
 
     fun toConfig() = HomeProxy.Config(
         stun = stun, mqtt = mqtt, caPem = caPem(), myId = myId, peerId = peerId, localPort = localPort,
+        reorderMs = reorderMs, dataHoles = dataHoles,
     )
 
     companion object {
         const val DEFAULT_LOCAL_PORT = 51821
+        const val DEFAULT_REORDER_MS = 8
     }
 }
