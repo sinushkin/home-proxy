@@ -55,14 +55,14 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(32, 32, 32, 32)
         }
-        column.addView(label("Мой GUID (дать роутеру как PHONE_<n>_PEER_ID)"))
+        column.addView(label("Мой GUID"))
         column.addView(TextView(this).apply {
             text = settings.myId
             setTextIsSelectable(true)
         })
         stun = field(column, "STUN (ip:порт)", settings.stun)
         mqtt = field(column, "MQTT, TLS (ip:порт)", settings.mqtt)
-        peerId = field(column, "GUID роутера (PHONE_<n>_MY_ID)", settings.peerId)
+        peerId = field(column, "GUID пира (ПК или роутера)", settings.peerId)
         port = field(column, "Порт моста на 127.0.0.1 (endpoint WireGuard)", settings.localPort.toString()).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
         }
