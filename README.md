@@ -69,12 +69,12 @@ sequenceDiagram
 
 ## Что нужно
 
-- **Домашний ПК** (Linux): служба `server` и WireGuard, инструкция — [`wireguard/`](wireguard/README.md).
+- **Домашний ПК**: служба `server` и WireGuard. Linux — [`wireguard/`](wireguard/README.md), Windows — [`windows/`](windows/README.md).
 - **Рандеву-сервер** на любом VPS: STUN и MQTT по TLS, см. [`docker-compose.yml`](docker-compose.yml), [`cert/`](cert/README.md), [`mosquitto/`](mosquitto/README.md).
 - **Телефон**: Android-приложение [`android-vpn/`](android-vpn/README.md) (сначала поднимает дыры, потом включает VPN).
 
 Есть и вариант с роутером OpenWrt посередине (несколько телефонов через один канал к
-серверу): [`OpenWRT/`](OpenWRT/README.md), `hp-backend/router`.
+серверу): [`OpenWRT/`](OpenWRT/README.md), [`router/`](router/README.md).
 
 ## Оговорки
 
@@ -88,7 +88,9 @@ sequenceDiagram
 
 | Каталог | Что |
 |---|---|
-| `hp-backend/` | Rust: протокол и пробив (`connection`), `peer`, `server`, `router`, ядро и JNI для Android |
+| `hp-backend/` | Rust-библиотеки: протокол и пробив (`connection`), логи, ядро и JNI для Android; `peer` для живых проверок |
+| `server/`, `router/` | исполняемые файлы: служба на домашнем ПК (дыры → WireGuard) и релей для OpenWrt |
+| `windows/` | установка службы на Windows (WireGuard, NAT, обход VPN для STUN) |
 | `android-vpn/` | приложение для Android (Kotlin) |
 | `wireguard/` | ключи, конфиги и служба на домашнем ПК |
 | `cert/`, `mosquitto/`, `coturn/` | TLS, MQTT-брокер и STUN для рандеву-сервера |
@@ -98,9 +100,12 @@ sequenceDiagram
 
 ## TODO
 
-- Определять, идёт ли трафик домашнего ПК через VPN, и добавить правила для Linux и
-  Windows, чтобы доступ к STUN шёл напрямую, минуя VPN. Иначе STUN увидит внешний адрес
-  VPN, а не домашний, и пробив по этому адресу не сойдётся.
+- Обход VPN для STUN на Linux: определять, идёт ли трафик домашнего ПК через VPN, и
+  добавлять правило, чтобы STUN шёл напрямую. На Windows это уже есть
+  ([`windows/stun-bypass.ps1`](windows/README.md)); без обхода STUN увидит адрес VPN, а не
+  домашний, и пробив по этому адресу не сойдётся.
+- Проверить на Windows NAT и выход в интернет с телефона (пробив, WireGuard и ping туннеля
+  уже проверены; на тестовой ВМ `New-NetNat` недоступен).
 
 ## Лицензия
 

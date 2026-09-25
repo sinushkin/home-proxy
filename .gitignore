@@ -1,6 +1,7 @@
 .env
 
 # Rust
+/target/
 hp-backend/target/
 
 # Лок-файлы сессий Claude Code
@@ -8,6 +9,7 @@ hp-backend/target/
 cert/out/
 
 # Android
+/target-android/
 hp-backend/target-android/
 android-vpn/.gradle/
 android-vpn/build/

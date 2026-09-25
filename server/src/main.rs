@@ -12,17 +12,28 @@
 //!   WG_ADDR — адрес WireGuard (по умолчанию 127.0.0.1:51820);
 //!   CLIENT_TIMEOUT_SECS — через сколько секунд тишины клиент удаляется (300).
 //!
-//! Логи: `RUST_LOG` (по умолчанию `info`), `LOG_TARGET=syslog` — в syslog.
+//! Логи: `RUST_LOG` (по умолчанию `info`), `LOG_TARGET=syslog` — в syslog,
+//! `LOG_FILE=путь` — в файл.
+//!
+//! Запуск: `server [--config server.env]` — обычный процесс (без `--config` берётся
+//! `server.env` рядом с бинарником, если есть, иначе только окружение).
+//! Windows: `server install --config C:\путь\server.env` регистрирует службу
+//! `homeproxy-server`, `server uninstall` удаляет (см. `windows/README.md`).
 
 mod bridge;
+mod settings;
+#[cfg(windows)]
+mod winsvc;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bridge::{Bridge, ClientKey, Reply};
 use connection::multilink::{MultiLink, TARGET_LINKS};
+use settings::Settings;
 use uuid::Uuid;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -44,7 +55,7 @@ impl Reply for ToPeer {
 struct Config {
     stun_addrs: Vec<SocketAddr>,
     mqtt_addr: SocketAddr,
-    mqtt_ca: String,
+    mqtt_ca: PathBuf,
     my_id: Uuid,
     peer_id: Uuid,
     wg_addr: SocketAddr,
@@ -52,7 +63,8 @@ struct Config {
 }
 
 impl Config {
-    fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+    fn from_settings(settings: &Settings) -> Result<Self> {
+        let get = |name: &str| settings.get(name);
         let need = |name: &str| get(name).with_context(|| format!("не задана переменная {name}"));
         let client_timeout_secs: u64 = match get("CLIENT_TIMEOUT_SECS") {
             Some(value) => value.parse().context("CLIENT_TIMEOUT_SECS: ожидается число секунд")?,
@@ -61,7 +73,7 @@ impl Config {
         Ok(Self {
             stun_addrs: connection::stun::parse_servers(&need("STUN_ADDR")?).context("STUN_ADDR")?,
             mqtt_addr: need("MQTT_ADDR")?.parse().context("MQTT_ADDR: ожидается ip:порт")?,
-            mqtt_ca: need("MQTT_CA")?,
+            mqtt_ca: settings.resolve(&need("MQTT_CA")?),
             my_id: need("MY_ID")?.parse().context("MY_ID: некорректный GUID")?,
             peer_id: need("PEER_ID")?.parse().context("PEER_ID: некорректный GUID")?,
             wg_addr: get("WG_ADDR")
@@ -73,12 +85,83 @@ impl Config {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    hp_logging::init()?;
-    let config = Config::from_env(|name| std::env::var(name).ok())?;
+enum Command {
+    Run,
+    Service,
+    Install,
+    Uninstall,
+}
+
+struct Cli {
+    command: Command,
+    config: Option<PathBuf>,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli> {
+    let mut cli = Cli { command: Command::Run, config: None };
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                cli.config = Some(args.next().context("--config: ожидается путь к файлу")?.into());
+            }
+            "--service" => cli.command = Command::Service,
+            "install" => cli.command = Command::Install,
+            "uninstall" => cli.command = Command::Uninstall,
+            other => anyhow::bail!(
+                "неизвестный аргумент {other}; ожидается [--config файл] или install/uninstall/--service"
+            ),
+        }
+    }
+    Ok(cli)
+}
+
+/// Файл настроек по умолчанию: `server.env` рядом с бинарником, если он есть.
+fn default_config() -> Option<PathBuf> {
+    let path = std::env::current_exe().ok()?.parent()?.join("server.env");
+    path.is_file().then_some(path)
+}
+
+/// Поднимает логи и runtime и гоняет сервер, пока он сам не завершится или не
+/// придёт `shutdown` (остановка службы).
+fn run_blocking(settings: &Settings, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
+    hp_logging::init_with(|name| match name {
+        "LOG_FILE" => settings.get(name).map(|path| settings.resolve(&path).to_string_lossy().into_owned()),
+        _ => settings.get(name),
+    })?;
+    let config = Config::from_settings(settings)?;
+    tokio::runtime::Runtime::new()?.block_on(async {
+        tokio::select! {
+            result = serve(config) => result,
+            () = shutdown => {
+                log::info!("получена команда остановки");
+                Ok(())
+            }
+        }
+    })
+}
+
+fn main() -> Result<()> {
+    let cli = parse_args(std::env::args().skip(1))?;
+    let config = cli.config.clone().or_else(default_config);
+    match cli.command {
+        Command::Run => run_blocking(&Settings::load(config.as_deref())?, std::future::pending()),
+        #[cfg(windows)]
+        Command::Service => winsvc::run_dispatcher(config),
+        #[cfg(windows)]
+        Command::Install => winsvc::install(cli.config),
+        #[cfg(windows)]
+        Command::Uninstall => winsvc::uninstall(),
+        #[cfg(not(windows))]
+        Command::Service | Command::Install | Command::Uninstall => {
+            anyhow::bail!("служба поддерживается только на Windows")
+        }
+    }
+}
+
+async fn serve(config: Config) -> Result<()> {
     let ca_pem = std::fs::read(&config.mqtt_ca)
-        .with_context(|| format!("не удалось прочитать CA-сертификат {}", config.mqtt_ca))?;
+        .with_context(|| format!("не удалось прочитать CA-сертификат {}", config.mqtt_ca.display()))?;
 
     log::info!(
         "сервер: я {} ищу пира {} (роутер или телефон), WireGuard {}, клиент удаляется через {} с тишины",
@@ -135,4 +218,34 @@ async fn main() -> Result<()> {
     }
     log::warn!("канал входящих закрыт, выходим");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_arguments_means_plain_run() {
+        let cli = parse_args(args(&[])).unwrap();
+        assert!(matches!(cli.command, Command::Run));
+        assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn install_takes_a_config_path() {
+        let cli = parse_args(args(&["install", "--config", "C:\\hp\\server.env"])).unwrap();
+        assert!(matches!(cli.command, Command::Install));
+        assert_eq!(cli.config, Some(PathBuf::from("C:\\hp\\server.env")));
+    }
+
+    #[test]
+    fn service_flag_and_bad_arguments() {
+        assert!(matches!(parse_args(args(&["--service"])).unwrap().command, Command::Service));
+        assert!(parse_args(args(&["--config"])).is_err());
+        assert!(parse_args(args(&["--nope"])).is_err());
+    }
 }

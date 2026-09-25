@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["connection", "peer", "router", "server", "logging", "client", "android-lib"]
+members = [
+    "hp-backend/connection",
+    "hp-backend/peer",
+    "hp-backend/logging",
+    "hp-backend/client",
+    "hp-backend/android-lib",
+    "server",
+    "router",
+]
 
 [workspace.package]
 edition = "2024"
@@ -21,3 +29,5 @@ libc = "0.2"
 jni = "0.21"
 # Без дефолтной фичи regex (как у env_logger): фильтр по модулям остаётся, размер меньше.
 android_logger = { version = "0.15", default-features = false }
+# Служба Windows для server (SCM: запуск, остановка, установка).
+windows-service = "0.8"

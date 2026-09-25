@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
+use std::io::ErrorKind;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -173,6 +174,12 @@ async fn read_replies<R: Reply>(
                     log::debug!("клиент {client}: ответ {len} байт потерян: {e:#}");
                 }
             }
+            // ICMP «порт недоступен» от остановленного WireGuard'а приходит ошибкой на
+            // следующем приёме (Windows: ConnectionReset, Linux: ConnectionRefused);
+            // это не конец клиента: WireGuard может подняться снова.
+            Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused) => {
+                log::debug!("клиент {client}: WireGuard не слушает ({e}), ждём его");
+            }
             Err(e) => {
                 log::warn!("клиент {client}: ошибка приёма от WireGuard: {e}");
                 return;
@@ -302,5 +309,28 @@ mod tests {
             timeout(Duration::from_millis(200), replies.recv()).await.is_err(),
             "пакет не от WireGuard дошёл до клиента"
         );
+    }
+
+    #[tokio::test]
+    async fn client_survives_wireguard_restart() {
+        let (wg, wg_addr) = fake_wireguard().await;
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let bridge = Bridge::new(wg_addr, Collect(tx), Duration::from_secs(60));
+        bridge.send_to_wireguard(ClientKey::Direct, b"one").await.unwrap();
+        let (_, from) = recv(&wg).await;
+
+        drop(wg);
+        for _ in 0..3 {
+            bridge.send_to_wireguard(ClientKey::Direct, b"into the void").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let wg = UdpSocket::bind(wg_addr).await.unwrap();
+        bridge.send_to_wireguard(ClientKey::Direct, b"two").await.unwrap();
+        let (payload, from_again) = recv(&wg).await;
+        assert_eq!((payload.as_slice(), from_again), (&b"two"[..], from), "тот же клиент, тот же сокет");
+
+        wg.send_to(b"reply", from).await.unwrap();
+        let (client, reply) = timeout(Duration::from_secs(2), replies.recv()).await.unwrap().unwrap();
+        assert_eq!((client, reply.as_slice()), (ClientKey::Direct, &b"reply"[..]));
     }
 }

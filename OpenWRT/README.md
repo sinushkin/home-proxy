@@ -7,7 +7,7 @@ Xiaomi 4C / mt76x8), какие у этого особенности и как �
 
 ```bash
 TOOLCHAIN_DIR=~/owrt/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl ./OpenWRT/build.sh
-# результат: hp-backend/target/openwrt/mipsel-unknown-linux-musl/release/{peer,router} (~1.7 МБ каждый);
+# результат: target/openwrt/mipsel-unknown-linux-musl/release/{peer,router} (~1.7 МБ каждый);
 # сервер (`server`) — обычный x86_64-бинарник для VPS, под роутер его не собирают
 ```
 
@@ -72,7 +72,7 @@ file /tmp/t.out     # ELF 32-bit LSB executable, MIPS, MIPS32 rel2 ...
    gcc (`CC_<таргет>`, `AR_<таргет>`). Запасной вариант с OpenSSL не понадобился.
 7. **Логи — в syslog.** `LOG_TARGET=syslog` пишет в `syslog(3)`; на OpenWrt его
    принимает `logd`, читать `logread -e peer`. Так же пишет `ulog` из libubox.
-8. **Без `regex`.** `env_logger` в `hp-backend/Cargo.toml` подключён с
+8. **Без `regex`.** `env_logger` в `Cargo.toml` подключён с
    `default-features = false, features = ["auto-color", "humantime"]`: фильтр по
    модулям (`RUST_LOG=peer=debug,connection=info`) остаётся, а regex-фильтр по
    тексту убран вместе с крейтами `regex`, `regex-automata`, `regex-syntax`,
@@ -114,7 +114,7 @@ export CARGO_PROFILE_RELEASE_PANIC=abort
 export CARGO_PROFILE_RELEASE_STRIP=true
 
 # 5. Сборка (RUSTC_BOOTSTRAP — чтобы -Z работал на stable)
-cd hp-backend
+cd <корень репозитория>
 RUSTC_BOOTSTRAP=1 cargo build --release -p peer \
   --target mipsel-unknown-linux-musl \
   -Zbuild-std=std,panic_abort
@@ -128,7 +128,7 @@ $TOOLCHAIN_DIR/bin/mipsel-openwrt-linux-musl-readelf -d target/mipsel-unknown-li
 Ожидаемо: `ELF 32-bit LSB pie executable, MIPS, MIPS32 rel2`, интерпретатор
 `/lib/ld-musl-mipsel-sf.so.1`, зависимости `libgcc_s.so.1` и `libc.so`.
 `OpenWRT/build.sh` делает то же самое и кладёт результат в
-`hp-backend/target/openwrt/...` (отдельный каталог сборки, чтобы не мешать
+`target/openwrt/...` (отдельный каталог сборки, чтобы не мешать
 обычным сборкам).
 
 Что означают переменные:
@@ -161,7 +161,7 @@ $TOOLCHAIN_DIR/bin/mipsel-openwrt-linux-musl-readelf -d target/mipsel-unknown-li
 
 ```bash
 scp -O target/mipsel-unknown-linux-musl/release/peer root@<роутер>:/tmp/peer
-scp -O ../cert/out/ca.crt root@<роутер>:/tmp/ca.crt
+scp -O cert/out/ca.crt root@<роутер>:/tmp/ca.crt
 ```
 
 Запуск (логи в syslog, читать `logread -e peer`):
@@ -205,7 +205,7 @@ big-endian ath79 интерпретатор будет `ld-musl-mips-sf.so.1`; �
 
 ```bash
 ssh jump1 'mkdir -p /tmp/hp'
-scp -O hp-backend/target/openwrt/mipsel-unknown-linux-musl/release/{peer,router} cert/out/ca.crt jump1:/tmp/hp/
+scp -O target/openwrt/mipsel-unknown-linux-musl/release/{peer,router} cert/out/ca.crt jump1:/tmp/hp/
 ```
 
 `jump1` в `~/.ssh/config` идёт через `ProxyJump`; `scp -O` нужен, потому что у

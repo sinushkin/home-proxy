@@ -44,7 +44,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   плейсхолдеры: `203.0.113.10` (`profit`), `203.0.113.20` (`ruhor`),
   `198.51.100.7` (домашний WAN). Реальные адреса лежат только в SSH-алиасах
   (`~/.ssh/config`) и в игнорируемых файлах.
-- Локальные секреты живут в `.gitignore`-путях: `hp-backend/{peer,server}/.env`,
+- Локальные секреты живут в `.gitignore`-путях: `hp-backend/peer/.env`, `server/.env`, `router/.env`,
   `cert/out/`, `wireguard/out/`, `android-vpn/local.properties`,
   `android-vpn/app/src/main/{assets,jniLibs}/`. Перед `git add` смотреть
   `git status`, не использовать `git add -A` вслепую.
@@ -56,7 +56,10 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
 
 ## Структура репозитория
 
-- `hp-backend/` — Cargo workspace (корень — `hp-backend/Cargo.toml`). Все
+- `hp-backend/` — библиотечные крейты и `peer` (CLI для живых проверок), входят в Cargo
+  workspace, корень которого — `Cargo.toml` в корне репозитория (там же `Cargo.lock`,
+  `target/`). Исполняемые службы `server/` и `router/` лежат уровнем выше, но
+  собираются тем же workspace. Все
   версии зависимостей закреплены один раз в `[workspace.dependencies]`,
   крейты-участники подключают их через `{ workspace = true }` — никогда не
   указывать версию прямо в `Cargo.toml` крейта. Ошибки — через `anyhow`
@@ -146,26 +149,15 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     - `src/lib.rs` — подключает модули (`codec`, `label`, `link_id`,
       `multilink`, `port_utils`, `punch`, `relay`, `rendezvous`, `stun`, `xor`,
       `proto`).
-  - `router/` — бинарный крейт, релей телефоны ↔ сервер: набор из 10 дыр к
-    серверу и по набору к каждому телефону (`PHONE_<n>_*`, n = `client_id`,
-    u8). От телефона принимает `Data`, оборачивает в
-    `WrappedData { client_id }` и шлёт серверу; от сервера по `client_id`
-    находит телефон, разворачивает и шлёт ему `Data`. Настройки —
-    переменные окружения (`run.sh` + `.env`), описание и проверка —
-    `hp-backend/router/README.md`.
-  - `server/` — бинарный крейт, мост клиенты → WireGuard (как
-    `server-rs`): для каждого клиента свой локальный UDP-сокет
-    `127.0.0.1:0` к `WG_ADDR`, неактивные клиенты удаляются. Клиент — либо
-    `client_id` за роутером (`WrappedData`, ответ обёрнутый с тем же
-    `client_id`), либо телефон напрямую (обычная `Data`, «прямой» клиент,
-    ответ тоже обычной `Data`). `hp-backend/server/README.md`.
   - `client/` — крейт `hp-client`: клиент телефона (`MultiLink` + локальный UDP-
     мост `Bridge` «WireGuard <-> дыры»), ядро Android-библиотеки, проверяется на хосте.
   - `android-lib/` — крейт `homeproxy-android`: JNI-обёртка над `hp-client`
     (`libhomeproxy.so`, `Java_ru_homeproxy_HomeProxy_*`); собирается под NDK
     скриптом `android-vpn/build-native.sh`.
   - `logging/` — крейт `hp-logging`: общая инициализация логов (`env_logger`
-    без regex, `LOG_TARGET=syslog` — в syslog для OpenWrt).
+    без regex, `LOG_TARGET=syslog` — в syslog для OpenWrt (только Unix), `LOG_FILE=путь` —
+    дописывать в файл: у службы Windows нет консоли; `init_with(get)` берёт настройки
+    не из окружения, а из переданной функции).
   - `peer/` — бинарный крейт, CLI-обвязка: поднимает `MultiLink`, шлёт по
     Enter набранную строку пиру (`отправлено по дыре [#N]: ...`) и печатает
     входящие как `[#N] ...` (N — номер дыры); keep-alive, добавление и
@@ -179,6 +171,31 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     брокера) — оба GUID'а операторы знают заранее (например,
     `uuidgen`), сам бинарник их не генерирует. Примеры команд — в
     `hp-backend/peer/README.md`.
+- `router/` — бинарный крейт, релей телефоны ↔ сервер: набор из 10 дыр к
+  серверу и по набору к каждому телефону (`PHONE_<n>_*`, n = `client_id`,
+  u8). От телефона принимает `Data`, оборачивает в
+  `WrappedData { client_id }` и шлёт серверу; от сервера по `client_id`
+  находит телефон, разворачивает и шлёт ему `Data`. Настройки —
+  переменные окружения (`run.sh` + `.env`), описание и проверка —
+  `router/README.md`.
+- `server/` — бинарный крейт, мост клиенты → WireGuard (как
+  `server-rs`): для каждого клиента свой локальный UDP-сокет
+  `127.0.0.1:0` к `WG_ADDR`, неактивные клиенты удаляются. Клиент — либо
+  `client_id` за роутером (`WrappedData`, ответ обёрнутый с тем же
+  `client_id`), либо телефон напрямую (обычная `Data`, «прямой» клиент,
+  ответ тоже обычной `Data`). Собирается и под Windows: `src/settings.rs` — файл
+  настроек `server.env` (`KEY=VALUE`, `--config`, по умолчанию `server.env` рядом с
+  бинарником; переменная окружения главнее файла; относительные пути — от каталога
+  файла), `src/winsvc.rs` (только `cfg(windows)`) — служба `homeproxy-server`:
+  `server install --config …` / `uninstall` / `--service` (запуск диспетчером служб,
+  остановка по SCM). Читатель ответов моста переживает рестарт WireGuard
+  (`ConnectionReset`/`ConnectionRefused` — не конец клиента). `server/README.md`.
+- `windows/` — установка службы на Windows: `install.ps1` (WireGuard-туннель `wghp`
+  из `wghp.conf` без PostUp/PostDown, NAT через `New-NetNat`, правило брандмауэра,
+  служба после туннеля, обход VPN для STUN), `uninstall.ps1`, `stun-bypass.ps1`
+  (если маршрут до STUN идёт не через физический адаптер, добавляет /32-маршрут
+  через физический шлюз; `-WhatIf`, `-Remove`). PowerShell-файлы — UTF-8 **с BOM**
+  (иначе PowerShell 5.1 ломает кириллицу). `windows/README.md`.
 - `wireguard/` — схема «телефон -> дыры -> этот ПК -> интернет» без роутера:
   `gen.sh` (ключи и конфиги WireGuard, GUID'ы; результат в `wireguard/out/`, в git
   не попадает) и README по пунктам (WireGuard `wghp` на ПК, прокси-служба
@@ -255,14 +272,13 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
 ## Команды
 
 ```bash
-# Сборка / тесты Rust-workspace
-cd hp-backend
+# Сборка / тесты Rust-workspace (из корня репозитория)
 cargo build
 cargo test
 cargo test -p connection punch::tests::zigzag_fans_outward_from_center   # один тест
 
 # Ручной запуск пира (например, локально против дебаг-стека)
-cargo run -p peer -- 127.0.0.1:3499 127.0.0.1:8883 ../cert/out/ca.crt <мой-guid> <guid-пира>
+cargo run -p peer -- 127.0.0.1:3499 127.0.0.1:8883 cert/out/ca.crt <мой-guid> <guid-пира>
 
 # Локальный debug-стек (STUN + MQTT); сначала сертификаты — см. cert/README.md
 docker compose up -d
@@ -306,6 +322,16 @@ NAT/провайдерами.
   "Text file busy" при работающем пире. Для запуска на хосте есть `run.sh` +
   `.env` (см. `hp-backend/peer/README.md`).
 - `rud` и `po` сидят за одним NAT — между собой пробить не могут (hairpin).
+- `win` (SSH-алиас, libvirt-ВМ на этом ПК, Windows 10, свой `~/.ssh/config`) —
+  тестовая Windows-машина: Rust MSVC и git есть, `protoc` лежит в
+  `C:\Users\user\tools\protoc`, исходники синхронизируем `tar` через ssh в
+  `C:\Users\user\home-proxy` и собираем там (`set PROTOC=…`, `cargo build --release -p server`).
+  WireGuard для Windows установлен, но `New-NetNat` не работает (нет WMI-провайдера
+  NetNat даже с включённым Containers), поэтому `install.ps1` проверялся с
+  `-SkipNat`; выход в интернет через NAT на этой ВМ не проверен. Сквозная проверка с телефоном на этой ВМ
+  проходила (дыры 10/10, рукопожатие WireGuard, ping туннеля) с отдельной парой из
+  `wireguard/out/win/` (`WG_OUT_DIR=out/win ./gen.sh`). Скрипты для
+  PowerShell через ssh запускаем как `-File` (stdin-режим ломает многострочные блоки).
 - Тестовые прогоны — только со свежими одноразовыми GUID
   (`cat /proc/sys/kernel/random/uuid`): `exchange()` публикует retained-запись
   на топик *своего* GUID, так что тест с чужим GUID затирает регистрацию

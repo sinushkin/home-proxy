@@ -9,5 +9,8 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
-connection = { path = "../connection" }
-hp-logging = { path = "../logging" }
+connection = { path = "../hp-backend/connection" }
+hp-logging = { path = "../hp-backend/logging" }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = { workspace = true }

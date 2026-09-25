@@ -29,7 +29,7 @@ echo "набирайте текст и нажимайте Enter; Ctrl+C — вы
 
 # В чекауте пересобираем (cargo сам пропустит, если ничего не менялось); на
 # хосте без cargo (там лежит готовый бинарник рядом со скриптом) берём его.
-if [[ -f ../Cargo.toml ]] && command -v cargo >/dev/null 2>&1; then
+if [[ -f ../../Cargo.toml ]] && command -v cargo >/dev/null 2>&1; then
   exec cargo run --release -q -p peer -- "$STUN_ADDR" "$MQTT_ADDR" "$MQTT_CA" "$MY_PEER_ID" "$PEER_ID"
 elif [[ -x ./peer ]]; then
   exec ./peer "$STUN_ADDR" "$MQTT_ADDR" "$MQTT_CA" "$MY_PEER_ID" "$PEER_ID"

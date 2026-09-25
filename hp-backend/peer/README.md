@@ -46,13 +46,13 @@ STUN и MQTT — debug-стек на `profit` (см. корневой `CLAUDE.md
 просто пример — для своего прогона сгенерируйте два новых (`cat
 /proc/sys/kernel/random/uuid`).
 
-**Хост A** (из `hp-backend/`):
+**Хост A** (из корня репозитория):
 
 ```bash
-cargo run -p peer -- 203.0.113.10:3499 203.0.113.10:8883 ../cert/out/ca.crt <A-guid> <B-guid>
+cargo run -p peer -- 203.0.113.10:3499 203.0.113.10:8883 cert/out/ca.crt <A-guid> <B-guid>
 ```
 
-**Хост B** (уже собран релизом, из `hp-backend/`):
+**Хост B** (уже собран релизом, из корня репозитория):
 
 ```bash
 ./target/release/peer 203.0.113.10:3499 203.0.113.10:8883 ./ca.crt <B-guid> <A-guid>

@@ -6,9 +6,11 @@
 ```
 телефон: WireGuard (libwg-go) -> 127.0.0.1:51821 (мост)
       -> 10 дыр (libhomeproxy.so) ==== интернет ====
-ПК:   homeproxy-server (hp-backend/server) -> 127.0.0.1:51820 -> WireGuard wghp (10.77.0.1)
+ПК:   homeproxy-server (server/) -> 127.0.0.1:51820 -> WireGuard wghp (10.77.0.1)
       -> NAT (enp4s0) -> интернет
 ```
+
+Для Windows вместо пунктов 3–4 — [`../windows/README.md`](../windows/README.md).
 
 STUN и MQTT (рандеву) — на `profit`: STUN на порту **3499**, MQTT по TLS на 8883.
 
@@ -55,24 +57,24 @@ sudo wg show wghp                           # должен показать пи
 ## 4. Поднять прокси-службу (дыры → WireGuard)
 
 ```bash
-cd ../hp-backend
+cd ..                                          # корень репозитория
 cargo build --release -p server
-. ../wireguard/out/guids.env
+. wireguard/out/guids.env
 cat > server/.env <<EOF2
 STUN_ADDR=203.0.113.10:3499
 MQTT_ADDR=203.0.113.10:8883
-MQTT_CA=../../cert/out/ca.crt
+MQTT_CA=../cert/out/ca.crt
 MY_ID=$PC_ID
 PEER_ID=$PHONE_ID
 EOF2
-sudo install -m 644 ../wireguard/out/homeproxy-server.service /etc/systemd/system/
+sudo install -m 644 wireguard/out/homeproxy-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start homeproxy-server
 journalctl -u homeproxy-server -f            # логи
 ```
 
 `PEER_ID` — GUID телефона: без роутера сервер принимает от него обычную `Data`,
-как «прямого клиента», и отвечает тем же (`hp-backend/server/README.md`).
+как «прямого клиента», и отвечает тем же (`server/README.md`).
 
 **Про STUN на ПК.** STUN должен идти тем же маршрутом, каким ПК выходит к телефону.
 По правилам `o1` (`vpn-bypass.nft`) UDP с портом назначения 3479–19000 и
@@ -85,7 +87,7 @@ journalctl -u homeproxy-server -f            # логи
 ## 5. Собрать APK с ключами и поставить на телефон
 
 ```bash
-cd ../android-vpn
+cd android-vpn
 ./build-native.sh --release      # .so под ABI + client.conf и ca.crt в assets приложения
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
@@ -93,7 +95,12 @@ adb shell cmd appops set ru.homeproxy ACTIVATE_VPN allow   # согласие н
 ```
 
 `client.conf` (с приватным ключом телефона) попадает в `assets/wg.conf` APK и
-используется приложением по умолчанию; в git он не попадает. Телефон armeabi-v7a
+используется приложением по умолчанию; в git он не попадает. **Осторожно:** конфиг,
+сохранённый в приложении (экран или extra `wgConfigB64`), главнее assets, и `adb install -r`
+его не стирает. Если после пересборки с новыми ключами нет рукопожатия, передайте конфиг
+явно: `--es wgConfigB64 $(base64 -w0 wireguard/out/client.conf)` в `am start` (п. 6).
+Отдельный набор ключей и GUID для второго ПК или тестов: `WG_OUT_DIR=out/win ./gen.sh`, в APK —
+`WG_CONF=…/client.conf ./build-native.sh`. Телефон armeabi-v7a
 (TECNO KG5m) — эту ABI `build-native.sh` собирает по умолчанию.
 
 ## 6. Запустить на телефоне

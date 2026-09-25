@@ -16,8 +16,8 @@ set -euo pipefail
 TARGET="${TARGET:-mipsel-unknown-linux-musl}"
 GCC_PREFIX="${GCC_PREFIX:-mipsel-openwrt-linux-musl}"
 
-# Собираем из workspace hp-backend/ (рядом с этой папкой).
-cd "$(dirname "${BASH_SOURCE[0]}")/../hp-backend"
+# Собираем из workspace в корне репозитория (на уровень выше этой папки).
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export STAGING_DIR="${STAGING_DIR:-$(dirname "$TOOLCHAIN_DIR")}"
 export PATH="$TOOLCHAIN_DIR/bin:$PATH"
 

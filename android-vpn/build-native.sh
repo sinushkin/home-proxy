@@ -12,7 +12,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKEND="$HERE/../hp-backend"
+BACKEND="$HERE/.."
 NDK="${ANDROID_NDK:-$HOME/Android/Sdk/ndk/26.1.10909125}"
 API="${ANDROID_API:-24}"
 ABIS="${ABIS:-armeabi-v7a x86_64}"
@@ -64,7 +64,7 @@ done
 
 # Конфиг WireGuard клиента (ключи из wireguard/out) — в assets: приложение берёт
 # его по умолчанию. Внутри приватный ключ, поэтому файл в git не попадает.
-WG="$HERE/../wireguard/out/client.conf"
+WG="${WG_CONF:-$HERE/../wireguard/out/client.conf}"
 if [[ -f "$WG" ]]; then
   mkdir -p "$HERE/app/src/main/assets"
   cp "$WG" "$HERE/app/src/main/assets/wg.conf"
