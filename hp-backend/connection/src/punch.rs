@@ -9,16 +9,18 @@
 //!
 //! Пробив шлёт `PeerMessage::Init` с полным GUID-заголовком (`receive_loop`
 //! принимает `Init` только с ожидаемым `from_peer_id` — заодно отсекает
-//! hairpin-эхо). После установки дыры идут `PeerMessage::Lite` (только slot),
-//! их `receive_loop` принимает только с уже подтверждённого адреса дыры.
+//! hairpin-эхо). После установки дыры идут `PeerMessage::Lite` (только slot).
+//! Адрес отправителя не проверяется: любой пакет с нашим слотом, прошедший XOR-вектор
+//! и protobuf, делает свой адрес текущим эндпоинтом пира (как роуминг в WireGuard),
+//! а `LinkSender` шлёт всегда на текущий эндпоинт. `PunchAck` уходит туда, откуда
+//! пришёл `Punch`.
 //!
 //! Keep-alive здесь НЕ запускается: `establish` возвращает `PeerLink` с
 //! `LinkSender`, а слать keep-alive по всем дырам — забота одной общей таски
 //! в менеджере.
 
-use std::collections::HashSet;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -158,7 +160,9 @@ impl Drop for AbortOnDrop {
 /// Общая keep-alive-таска держит по одному такому на каждую живую дыру.
 pub struct LinkSender {
     socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
+    /// Текущий эндпоинт пира: его обновляет `receive_loop` по каждому валидному пакету
+    /// (у пира может быть несколько провайдеров/маршрутов, адрес отправителя меняется).
+    endpoint: watch::Receiver<Option<SocketAddr>>,
     identity: PeerIdentity,
     seq: AtomicU32,
     stats: Arc<LinkStats>,
@@ -175,10 +179,16 @@ impl LinkSender {
         self.stats.snapshot()
     }
 
+    /// Адрес пира, с которого недавно приходили валидные пакеты; шлём именно туда.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        *self.endpoint.borrow()
+    }
+
     async fn send_lite(&self, payload: lite::Payload) {
+        let Some(peer_addr) = self.peer_addr() else { return };
         let msg = self.identity.lite(payload);
         let packet = codec::encode(&msg, &self.identity.peer_key);
-        if self.socket.send_to(&packet, self.peer_addr).await.is_ok() {
+        if self.socket.send_to(&packet, peer_addr).await.is_ok() {
             self.stats.sent.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -246,7 +256,8 @@ impl LinkSender {
 pub struct PeerLink {
     pub slot: u8,
     pub link_id: PeerLinkId,
-    /// Адрес пира, с которого реально пришёл пакет.
+    /// Адрес пира, с которого пришёл пакет, установивший дыру. Дальше эндпоинт может
+    /// сменяться (см. `LinkSender::peer_addr`).
     pub peer_addr: SocketAddr,
     /// Локальный адрес нашего сокета (IP — `0.0.0.0`, порт — от ОС).
     pub local_addr: SocketAddr,
@@ -313,7 +324,6 @@ pub async fn establish(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "нет адресов пира для пробива"));
     }
     let local_addr = socket.local_addr()?;
-    let peer_ips: HashSet<IpAddr> = peer_addrs.iter().map(SocketAddr::ip).collect();
     let (found_tx, mut found_rx) = watch::channel::<Option<SocketAddr>>(None);
 
     let last_seen = Arc::new(Mutex::new(Instant::now()));
@@ -323,7 +333,6 @@ pub async fn establish(
     // и читать сокет дальше.
     let receiver = AbortOnDrop(tokio::spawn(receive_loop(
         socket.clone(),
-        peer_ips,
         identity.clone(),
         found_tx,
         last_seen.clone(),
@@ -348,6 +357,7 @@ pub async fn establish(
         }
     }));
 
+    let endpoint = found_rx.clone();
     let confirmed_peer = loop {
         if found_rx.changed().await.is_err() {
             return Err(io::Error::new(
@@ -364,7 +374,7 @@ pub async fn establish(
     let link_id = identity.link_id();
     let sender = Arc::new(LinkSender {
         socket,
-        peer_addr: confirmed_peer,
+        endpoint,
         identity: identity.clone(),
         seq: AtomicU32::new(0),
         stats,
@@ -382,29 +392,45 @@ pub async fn establish(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Любой пакет, прошедший XOR-вектор и protobuf (и слот / GUID пира), доказывает, что
+/// пир достижим с адреса `from`: считаем этот адрес текущим эндпоинтом, даже если он
+/// отличается от того, куда мы стучались или откуда пришёл прежний пакет.
+fn note_packet(
+    slot: u8,
+    from: SocketAddr,
+    endpoint: &watch::Sender<Option<SocketAddr>>,
+    last_seen: &Mutex<Instant>,
+    stats: &LinkStats,
+) {
+    *last_seen.lock().unwrap() = Instant::now();
+    stats.received.fetch_add(1, Ordering::Relaxed);
+    endpoint.send_if_modified(|current| {
+        if *current == Some(from) {
+            return false;
+        }
+        if let Some(old) = current {
+            log::info!("слот {slot}: эндпоинт пира сменился {old} -> {from}");
+        }
+        *current = Some(from);
+        true
+    });
+}
+
 async fn receive_loop(
     socket: Arc<UdpSocket>,
-    peer_ips: HashSet<IpAddr>,
     identity: PeerIdentity,
-    found_tx: watch::Sender<Option<SocketAddr>>,
+    endpoint: watch::Sender<Option<SocketAddr>>,
     last_seen: Arc<Mutex<Instant>>,
     stats: Arc<LinkStats>,
     events: mpsc::Sender<LinkEvent>,
 ) {
     let expected_from = identity.peer_id.to_string();
-    // Адрес пира, подтверждённый пробивом. Пока не установлен — Lite-пакеты
-    // (только slot, без GUID) не принимаем: их не от кого проверить.
-    let mut confirmed: Option<SocketAddr> = None;
     let mut buf = [0u8; 1500];
     loop {
         let (n, from) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if !peer_ips.contains(&from.ip()) {
-            continue;
-        }
         // Битый/чужой protobuf (случайный пакет, скан, мусор) — просто
         // игнорируем: XOR нашим вектором + decode дадут Err, и мы пропускаем пакет.
         let Ok(msg) = codec::decode(buf[..n].to_vec(), &identity.my_key) else {
@@ -426,10 +452,8 @@ async fn receive_loop(
                         None => "получен Init без нагрузки",
                     }
                 );
-                *last_seen.lock().unwrap() = Instant::now();
-                stats.received.fetch_add(1, Ordering::Relaxed);
-                confirmed = Some(from);
-                let _ = found_tx.send(Some(from));
+                note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
+                // Ack уходит туда, откуда реально пришёл Punch (а не туда, куда стучались мы).
                 if let Some(init_message::Payload::Punch(p)) = init.payload {
                     let ack = identity.init(init_message::Payload::PunchAck(PunchAck {
                         target_port: p.target_port,
@@ -440,12 +464,12 @@ async fn receive_loop(
                 }
             }
             Some(peer_message::Body::Lite(lite)) => {
-                // После установки: принимаем только с подтверждённого адреса.
-                if confirmed != Some(from) {
+                // После установки: достаточно нашего слота (и вектора, см. выше). Адрес
+                // отправителя не проверяем: он становится текущим эндпоинтом пира.
+                if lite.slot != u32::from(identity.slot) {
                     continue;
                 }
-                *last_seen.lock().unwrap() = Instant::now();
-                stats.received.fetch_add(1, Ordering::Relaxed);
+                note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
                 handle_lite(lite, identity.slot, &events).await;
             }
             None => {}
@@ -511,6 +535,7 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     fn test_config() -> PunchConfig {
         PunchConfig {
@@ -911,5 +936,199 @@ mod tests {
                 .is_err(),
             "establish() принял пакет, закодированный чужим вектором"
         );
+    }
+
+    /// Пара установленных дыр на loopback: `a` — под проверкой, `b` — «настоящий» пир.
+    struct Pair {
+        link_a: PeerLink,
+        _link_b: PeerLink,
+        a_events: mpsc::Receiver<LinkEvent>,
+        a_addr: SocketAddr,
+        a_key: XorKey,
+        b_id: Uuid,
+        b_addr: SocketAddr,
+    }
+
+    async fn linked_pair() -> Pair {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let a_socket = Arc::new(UdpSocket::bind((ip, 0)).await.unwrap());
+        let b_socket = Arc::new(UdpSocket::bind((ip, 0)).await.unwrap());
+        let a_addr = a_socket.local_addr().unwrap();
+        let b_addr = b_socket.local_addr().unwrap();
+        let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
+        let (a_key, b_key) = (codec::random_key(), codec::random_key());
+        let (a_events_tx, a_events) = mpsc::channel(16);
+        let (link_a, link_b) = tokio::join!(
+            establish(
+                a_socket,
+                a_addr.port(),
+                vec![b_addr],
+                identity(a_sess, b_sess, a_id, b_id, a_key, b_key),
+                test_config(),
+                a_events_tx
+            ),
+            establish(
+                b_socket,
+                b_addr.port(),
+                vec![a_addr],
+                identity(b_sess, a_sess, b_id, a_id, b_key, a_key),
+                test_config(),
+                null_events()
+            ),
+        );
+        Pair { link_a: link_a.unwrap(), _link_b: link_b.unwrap(), a_events, a_addr, a_key, b_id, b_addr }
+    }
+
+    fn lite_packet(slot: u32, payload: lite::Payload, key: &XorKey) -> Vec<u8> {
+        let msg = PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(payload) })) };
+        codec::encode(&msg, key)
+    }
+
+    fn punch_packet(from: Uuid, to: Uuid, key: &XorKey) -> Vec<u8> {
+        let msg = PeerMessage {
+            body: Some(peer_message::Body::Init(InitMessage {
+                session_id: Uuid::new_v4().to_string(),
+                from_peer_id: from.to_string(),
+                to_peer_id: to.to_string(),
+                slot: 0,
+                payload: Some(init_message::Payload::Punch(Punch { target_port: 0 })),
+            })),
+        };
+        codec::encode(&msg, key)
+    }
+
+    async fn next_event(events: &mut mpsc::Receiver<LinkEvent>) -> LinkEvent {
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("событие не пришло")
+            .unwrap()
+    }
+
+    /// Валидный пакет с нашего слота от другого порта пира делает этот адрес текущим
+    /// эндпоинтом: и данные принимаются, и дальше мы шлём туда.
+    #[tokio::test]
+    async fn valid_lite_from_a_new_port_moves_the_endpoint() {
+        let mut p = linked_pair().await;
+        assert_eq!(p.link_a.sender.peer_addr(), Some(p.b_addr));
+        let moved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"roam".to_vec() }), &p.a_key);
+        moved.send_to(&data, p.a_addr).await.unwrap();
+
+        match next_event(&mut p.a_events).await {
+            LinkEvent::PeerData { payload, .. } => assert_eq!(payload, b"roam"),
+            other => panic!("ожидали PeerData, пришло {other:?}"),
+        }
+        assert_eq!(p.link_a.sender.peer_addr(), Some(moved.local_addr().unwrap()));
+
+        p.link_a.sender.send_keepalive().await;
+        let mut buf = [0u8; 1500];
+        tokio::time::timeout(Duration::from_secs(2), moved.recv_from(&mut buf))
+            .await
+            .expect("keep-alive не пришёл на новый эндпоинт")
+            .unwrap();
+    }
+
+    /// Пир может прийти с другого IP (другой провайдер): фильтра по IP нет.
+    #[tokio::test]
+    async fn valid_lite_from_another_ip_is_accepted() {
+        let mut p = linked_pair().await;
+        let other_ip = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+
+        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"other ip".to_vec() }), &p.a_key);
+        other_ip.send_to(&data, p.a_addr).await.unwrap();
+
+        match next_event(&mut p.a_events).await {
+            LinkEvent::PeerData { payload, .. } => assert_eq!(payload, b"other ip"),
+            other => panic!("ожидали PeerData, пришло {other:?}"),
+        }
+        assert_eq!(p.link_a.sender.peer_addr(), Some(other_ip.local_addr().unwrap()));
+    }
+
+    /// Чужой слот или чужой вектор эндпоинт не двигают.
+    #[tokio::test]
+    async fn wrong_slot_or_key_does_not_move_the_endpoint() {
+        let p = linked_pair().await;
+        let rogue = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let wrong_slot = lite_packet(5, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &p.a_key);
+        let wrong_key = lite_packet(0, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &codec::random_key());
+        rogue.send_to(&wrong_slot, p.a_addr).await.unwrap();
+        rogue.send_to(&wrong_key, p.a_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(p.link_a.sender.peer_addr(), Some(p.b_addr));
+    }
+
+    /// Пир, пока не получил наш Ack, шлёт `Punch` с разных портов (симметричный NAT);
+    /// данные с первого из них после этого не должны отбрасываться.
+    #[tokio::test]
+    async fn data_from_an_earlier_punch_source_is_not_dropped() {
+        let mut p = linked_pair().await;
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        first.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.a_key), p.a_addr).await.unwrap();
+        second.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.a_key), p.a_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"from first".to_vec() }), &p.a_key);
+        first.send_to(&data, p.a_addr).await.unwrap();
+        match next_event(&mut p.a_events).await {
+            LinkEvent::PeerData { payload, .. } => assert_eq!(payload, b"from first"),
+            other => panic!("ожидали PeerData, пришло {other:?}"),
+        }
+    }
+
+    /// `Ack` уходит туда, откуда пришёл `Punch`, а не туда, куда стучались мы.
+    #[tokio::test]
+    async fn punch_is_acked_to_its_real_source() {
+        let p = linked_pair().await;
+        let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        source.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.a_key), p.a_addr).await.unwrap();
+
+        let mut buf = [0u8; 1500];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), source.recv_from(&mut buf))
+            .await
+            .expect("PunchAck не пришёл на адрес отправителя Punch")
+            .unwrap();
+        assert_eq!(from, p.a_addr);
+        assert!(n > 0);
+    }
+
+    /// Если `Lite` от пира пришёл раньше `Punch`/`PunchAck` (Ack потерян), дыра всё
+    /// равно считается установленной.
+    #[tokio::test]
+    async fn lite_before_any_punch_establishes_the_link() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let under_test = Arc::new(UdpSocket::bind((ip, 0)).await.unwrap());
+        let under_test_addr = under_test.local_addr().unwrap();
+        let peer = UdpSocket::bind((ip, 0)).await.unwrap();
+        let ident = identity(
+            Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(),
+            codec::random_key(), codec::random_key(),
+        );
+        let key = ident.my_key;
+        let establishing = tokio::spawn(establish(
+            under_test,
+            peer.local_addr().unwrap().port(),
+            vec![peer.local_addr().unwrap()],
+            ident,
+            test_config(),
+            null_events(),
+        ));
+
+        peer.send_to(&lite_packet(0, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &key), under_test_addr)
+            .await
+            .unwrap();
+
+        let link = tokio::time::timeout(Duration::from_secs(2), establishing)
+            .await
+            .expect("establish не завершился")
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.peer_addr, peer.local_addr().unwrap());
     }
 }
