@@ -1,4 +1,4 @@
-//! Клиент с локальным мостом для WireGuard: то же, что делает приложение на телефоне
+//! `hp-client`: клиент с локальным мостом для WireGuard (P2P, через STUN и MQTT): то же, что делает приложение на телефоне
 //! (`hp-client`), только на обычном Linux. Поднимает набор дыр к серверу и слушает
 //! `127.0.0.1:<порт>`: этот адрес указывается как Endpoint у WireGuard.
 //!
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     anyhow::ensure!(
         args.len() == 5 || args.len() == 6,
-        "использование: client <stun[,stun2]> <mqtt> <mqtt_ca> <my_peer_id> <peer_id> [порт]"
+        "использование: hp-client <stun[,stun2]> <mqtt> <mqtt_ca> <my_peer_id> <peer_id> [порт]"
     );
     let mqtt_ca = std::fs::read(&args[2]).with_context(|| format!("не удалось прочитать CA {}", args[2]))?;
     let config = ClientConfig {

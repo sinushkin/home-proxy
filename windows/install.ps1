@@ -4,7 +4,7 @@
   прокси-службу homeproxy-server (дыры -> WireGuard) и обход VPN для STUN.
 
 .DESCRIPTION
-  В каталоге -SourceDir должны лежать: server.exe, server.env (настройки службы),
+  В каталоге -SourceDir должны лежать: hp-server.exe, server.env (настройки службы),
   wghp.conf (конфиг WireGuard, его делает wireguard/gen.sh) и CA-сертификат брокера,
   на который указывает MQTT_CA в server.env (относительный путь — от server.env).
   Всё копируется в -InstallDir и закрывается правами только для SYSTEM и администраторов
@@ -81,7 +81,7 @@ function Remove-HomeproxyService {
 }
 
 # 1. Проверки до любых изменений.
-foreach ($name in 'server.exe', 'server.env', 'wghp.conf') {
+foreach ($name in 'hp-server.exe', 'server.env', 'wghp.conf') {
     if (-not (Test-Path (Join-Path $SourceDir $name))) { throw "Нет $name в $SourceDir" }
 }
 if (-not (Test-Path $wireguard)) {
@@ -117,7 +117,7 @@ Get-NetNat -Name homeproxy -ErrorAction SilentlyContinue | Remove-NetNat -Confir
 # 3. Файлы и права.
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
 & icacls $InstallDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-foreach ($name in 'server.exe', 'server.env', 'stun-bypass.ps1') {
+foreach ($name in 'hp-server.exe', 'server.env', 'stun-bypass.ps1') {
     $from = Join-Path $SourceDir $name
     if (Test-Path $from) { Copy-Item $from $InstallDir -Force }
 }
@@ -169,10 +169,10 @@ if ($Nat -ne 'None') {
     }
 }
 
-# 6. Брандмауэр: входящий UDP для server.exe (ответы пира на дыры).
+# 6. Брандмауэр: входящий UDP для hp-server.exe (ответы пира на дыры).
 Get-NetFirewallRule -DisplayName $serviceName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName $serviceName -Direction Inbound -Action Allow -Protocol UDP -Profile Any `
-    -Program (Join-Path $InstallDir 'server.exe') | Out-Null
+    -Program (Join-Path $InstallDir 'hp-server.exe') | Out-Null
 
 # 7. STUN мимо VPN.
 if (-not $SkipStunBypass) {
@@ -180,7 +180,7 @@ if (-not $SkipStunBypass) {
 }
 
 # 8. Служба: после WireGuard-туннеля, автозапуск, перезапуск при сбое.
-& (Join-Path $InstallDir 'server.exe') install --config (Join-Path $InstallDir 'server.env')
+& (Join-Path $InstallDir 'hp-server.exe') install --config (Join-Path $InstallDir 'server.env')
 & sc.exe config $serviceName depend= "WireGuardTunnel`$$tunnel" | Out-Null
 Start-Service $serviceName
 Write-Host "Готово. Логи: $InstallDir\server.log (LOG_FILE в server.env), статус: Get-Service $serviceName"

@@ -310,7 +310,9 @@ fn sweep_order(candidates: &[SocketAddr], my_port: u16, margin: u16) -> Vec<Sock
 /// Пробивает одну дыру и возвращает `PeerLink`. Keep-alive НЕ запускает.
 /// `peer_addrs` — внешние адреса пира (основной первым; несколько, если разные
 /// STUN-серверы видели его по-разному): стучимся по каждому, дырой считается тот,
-/// с которого пришёл ответ. `events` — канал в менеджер: сюда `receive_loop`
+/// с которого пришёл ответ. Пустой `peer_addrs` — пассивный режим (сервер с белым
+/// адресом): никуда не стучимся, ждём первый валидный пакет пира и отвечаем туда,
+/// откуда он пришёл. `events` — канал в менеджер: сюда `receive_loop`
 /// шлёт статистику пира и команды `DeleteLink`.
 pub async fn establish(
     socket: Arc<UdpSocket>,
@@ -320,9 +322,6 @@ pub async fn establish(
     config: PunchConfig,
     events: mpsc::Sender<LinkEvent>,
 ) -> io::Result<PeerLink> {
-    if peer_addrs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "нет адресов пира для пробива"));
-    }
     let local_addr = socket.local_addr()?;
     let (found_tx, mut found_rx) = watch::channel::<Option<SocketAddr>>(None);
 
@@ -345,6 +344,9 @@ pub async fn establish(
     let punch_interval = config.punch_interval;
     let sweep_identity = identity.clone();
     let sweeper = AbortOnDrop(tokio::spawn(async move {
+        if destinations.is_empty() {
+            return;
+        }
         loop {
             for &dest in &destinations {
                 let msg = sweep_identity.init(init_message::Payload::Punch(Punch {
@@ -1130,5 +1132,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(link.peer_addr, peer.local_addr().unwrap());
+    }
+
+    /// Пассивная сторона (белый адрес) не стучится сама, а принимает пробив активной;
+    /// активная стучится ровно в один порт (margin 0).
+    #[tokio::test]
+    async fn passive_side_accepts_the_active_one() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let server = Arc::new(UdpSocket::bind((ip, 0)).await.unwrap());
+        let client = Arc::new(UdpSocket::bind((ip, 0)).await.unwrap());
+        let (server_addr, client_addr) = (server.local_addr().unwrap(), client.local_addr().unwrap());
+        let (s_id, c_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let (s_sess, c_sess) = (Uuid::new_v4(), Uuid::new_v4());
+        let (s_key, c_key) = (codec::random_key(), codec::random_key());
+        let (s_link, c_link) = tokio::join!(
+            establish(server, server_addr.port(), Vec::new(), identity(s_sess, c_sess, s_id, c_id, s_key, c_key), test_config(), null_events()),
+            establish(client, client_addr.port(), vec![server_addr], identity(c_sess, s_sess, c_id, s_id, c_key, s_key), test_config(), null_events()),
+        );
+        let (s_link, c_link) = (s_link.unwrap(), c_link.unwrap());
+        assert_eq!(s_link.peer_addr, client_addr);
+        assert_eq!(c_link.peer_addr, server_addr);
+        assert_eq!(s_link.link_id, c_link.link_id);
     }
 }

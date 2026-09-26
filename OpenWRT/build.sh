@@ -34,9 +34,10 @@ export CARGO_PROFILE_RELEASE_STRIP=true
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/openwrt}"
 export RUSTC_BOOTSTRAP=1
-# Что собираем: peer (клиент) и router (релей телефон <-> сервер). Один пакет:
+# Что собираем: peer (P2P-клиент), router (релей телефон <-> сервер), vps-client
+# (клиент VPS-сервера с белым IP). Один пакет:
 # PACKAGES=router ./OpenWRT/build.sh
-PACKAGES="${PACKAGES:-peer router}"
+PACKAGES="${PACKAGES:-peer router vps-client}"
 args=()
 for package in $PACKAGES; do args+=(-p "$package"); done
 cargo build --release "${args[@]}" --target "$TARGET" -Zbuild-std=std,panic_abort

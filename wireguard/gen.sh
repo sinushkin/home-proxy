@@ -88,10 +88,10 @@ Wants=network-online.target wg-quick@wghp.service
 
 [Service]
 User=$USER
-WorkingDirectory=$REPO/server
-EnvironmentFile=$REPO/server/.env
+WorkingDirectory=$REPO/hp-server
+EnvironmentFile=$REPO/hp-server/.env
 Environment=RUST_LOG=server=info,connection=info
-ExecStart=$REPO/target/release/server
+ExecStart=$REPO/target/release/hp-server
 Restart=on-failure
 RestartSec=5
 

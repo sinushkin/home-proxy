@@ -18,7 +18,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +37,7 @@ use crate::reorder::{ReorderStats, Resequencer};
 use crate::punch::{self, LinkEvent, LinkSender, PeerIdentity, PeerLinkStat, PunchConfig};
 use crate::rendezvous::{self, PeerSession, Registrar};
 use crate::stun;
+use crate::vps;
 
 /// Сколько дыр набираем.
 pub const TARGET_LINKS: u8 = 10;
@@ -265,6 +267,39 @@ enum Announce {
     /// Остальные: тот же `Rendezvous` шлём напрямую по живым дырам
     /// (виртуал-брокер).
     VirtualBroker(Arc<Mutex<LinkRegistry>>),
+    /// VPS-сервер, слот 0: запись отдаём клиенту на порту знакомства.
+    VpsServer(Arc<vps::ServerBootstrap>),
+    /// VPS-клиент, слот 0: запись шлём серверу на порт знакомства.
+    VpsClient(Arc<vps::ClientBootstrap>),
+}
+
+/// Как стороны узнают друг о друге.
+#[derive(Clone, Debug)]
+pub enum Discovery {
+    /// Обычный режим: STUN + MQTT, пробив NAT.
+    StunMqtt { stun_addrs: Vec<SocketAddr>, mqtt_addr: SocketAddr, mqtt_ca_pem: Vec<u8> },
+    /// Сервер с белым IP: слушает порт знакомства, слоты занимают случайные порты из
+    /// `ports`, пробив пассивный (ждём клиента).
+    VpsServer { public_ip: IpAddr, bootstrap_port: u16, ports: RangeInclusive<u16> },
+    /// Клиент VPS-сервера: знает `ip:порт знакомства`, ни STUN, ни MQTT не нужен.
+    VpsClient { server: SocketAddr },
+}
+
+/// Как слот получает свои адреса и стучится к пиру.
+#[derive(Clone)]
+enum SlotMode {
+    Stun(Vec<SocketAddr>),
+    VpsServer { public_ip: IpAddr, bootstrap_port: u16, ports: RangeInclusive<u16> },
+    VpsClient,
+}
+
+/// Снимает запись слота 0 сервера, когда анонс больше не нужен.
+struct ClearOnDrop(Arc<vps::ServerBootstrap>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.set(None);
+    }
 }
 
 /// Запущенный менеджер.
@@ -314,6 +349,7 @@ pub struct MultiLink {
     picker: Mutex<SlotPicker>,
     wrap_seq: Mutex<SeqCounters>,
     data_holes: u8,
+    redrop_txs: Vec<mpsc::Sender<()>>,
 }
 
 impl MultiLink {
@@ -342,13 +378,43 @@ impl MultiLink {
         peer_id: Uuid,
         options: MultiLinkOptions,
     ) -> Result<(Self, mpsc::Receiver<Incoming>)> {
+        let discovery = Discovery::StunMqtt { stun_addrs, mqtt_addr, mqtt_ca_pem };
+        Self::start_discovery(label, discovery, my_peer_id, peer_id, options).await
+    }
+
+    /// Запуск с явным способом знакомства (обычный или VPS).
+    pub async fn start_discovery(
+        label: &str,
+        discovery: Discovery,
+        my_peer_id: Uuid,
+        peer_id: Uuid,
+        options: MultiLinkOptions,
+    ) -> Result<(Self, mpsc::Receiver<Incoming>)> {
         let label = Label::new(label);
-        let (registrar, peer_rx) =
-            rendezvous::connect(label.clone(), mqtt_addr, mqtt_ca_pem, my_peer_id, peer_id)
-            .await
-            .context("не удалось подключиться к MQTT-брокеру")?;
-        let registrar = Arc::new(registrar);
         let registry = Arc::new(Mutex::new(LinkRegistry::default()));
+        let (slot0_announce, mode, mqtt_rx, punch) = match &discovery {
+            Discovery::StunMqtt { stun_addrs, mqtt_addr, mqtt_ca_pem } => {
+                let (registrar, peer_rx) =
+                    rendezvous::connect(label.clone(), *mqtt_addr, mqtt_ca_pem.clone(), my_peer_id, peer_id)
+                        .await
+                        .context("не удалось подключиться к MQTT-брокеру")?;
+                (Announce::Mqtt(Arc::new(registrar)), SlotMode::Stun(stun_addrs.clone()), Some(peer_rx), PunchConfig::default())
+            }
+            Discovery::VpsServer { public_ip, bootstrap_port, ports } => (
+                Announce::VpsServer(Arc::new(vps::ServerBootstrap::default())),
+                SlotMode::VpsServer { public_ip: *public_ip, bootstrap_port: *bootstrap_port, ports: ports.clone() },
+                None,
+                PunchConfig::default(),
+            ),
+            Discovery::VpsClient { server } => (
+                Announce::VpsClient(Arc::new(
+                    vps::ClientBootstrap::new(*server, vps::bootstrap_key(my_peer_id, peer_id)).await?,
+                )),
+                SlotMode::VpsClient,
+                None,
+                PunchConfig { margin: 0, ..PunchConfig::default() },
+            ),
+        };
 
         let (events_tx, events_rx) = mpsc::channel::<LinkEvent>(64);
         let (incoming_tx, incoming_rx) = mpsc::channel::<Incoming>(64);
@@ -357,8 +423,13 @@ impl MultiLink {
         let mut slot_txs: Vec<mpsc::Sender<PeerSession>> = Vec::new();
         let mut redrop_txs: Vec<mpsc::Sender<()>> = Vec::new();
         for slot in 0..TARGET_LINKS {
+            let port = match mode {
+                SlotMode::Stun(_) => slot_port(options.local_port_base, slot),
+                // В VPS-режимах слот занимает порт заново на каждую регистрацию.
+                _ => 0,
+            };
             let socket = Arc::new(
-                UdpSocket::bind(("0.0.0.0", slot_port(options.local_port_base, slot)))
+                UdpSocket::bind(("0.0.0.0", port))
                     .await
                     .with_context(|| format!("не удалось создать сокет для слота {slot}"))?,
             );
@@ -367,19 +438,19 @@ impl MultiLink {
             slot_txs.push(slot_tx);
             redrop_txs.push(redrop_tx);
             let announce = if slot == BOOTSTRAP_SLOT {
-                Announce::Mqtt(registrar.clone())
+                slot0_announce.clone()
             } else {
                 Announce::VirtualBroker(registry.clone())
             };
             tokio::spawn(slot_worker(SlotCtx {
                 slot,
                 socket,
-                stun_addrs: stun_addrs.clone(),
+                mode: mode.clone(),
                 my_peer_id,
                 peer_id,
                 announce,
                 registry: registry.clone(),
-                punch: PunchConfig::default(),
+                punch: punch.clone(),
                 peer_rx: slot_rx,
                 redrop_rx,
                 events: events_tx.clone(),
@@ -388,7 +459,31 @@ impl MultiLink {
             }));
         }
 
-        tokio::spawn(demux(peer_rx, slot_txs.clone()));
+        match (&slot0_announce, &discovery) {
+            (Announce::VpsServer(boot), Discovery::VpsServer { bootstrap_port, .. }) => {
+                let socket = UdpSocket::bind(("0.0.0.0", *bootstrap_port))
+                    .await
+                    .with_context(|| format!("не удалось занять порт знакомства {bootstrap_port}"))?;
+                log::info!("{label}VPS-сервер: порт знакомства {bootstrap_port}");
+                tokio::spawn(vps::serve_bootstrap(
+                    socket,
+                    boot.clone(),
+                    vps::bootstrap_key(my_peer_id, peer_id),
+                    peer_id,
+                    slot_txs[BOOTSTRAP_SLOT as usize].clone(),
+                ));
+            }
+            (Announce::VpsClient(boot), _) => {
+                log::info!("{label}VPS-клиент: сервер {}", boot.server);
+                let (boot, tx) = (boot.clone(), slot_txs[BOOTSTRAP_SLOT as usize].clone());
+                tokio::spawn(async move { boot.receive(peer_id, tx).await });
+            }
+            _ => {}
+        }
+        if let Some(peer_rx) = mqtt_rx {
+            tokio::spawn(demux(peer_rx, slot_txs.clone()));
+        }
+        let redrop_for_api = redrop_txs.clone();
         tokio::spawn(keepalive_loop(registry.clone()));
         tokio::spawn(stats_loop(registry.clone()));
         tokio::spawn(control_loop(
@@ -408,6 +503,7 @@ impl MultiLink {
             picker: Mutex::new(SlotPicker::default()),
             wrap_seq: Mutex::new(SeqCounters::default()),
             data_holes: options.data_holes,
+            redrop_txs: redrop_for_api,
         };
         Ok((multilink, incoming_rx))
     }
@@ -450,6 +546,21 @@ impl MultiLink {
 
     pub fn live_count(&self) -> usize {
         self.registry.lock().unwrap().live_count()
+    }
+
+    /// Перенести дыру `slot` на новые порты: слот регистрируется заново (в VPS-режиме —
+    /// на новом порту сервера), пиру уходит `DeleteLink`, чтобы и он бросил старую.
+    pub async fn move_slot(&self, slot: u8) {
+        request_redrop(&self.redrop_txs, slot);
+        broadcast_delete_link(&self.registry, slot).await;
+    }
+
+    /// Живые дыры: слот и текущий адрес пира.
+    pub fn live_links(&self) -> Vec<(u8, Option<SocketAddr>)> {
+        let mut links: Vec<_> =
+            self.registry.lock().unwrap().links().into_iter().map(|l| (l.slot, l.sender.peer_addr())).collect();
+        links.sort_by_key(|l| l.0);
+        links
     }
 
     pub fn my_peer_id(&self) -> Uuid {
@@ -641,7 +752,7 @@ async fn broadcast_delete_link(registry: &Arc<Mutex<LinkRegistry>>, slot: u8) {
 struct SlotCtx {
     slot: u8,
     socket: Arc<UdpSocket>,
-    stun_addrs: Vec<SocketAddr>,
+    mode: SlotMode,
     my_peer_id: Uuid,
     peer_id: Uuid,
     announce: Announce,
@@ -664,13 +775,35 @@ async fn slot_worker(mut ctx: SlotCtx) {
         let my_key = codec::random_key();
         ctx.state.set(ctx.slot, SlotPhase::Starting);
 
-        let my_endpoints = match observe_endpoints(&ctx.socket, &ctx.stun_addrs).await {
-            Ok(endpoints) => endpoints,
-            Err(e) => {
-                log::warn!("{label}слот {}: STUN не удался: {e:#}; повтор", ctx.slot);
+        // VPS-режимы: на каждую регистрацию слот занимает новый порт (плохую дыру
+        // переносим на другой порт, у клиента — новый локальный адрес).
+        let rebound = match &ctx.mode {
+            SlotMode::Stun(_) => None,
+            SlotMode::VpsServer { ports, bootstrap_port, .. } => Some(vps::bind_random_port(ports, *bootstrap_port).await),
+            SlotMode::VpsClient => Some(UdpSocket::bind(("0.0.0.0", 0)).await.context("сокет слота")),
+        };
+        match rebound {
+            Some(Ok(socket)) => ctx.socket = Arc::new(socket),
+            Some(Err(e)) => {
+                log::warn!("{label}слот {}: не удалось занять порт: {e:#}; повтор", ctx.slot);
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
+            None => {}
+        }
+        let local_port = ctx.socket.local_addr().map(|a| a.port()).unwrap_or(0);
+
+        let my_endpoints = match &ctx.mode {
+            SlotMode::Stun(stun_addrs) => match observe_endpoints(&ctx.socket, stun_addrs).await {
+                Ok(endpoints) => endpoints,
+                Err(e) => {
+                    log::warn!("{label}слот {}: STUN не удался: {e:#}; повтор", ctx.slot);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            },
+            SlotMode::VpsServer { public_ip, .. } => vec![SocketAddr::new(*public_ip, local_port)],
+            SlotMode::VpsClient => vec![SocketAddr::from(([0, 0, 0, 0], local_port))],
         };
 
         // Анонсируем себя пиру: bootstrap-слот — публикацией в MQTT, остальные
@@ -710,19 +843,32 @@ async fn slot_worker(mut ctx: SlotCtx) {
             peer_key: peer.key,
         };
         let my_endpoint = my_endpoints[0];
-        let candidates = peer.candidates();
-        let (low, high) = port_utils::sweep_bounds(my_endpoint.port(), peer.addr.port(), ctx.punch.margin);
-        log::info!(
-            "{label}слот {}: пробив {low}..={high} на {} (STUN-порт пира {}){}",
-            ctx.slot,
-            peer.addr.ip(),
-            peer.addr.port(),
-            if candidates.len() > 1 {
-                format!(", ещё адреса пира: {:?}", &candidates[1..])
-            } else {
-                String::new()
+        let candidates = match &ctx.mode {
+            SlotMode::Stun(_) => {
+                let candidates = peer.candidates();
+                let (low, high) = port_utils::sweep_bounds(my_endpoint.port(), peer.addr.port(), ctx.punch.margin);
+                log::info!(
+                    "{label}слот {}: пробив {low}..={high} на {} (STUN-порт пира {}){}",
+                    ctx.slot,
+                    peer.addr.ip(),
+                    peer.addr.port(),
+                    if candidates.len() > 1 {
+                        format!(", ещё адреса пира: {:?}", &candidates[1..])
+                    } else {
+                        String::new()
+                    }
+                );
+                candidates
             }
-        );
+            SlotMode::VpsServer { .. } => {
+                log::info!("{label}слот {}: ждём клиента на порту {local_port}", ctx.slot);
+                Vec::new()
+            }
+            SlotMode::VpsClient => {
+                log::info!("{label}слот {}: идём на порт сервера {}", ctx.slot, peer.addr);
+                vec![peer.addr]
+            }
+        };
 
         ctx.state.set(ctx.slot, SlotPhase::Punching);
         let attempt = punch::establish(
@@ -811,6 +957,18 @@ async fn announce_slot(
         Announce::VirtualBroker(registry) => {
             let rendezvous = our_rendezvous(my_peer_id, slot, session, endpoints, key);
             Ok(spawn_hole_announce(registry.clone(), rendezvous))
+        }
+        Announce::VpsServer(boot) => {
+            boot.set(Some(our_rendezvous(my_peer_id, slot, session, endpoints, key)));
+            let guard = ClearOnDrop(boot.clone());
+            Ok(AbortOnDrop(tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })))
+        }
+        Announce::VpsClient(boot) => {
+            let (boot, record) = (boot.clone(), our_rendezvous(my_peer_id, slot, session, endpoints, key));
+            Ok(AbortOnDrop(tokio::spawn(async move { boot.announce(record).await })))
         }
     }
 }
@@ -1118,5 +1276,60 @@ mod tests {
         assert_eq!(slot_port(0, 3), 0);
         assert_eq!(slot_port(51410, 0), 51410);
         assert_eq!(slot_port(51410, 9), 51419);
+    }
+
+    async fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while !ok() {
+            assert!(tokio::time::Instant::now() < deadline, "не дождались: {what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// VPS-режим целиком на loopback: знакомство через порт сервера, 10 дыр без STUN и
+    /// MQTT, данные в обе стороны, перенос слота на новый порт сервера.
+    #[tokio::test]
+    async fn vps_server_and_client_link_all_slots_and_move_a_slot() {
+        let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let options = MultiLinkOptions::default();
+        let (server, mut server_rx) = MultiLink::start_discovery(
+            "",
+            Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap_port, ports: 47100..=47299 },
+            server_id,
+            client_id,
+            options,
+        )
+        .await
+        .unwrap();
+        let (client, mut client_rx) = MultiLink::start_discovery(
+            "",
+            Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)) },
+            client_id,
+            server_id,
+            options,
+        )
+        .await
+        .unwrap();
+
+        wait_until("10 дыр с обеих сторон", 40, || server.live_count() == 10 && client.live_count() == 10).await;
+        for (_, addr) in client.live_links() {
+            let port = addr.unwrap().port();
+            assert!((47100..=47299).contains(&port), "клиент ходит на порт из диапазона сервера: {port}");
+        }
+
+        client.send_data(b"ping".to_vec()).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), server_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(got.payload, b"ping");
+        server.send_data(b"pong".to_vec()).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), client_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(got.payload, b"pong");
+
+        let old = client.live_links().into_iter().find(|l| l.0 == 3).unwrap().1.unwrap();
+        server.move_slot(3).await;
+        wait_until("слот 3 на новом порту сервера", 40, || {
+            client.live_links().iter().any(|l| l.0 == 3 && l.1.is_some_and(|a| a != old)) && client.live_count() == 10
+        })
+        .await;
     }
 }

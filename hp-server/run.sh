@@ -24,12 +24,12 @@ export RUST_LOG="${RUST_LOG:-server=${LOG_LEVEL},connection=${LOG_LEVEL}}"
 
 echo "server: я=$MY_ID роутер=$PEER_ID WireGuard=${WG_ADDR:-127.0.0.1:51820} RUST_LOG=$RUST_LOG" >&2
 
-# В чекауте пересобираем через cargo; на хосте без cargo — готовый ./server.
+# В чекауте пересобираем через cargo; на хосте без cargo — готовый ./hp-server.
 if [[ -f ../Cargo.toml ]] && command -v cargo >/dev/null 2>&1; then
-  exec cargo run --release -q -p server
-elif [[ -x ./server ]]; then
-  exec ./server
+  exec cargo run --release -q -p hp-server
+elif [[ -x ./hp-server ]]; then
+  exec ./hp-server
 else
-  echo "не нашёл ни cargo с исходниками, ни бинарника ./server" >&2
+  echo "не нашёл ни cargo с исходниками, ни бинарника ./hp-server" >&2
   exit 1
 fi

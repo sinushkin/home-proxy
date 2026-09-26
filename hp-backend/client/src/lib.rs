@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use bridge::Bridge;
-use connection::multilink::{MultiLink, MultiLinkOptions, TARGET_LINKS};
+use connection::multilink::{Discovery, MultiLink, MultiLinkOptions, TARGET_LINKS};
 use connection::relay::PlainOut;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -68,26 +68,27 @@ pub struct Client {
 
 impl Client {
     pub async fn start(config: ClientConfig) -> Result<Self> {
-        // Порт занимаем первым: ошибку «адрес занят» лучше получить до сети.
-        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], config.local_port)))
-            .await
-            .with_context(|| format!("не удалось занять локальный порт {}", config.local_port))?;
-
-        let options = MultiLinkOptions {
-            reorder_wait: std::time::Duration::from_millis(u64::from(config.reorder_wait_ms)),
-            data_holes: config.data_holes,
-            local_port_base: 0,
+        let discovery = Discovery::StunMqtt {
+            stun_addrs: config.stun_addrs,
+            mqtt_addr: config.mqtt_addr,
+            mqtt_ca_pem: config.mqtt_ca_pem,
         };
-        let (multilink, incoming) = MultiLink::start_with(
-            "",
-            config.stun_addrs,
-            config.mqtt_addr,
-            config.mqtt_ca_pem,
-            config.my_id,
-            config.peer_id,
-            options,
-        )
-        .await?;
+        let options = options(config.reorder_wait_ms, config.data_holes);
+        Self::start_discovery(discovery, config.my_id, config.peer_id, config.local_port, options).await
+    }
+
+    async fn start_discovery(
+        discovery: Discovery,
+        my_id: Uuid,
+        peer_id: Uuid,
+        local_port: u16,
+        options: MultiLinkOptions,
+    ) -> Result<Self> {
+        // Порт занимаем первым: ошибку «адрес занят» лучше получить до сети.
+        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], local_port)))
+            .await
+            .with_context(|| format!("не удалось занять локальный порт {local_port}"))?;
+        let (multilink, incoming) = MultiLink::start_discovery("", discovery, my_id, peer_id, options).await?;
         let multilink = Arc::new(multilink);
         let bridge = Bridge::start(socket, PlainOut(multilink.clone()), incoming)?;
         log::info!("клиент запущен: мост для WireGuard на {}", bridge.local_addr());
@@ -107,6 +108,14 @@ impl Client {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.bridge.local_addr()
+    }
+}
+
+fn options(reorder_wait_ms: u32, data_holes: u8) -> MultiLinkOptions {
+    MultiLinkOptions {
+        reorder_wait: std::time::Duration::from_millis(u64::from(reorder_wait_ms)),
+        data_holes,
+        local_port_base: 0,
     }
 }
 

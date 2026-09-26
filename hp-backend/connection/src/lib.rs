@@ -8,6 +8,7 @@ pub mod relay;
 pub mod reorder;
 pub mod rendezvous;
 pub mod stun;
+pub mod vps;
 pub mod xor;
 
 pub mod proto {

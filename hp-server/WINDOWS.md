@@ -1,13 +1,13 @@
 # server на Windows: что важно знать
 
-Короткие заметки по `server.exe` как службе Windows и по тестовой Windows-ВМ. Установка по
+Короткие заметки по `hp-server.exe` как службе Windows и по тестовой Windows-ВМ. Установка по
 шагам — [`../windows/README.md`](../windows/README.md), общее устройство моста —
 [`README.md`](README.md).
 
 ## Сборка и служба
 
 - Собирается на самой Windows: Rust (MSVC) и `protoc` (`PROTOC=путь\protoc.exe`, отдельной
-  установки не нужно, хватит распаковки архива). `cargo build --release -p server` из корня.
+  установки не нужно, хватит распаковки архива). `cargo build --release -p hp-server` из корня.
 - Служба `homeproxy-server`: `server install --config server.env`, `server uninstall`,
   запуск диспетчером — `--service`. Автозапуск, при сбое перезапуск через 5 с, зависит от
   туннеля `WireGuardTunnel$wghp` (ставит `install.ps1`).
@@ -57,7 +57,7 @@
   (WireGuard остановлен), следующий `recv` возвращает `ConnectionReset` (на Linux —
   `ConnectionRefused`). Раньше читатель ответов клиента из-за этого навсегда завершался;
   теперь игнорирует эти ошибки (тест `client_survives_wireguard_restart`).
-- Правила брандмауэра `server.exe`: входящий UDP разрешён (`install.ps1` создаёт правило
+- Правила брандмауэра `hp-server.exe`: входящий UDP разрешён (`install.ps1` создаёт правило
   `homeproxy-server`).
 - **Не выполняйте `netsh advfirewall ...` и не меняйте правила во время работы дыр**:
   перезагрузка правил сбрасывает UDP-состояние, и все дыры теряются.

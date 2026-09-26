@@ -6,7 +6,7 @@
 ```
 телефон: WireGuard (libwg-go) -> 127.0.0.1:51821 (мост)
       -> 10 дыр (libhomeproxy.so) ==== интернет ====
-ПК:   homeproxy-server (server/) -> 127.0.0.1:51820 -> WireGuard wghp (10.77.0.1)
+ПК:   homeproxy-server (hp-server/) -> 127.0.0.1:51820 -> WireGuard wghp (10.77.0.1)
       -> NAT (enp4s0) -> интернет
 ```
 
@@ -58,9 +58,9 @@ sudo wg show wghp                           # должен показать пи
 
 ```bash
 cd ..                                          # корень репозитория
-cargo build --release -p server
+cargo build --release -p hp-server
 . wireguard/out/guids.env
-cat > server/.env <<EOF2
+cat > hp-server/.env <<EOF2
 STUN_ADDR=203.0.113.10:3499
 MQTT_ADDR=203.0.113.10:8883
 MQTT_CA=../cert/out/ca.crt
@@ -74,7 +74,7 @@ journalctl -u homeproxy-server -f            # логи
 ```
 
 `PEER_ID` — GUID телефона: без роутера сервер принимает от него обычную `Data`,
-как «прямого клиента», и отвечает тем же (`server/README.md`).
+как «прямого клиента», и отвечает тем же (`hp-server/README.md`).
 
 **Про STUN на ПК.** STUN должен идти тем же маршрутом, каким ПК выходит к телефону.
 По правилам `o1` (`vpn-bypass.nft`) UDP с портом назначения 3479–19000 и

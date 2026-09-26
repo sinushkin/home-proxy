@@ -18,13 +18,16 @@
 //! Логи: `RUST_LOG` (по умолчанию `info`), `LOG_TARGET=syslog` — в syslog,
 //! `LOG_FILE=путь` — в файл.
 //!
-//! Запуск: `server [--config server.env]` — обычный процесс (без `--config` берётся
+//! Библиотечная часть (`bridge`, `settings`, `Common`, `serve`) переиспользуется
+//! крейтом `vps-server`.
+//!
+//! Запуск: `hp-server [--config server.env]` — обычный процесс (без `--config` берётся
 //! `server.env` рядом с бинарником, если есть, иначе только окружение).
-//! Windows: `server install --config C:\путь\server.env` регистрирует службу
-//! `homeproxy-server`, `server uninstall` удаляет (см. `windows/README.md`).
+//! Windows: `hp-server install --config C:\путь\server.env` регистрирует службу
+//! `homeproxy-server`, `hp-server uninstall` удаляет (см. `windows/README.md`).
 
-mod bridge;
-mod settings;
+pub mod bridge;
+pub mod settings;
 #[cfg(windows)]
 mod winsvc;
 
@@ -35,7 +38,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bridge::{Bridge, ClientKey, Reply};
-use connection::multilink::{MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::multilink::{Discovery, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
 use settings::Settings;
 use uuid::Uuid;
 
@@ -55,20 +58,18 @@ impl Reply for ToPeer {
     }
 }
 
-struct Config {
-    stun_addrs: Vec<SocketAddr>,
-    mqtt_addr: SocketAddr,
-    mqtt_ca: PathBuf,
-    my_id: Uuid,
-    peer_id: Uuid,
-    wg_addr: SocketAddr,
-    client_timeout: Duration,
-    reorder_wait: Duration,
-    data_holes: u8,
+/// Настройки моста, общие для `hp-server` и `vps-server`.
+pub struct Common {
+    pub my_id: Uuid,
+    pub peer_id: Uuid,
+    pub wg_addr: SocketAddr,
+    pub client_timeout: Duration,
+    pub reorder_wait: Duration,
+    pub data_holes: u8,
 }
 
-impl Config {
-    fn from_settings(settings: &Settings) -> Result<Self> {
+impl Common {
+    pub fn from_settings(settings: &Settings) -> Result<Self> {
         let get = |name: &str| settings.get(name);
         let need = |name: &str| get(name).with_context(|| format!("не задана переменная {name}"));
         let client_timeout_secs: u64 = match get("CLIENT_TIMEOUT_SECS") {
@@ -76,9 +77,6 @@ impl Config {
             None => 300,
         };
         Ok(Self {
-            stun_addrs: connection::stun::parse_servers(&need("STUN_ADDR")?).context("STUN_ADDR")?,
-            mqtt_addr: need("MQTT_ADDR")?.parse().context("MQTT_ADDR: ожидается ip:порт")?,
-            mqtt_ca: settings.resolve(&need("MQTT_CA")?),
             my_id: need("MY_ID")?.parse().context("MY_ID: некорректный GUID")?,
             peer_id: need("PEER_ID")?.parse().context("PEER_ID: некорректный GUID")?,
             wg_addr: get("WG_ADDR")
@@ -96,6 +94,27 @@ impl Config {
             },
         })
     }
+}
+
+/// Логи по настройкам: `LOG_FILE` считается от каталога файла настроек.
+pub fn init_logging(settings: &Settings) -> Result<()> {
+    hp_logging::init_with(|name| match name {
+        "LOG_FILE" => settings.get(name).map(|path| settings.resolve(&path).to_string_lossy().into_owned()),
+        _ => settings.get(name),
+    })?;
+    Ok(())
+}
+
+/// Обычный (P2P) режим: встреча через STUN и MQTT.
+fn p2p_discovery(settings: &Settings) -> Result<Discovery> {
+    let need = |name: &str| settings.get(name).with_context(|| format!("не задана переменная {name}"));
+    let mqtt_ca = settings.resolve(&need("MQTT_CA")?);
+    Ok(Discovery::StunMqtt {
+        stun_addrs: connection::stun::parse_servers(&need("STUN_ADDR")?).context("STUN_ADDR")?,
+        mqtt_addr: need("MQTT_ADDR")?.parse().context("MQTT_ADDR: ожидается ip:порт")?,
+        mqtt_ca_pem: std::fs::read(&mqtt_ca)
+            .with_context(|| format!("не удалось прочитать CA-сертификат {}", mqtt_ca.display()))?,
+    })
 }
 
 enum Command {
@@ -130,7 +149,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 }
 
 /// Файл настроек по умолчанию: `server.env` рядом с бинарником, если он есть.
-fn default_config() -> Option<PathBuf> {
+pub fn default_config() -> Option<PathBuf> {
     let path = std::env::current_exe().ok()?.parent()?.join("server.env");
     path.is_file().then_some(path)
 }
@@ -138,14 +157,12 @@ fn default_config() -> Option<PathBuf> {
 /// Поднимает логи и runtime и гоняет сервер, пока он сам не завершится или не
 /// придёт `shutdown` (остановка службы).
 fn run_blocking(settings: &Settings, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
-    hp_logging::init_with(|name| match name {
-        "LOG_FILE" => settings.get(name).map(|path| settings.resolve(&path).to_string_lossy().into_owned()),
-        _ => settings.get(name),
-    })?;
-    let config = Config::from_settings(settings)?;
+    init_logging(settings)?;
+    let common = Common::from_settings(settings)?;
+    let discovery = p2p_discovery(settings)?;
     tokio::runtime::Runtime::new()?.block_on(async {
         tokio::select! {
-            result = serve(config) => result,
+            result = serve(discovery, common) => result,
             () = shutdown => {
                 log::info!("получена команда остановки");
                 Ok(())
@@ -154,7 +171,8 @@ fn run_blocking(settings: &Settings, shutdown: impl std::future::Future<Output =
     })
 }
 
-fn main() -> Result<()> {
+/// Точка входа `hp-server`.
+pub fn main() -> Result<()> {
     let cli = parse_args(std::env::args().skip(1))?;
     let config = cli.config.clone().or_else(default_config);
     match cli.command {
@@ -172,32 +190,23 @@ fn main() -> Result<()> {
     }
 }
 
-async fn serve(config: Config) -> Result<()> {
-    let ca_pem = std::fs::read(&config.mqtt_ca)
-        .with_context(|| format!("не удалось прочитать CA-сертификат {}", config.mqtt_ca.display()))?;
-
+/// Мост «дыры → WireGuard»: поднимает `MultiLink` с заданным способом встречи и
+/// раскладывает пакеты по клиентам, пока канал входящих жив.
+pub async fn serve(discovery: Discovery, common: Common) -> Result<()> {
     log::info!(
         "сервер: я {} ищу пира {} (роутер или телефон), WireGuard {}, клиент удаляется через {} с тишины, порядок пакетов: ожидание {} мс, дыр для данных: {}",
-        config.my_id,
-        config.peer_id,
-        config.wg_addr,
-        config.client_timeout.as_secs(),
-        config.reorder_wait.as_millis(),
-        if config.data_holes == 0 { "все".to_string() } else { config.data_holes.to_string() }
+        common.my_id,
+        common.peer_id,
+        common.wg_addr,
+        common.client_timeout.as_secs(),
+        common.reorder_wait.as_millis(),
+        if common.data_holes == 0 { "все".to_string() } else { common.data_holes.to_string() }
     );
 
-    let (link, mut incoming) = MultiLink::start_with(
-        "",
-        config.stun_addrs,
-        config.mqtt_addr,
-        ca_pem,
-        config.my_id,
-        config.peer_id,
-        MultiLinkOptions { reorder_wait: config.reorder_wait, data_holes: config.data_holes, local_port_base: 0 },
-    )
-    .await?;
+    let options = MultiLinkOptions { reorder_wait: common.reorder_wait, data_holes: common.data_holes, local_port_base: 0 };
+    let (link, mut incoming) = MultiLink::start_discovery("", discovery, common.my_id, common.peer_id, options).await?;
     let link = Arc::new(link);
-    let bridge = Bridge::new(config.wg_addr, ToPeer(link.clone()), config.client_timeout);
+    let bridge = Bridge::new(common.wg_addr, ToPeer(link.clone()), common.client_timeout);
 
     let cleanup_bridge = bridge.clone();
     tokio::spawn(async move {
@@ -217,7 +226,7 @@ async fn serve(config: Config) -> Result<()> {
             ticker.tick().await;
             let now = (status_bridge.client_count(), status_link.live_count());
             if now != last {
-                log::info!("клиентов: {}, дыр к роутеру: {}/{TARGET_LINKS}", now.0, now.1);
+                log::info!("клиентов: {}, дыр к пиру: {}/{TARGET_LINKS}", now.0, now.1);
                 last = now;
             }
         }
@@ -264,4 +273,5 @@ mod tests {
         assert!(parse_args(args(&["--config"])).is_err());
         assert!(parse_args(args(&["--nope"])).is_err());
     }
+
 }

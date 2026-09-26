@@ -6,7 +6,9 @@ members = [
     "hp-backend/logging",
     "hp-backend/client",
     "hp-backend/android-lib",
-    "server",
+    "hp-server",
+    "vps-server",
+    "vps-client",
     "router",
 ]
 

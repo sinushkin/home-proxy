@@ -7,12 +7,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY hp-backend hp-backend
 COPY server server
 COPY router router
-RUN cargo build --release -p server && strip target/release/server
+RUN cargo build --release -p hp-server && strip target/release/hp-server
 
 FROM alpine:3.20
 RUN apk add --no-cache wireguard-tools iptables iproute2 \
     && rm -rf /var/cache/apk/* /etc/motd
-COPY --from=build /src/target/release/server /usr/local/bin/homeproxy-server
+COPY --from=build /src/target/release/hp-server /usr/local/bin/homeproxy-server
 COPY wsl/rootfs/ /
 RUN chmod +x /usr/local/bin/homeproxy-start /usr/local/bin/homeproxy-stop \
     && mkdir -p /etc/homeproxy /etc/wireguard

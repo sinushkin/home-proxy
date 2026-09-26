@@ -1,4 +1,4 @@
-# `server` — мост «клиенты (роутера или телефона) → WireGuard»
+# `hp-server` — мост «клиенты (роутера или телефона) → WireGuard»
 
 Принимает от роутера пакеты клиентов (`WrappedData` с `client_id`) по общему
 набору из 10 дыр и передаёт их WireGuard'у, а ответы WireGuard'а отправляет
@@ -49,9 +49,14 @@ cp .env.example .env     # MY_ID, PEER_ID, адреса, ca.crt
 
 Пакеты по клиентам видны на `DEBUG` (`RUST_LOG=server=debug,connection=debug`).
 
+## VPS-режим
+
+Сервер для машины с белым IP (без пробива) — отдельный крейт [`../vps-server`](../vps-server/README.md);
+он переиспользует мост и настройки этого крейта (`hp_server::{bridge, settings, Common, serve}`).
+
 ## Windows
 
-`server.exe` собирается и работает и под Windows, в том числе как служба `homeproxy-server`
+`hp-server.exe` собирается и работает и под Windows, в том числе как служба `homeproxy-server`
 (`server install --config server.env`, `server uninstall`). Настройки службы — файл
 `server.env` (`--config`, по умолчанию `server.env` рядом с бинарником; переменные окружения
 главнее файла, относительные пути — от каталога файла). Установка целиком (WireGuard, NAT,
@@ -59,7 +64,7 @@ cp .env.example .env     # MY_ID, PEER_ID, адреса, ca.crt
 
 ## Проверка
 
-Логика моста покрыта тестами (`cargo test -p server`): отдельные локальные
+Логика моста покрыта тестами (`cargo test -p hp-server`): отдельные локальные
 адреса для клиентов, возврат ответов нужному клиенту, удаление неактивных,
 игнорирование чужих отправителей, переживание рестарта WireGuard (на Windows остановленный
 WireGuard даёт `ConnectionReset` на приёме, на Linux — `ConnectionRefused`), разбор файла

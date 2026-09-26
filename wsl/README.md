@@ -29,7 +29,7 @@ WireGuard с NAT и `server` (дыры → WireGuard). Образ на базе 
 
 | Файл | Что |
 |---|---|
-| `server.env` | как `server/.env`: `STUN_ADDR`, `MQTT_ADDR`, `MQTT_CA=ca.crt`, `MY_ID`, `PEER_ID` |
+| `server.env` | как `hp-server/.env`: `STUN_ADDR`, `MQTT_ADDR`, `MQTT_CA=ca.crt`, `MY_ID`, `PEER_ID` |
 | `wghp.conf` | конфиг WireGuard с `PostUp`/`PostDown` (их делает `wireguard/gen.sh`) |
 | `ca.crt` | CA-сертификат брокера (путь из `MQTT_CA` считается от каталога `server.env`) |
 
@@ -61,7 +61,7 @@ wsl/build.sh          # результат: wsl/out/homeproxy-wsl.tar.gz
 WG_OUT_IFACE=eth0 wireguard/gen.sh          # или WG_OUT_DIR=out/wsl WG_OUT_IFACE=eth0 ./gen.sh
 ```
 
-`server.env` создайте по образцу `server/.env.example`, `MQTT_CA=ca.crt`, `MY_ID = PC_ID`,
+`server.env` создайте по образцу `hp-server/.env.example`, `MQTT_CA=ca.crt`, `MY_ID = PC_ID`,
 `PEER_ID = PHONE_ID` из `guids.env`. Файлы должны быть с окончаниями строк LF.
 
 ## 4. Импортировать и запустить

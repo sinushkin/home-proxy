@@ -387,6 +387,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hp-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "connection",
+ "hp-logging",
+ "log",
+ "tokio",
+ "uuid",
+ "windows-service",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -949,19 +962,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "connection",
- "hp-logging",
- "log",
- "tokio",
- "uuid",
- "windows-service",
-]
-
-[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1155,6 +1155,30 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "vps-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "connection",
+ "hp-client",
+ "hp-logging",
+ "log",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "vps-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "connection",
+ "hp-server",
+ "log",
+ "tokio",
 ]
 
 [[package]]

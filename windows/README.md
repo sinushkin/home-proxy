@@ -4,7 +4,7 @@
 только под Windows.
 
 ```
-телефон -> 10 дыр ==== интернет ==== ПК: служба homeproxy-server (server.exe)
+телефон -> 10 дыр ==== интернет ==== ПК: служба homeproxy-server (hp-server.exe)
                                       -> 127.0.0.1:51820 -> WireGuard-туннель wghp (10.77.0.1)
                                       -> NAT (New-NetNat) -> интернет
 ```
@@ -21,11 +21,11 @@
   «Недопустимый класс»). Если его нет, `install.ps1` сам возьмёт общий доступ к интернету
   (ICS, подсеть туннеля должна быть `/24`). Режим задаёт `-Nat Auto|NetNat|Ics|None`.
 - Ключи и GUID'ы: `wireguard/gen.sh` на Linux (нужен `wg`), результат в `wireguard/out/`.
-- `server.exe`. Собирается на самой Windows: Rust (MSVC), [`protoc`](https://github.com/protocolbuffers/protobuf/releases)
+- `hp-server.exe`. Собирается на самой Windows: Rust (MSVC), [`protoc`](https://github.com/protocolbuffers/protobuf/releases)
   в `PATH` или в `PROTOC`, затем из корня репозитория:
 
   ```powershell
-  cargo build --release -p server        # target\release\server.exe
+  cargo build --release -p hp-server        # target\release\hp-server.exe
   ```
 
 ## 2. Подготовить каталог
@@ -34,7 +34,7 @@
 
 | Файл | Откуда |
 |---|---|
-| `server.exe` | сборка выше |
+| `hp-server.exe` | сборка выше |
 | `server.env` | из [`server.env.example`](server.env.example): адреса STUN/MQTT, `MY_ID = PC_ID`, `PEER_ID = PHONE_ID` |
 | `wghp.conf` | `wireguard/out/wghp.conf` (строки `PostUp`/`PostDown` скрипт отбросит: WireGuard для Windows их не выполняет) |
 | `ca.crt` | `cert/out/ca.crt` (путь в `MQTT_CA`) |
@@ -52,10 +52,10 @@ Get-Content C:\ProgramData\homeproxy\server.log -Tail 20 -Wait
 
 Всё копируется в `C:\ProgramData\homeproxy` (доступ только SYSTEM и администраторам:
 там приватный ключ). Параметры: `-InstallDir`, `-Nat` (по умолчанию `Auto`), `-SkipNat` = `-Nat None` (NAT настроен иначе),
-`-SkipStunBypass`. Скрипт можно запускать повторно (обновление конфигов и `server.exe`).
+`-SkipStunBypass`. Скрипт можно запускать повторно (обновление конфигов и `hp-server.exe`).
 
-Сама служба управляется и без скриптов: `server.exe install --config C:\путь\server.env`
-регистрирует её, `server.exe uninstall` удаляет, `server.exe --config server.env` запускает
+Сама служба управляется и без скриптов: `hp-server.exe install --config C:\путь\server.env`
+регистрирует её, `hp-server.exe uninstall` удаляет, `hp-server.exe --config server.env` запускает
 обычным процессом в консоли (для отладки).
 
 ## 4. Обход VPN для STUN
@@ -110,4 +110,4 @@ powershell -ExecutionPolicy Bypass -File C:\ProgramData\homeproxy\uninstall.ps1
 
 **Не проверено:** путь через `New-NetNat` (на ВМ его нет) и устойчивость дыр на точке доступа
 iPhone (симметричный NAT): в части прогонов дыры пропадали. Подробности и ловушки — в
-[`../server/WINDOWS.md`](../server/WINDOWS.md).
+[`../hp-server/WINDOWS.md`](../hp-server/WINDOWS.md).
