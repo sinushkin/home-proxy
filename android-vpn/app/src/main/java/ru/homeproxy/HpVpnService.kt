@@ -6,8 +6,8 @@ import android.net.VpnService
 import android.util.Log
 
 /**
- * Свой VPN без WireGuard: интерфейс TUN с адресом телефона в туннеле, маршрут на всё и
- * DNS; дескриптор отдаётся клиенту ([HomeProxy.attachTun]), IP-пакеты идут по дырам как есть.
+ * Свой VPN без WireGuard: интерфейс TUN с адресом телефона в туннеле (его выдаёт сервер —
+ * домашний ПК или VPS за роутером), маршрут на всё и DNS от того же сервера; дескриптор отдаётся клиенту ([HomeProxy.attachTun]), IP-пакеты идут по дырам как есть.
  *
  * Само приложение из VPN исключено (`addDisallowedApplication`): его сокеты — дыры, STUN,
  * MQTT — должны ходить напрямую, иначе дыры ушли бы в свой же туннель.
@@ -24,16 +24,17 @@ class HpVpnService : VpnService() {
     /** Поднимает интерфейс и отдаёт его клиенту; null — успех, иначе текст ошибки. */
     private fun connect(): String? {
         if (HomeProxy.liveHoles() < 1) return "дыры ещё не подняты: сначала «Подключить»"
-        val settings = Settings(this)
+        val (address, prefix) = HomeProxy.address() ?: return "адрес в туннеле ещё не выдан сервером"
+        val dns = HomeProxy.dns().ifEmpty { FALLBACK_DNS }
         val pfd = try {
-            Builder()
+            val builder = Builder()
                 .setSession("HomeProxy")
-                .addAddress(settings.tunAddr, 32)
+                .addAddress(address, prefix)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer(settings.dns)
                 .setMtu(MTU)
                 .addDisallowedApplication(packageName)
-                .establish()
+            dns.forEach { builder.addDnsServer(it) }
+            builder.establish()
         } catch (e: Exception) {
             Log.w(TAG, "VPN не поднялся", e)
             return "VPN: ${e.message ?: e}"
@@ -41,7 +42,7 @@ class HpVpnService : VpnService() {
         val error = HomeProxy.attachTun(pfd.detachFd())
         if (error != null) return "TUN: $error"
         VpnController.isUp = true
-        Log.i(TAG, "VPN включён: ${settings.tunAddr}, DNS ${settings.dns}")
+        Log.i(TAG, "VPN включён: $address/$prefix, DNS $dns")
         return null
     }
 
@@ -67,6 +68,8 @@ class HpVpnService : VpnService() {
         private const val TAG = "homeproxy"
         /** MTU туннеля: IP-пакет целиком едет в одной датаграмме дыры (с заголовками и подписью). */
         const val MTU = 1400
+        /** Если сервер не прислал DNS. */
+        val FALLBACK_DNS = listOf("8.8.8.8", "1.1.1.1")
         const val ACTION_CONNECT = "ru.homeproxy.VPN_CONNECT"
         const val ACTION_DISCONNECT = "ru.homeproxy.VPN_DISCONNECT"
 

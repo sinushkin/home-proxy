@@ -19,6 +19,8 @@ object HomeProxy {
 
     @JvmStatic private external fun nativeStop()
     @JvmStatic private external fun nativeStatus(): String
+    @JvmStatic private external fun nativeAddress(): String
+    @JvmStatic private external fun nativeDns(): String
     @JvmStatic private external fun nativeAttachTun(fd: Int): String?
     @JvmStatic private external fun nativeDetachTun()
     @JvmStatic private external fun nativeLiveHoles(): Int
@@ -32,6 +34,20 @@ object HomeProxy {
 
     /** Строка состояния: сколько дыр живо, счётчики пакетов. */
     fun status(): String = nativeStatus()
+
+    /**
+     * Адрес в туннеле, выданный сервером (домашним ПК или VPS за роутером): пара «адрес, префикс»
+     * или null, пока не выдан. VPN поднимается с ним.
+     */
+    fun address(): Pair<String, Int>? {
+        val text = nativeAddress()
+        val slash = text.indexOf('/')
+        if (slash <= 0) return null
+        return Pair(text.substring(0, slash), text.substring(slash + 1).toIntOrNull() ?: return null)
+    }
+
+    /** DNS от сервера по порядку (его резолверы, затем 8.8.8.8 и 1.1.1.1); пусто, пока адреса нет. */
+    fun dns(): List<String> = nativeDns().split(',').map { it.trim() }.filter { it.isNotEmpty() }
 
     /**
      * Отдаёт клиенту дескриптор TUN (`ParcelFileDescriptor.detachFd()`: владение переходит

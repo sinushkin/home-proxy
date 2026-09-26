@@ -27,8 +27,6 @@ class MainActivity : Activity() {
     private lateinit var stun: EditText
     private lateinit var mqtt: EditText
     private lateinit var peerId: EditText
-    private lateinit var tunAddr: EditText
-    private lateinit var dns: EditText
     private lateinit var status: TextView
     private lateinit var connectButton: Button
     private lateinit var vpnOnButton: Button
@@ -61,8 +59,6 @@ class MainActivity : Activity() {
         stun = field(column, "STUN (ip:порт)", settings.stun)
         mqtt = field(column, "MQTT, TLS (ip:порт)", settings.mqtt)
         peerId = field(column, "GUID пира (ПК или роутера)", settings.peerId)
-        tunAddr = field(column, "Адрес в туннеле (10.80.1.<номер телефона на роутере>)", settings.tunAddr)
-        dns = field(column, "DNS внутри VPN", settings.dns)
 
         connectButton = button(column, "1. Подключить (дыры и keep-alive)") { connect() }
         vpnOnButton = button(column, "2. Включить VPN") { startVpn() }
@@ -99,7 +95,7 @@ class MainActivity : Activity() {
                         }
                         Thread.sleep(1000)
                     }
-                    vpnMessage = "автозапуск VPN: дыры не поднялись за 90 секунд"
+                    vpnMessage = "автозапуск VPN: за 90 секунд нет дыр или адреса от сервера"
                 }
             }
         }
@@ -130,8 +126,9 @@ class MainActivity : Activity() {
             append("\nVPN: ").append(if (VpnController.isUp) "включён" else "выключен")
             (vpnMessage ?: VpnController.lastMessage)?.let { append("\n").append(it) }
             if (holes < 1) append("\nVPN можно включить, когда появится хотя бы одна живая дыра")
+            else if (HomeProxy.address() == null) append("\nЖдём адрес в туннеле от сервера")
         }
-        vpnOnButton.isEnabled = holes >= 1 && !VpnController.isUp
+        vpnOnButton.isEnabled = VpnController.canStart() && !VpnController.isUp
         vpnOffButton.isEnabled = VpnController.isUp
     }
 
@@ -139,8 +136,6 @@ class MainActivity : Activity() {
         settings.stun = stun.text.toString().trim()
         settings.mqtt = mqtt.text.toString().trim()
         settings.peerId = peerId.text.toString().trim()
-        settings.tunAddr = tunAddr.text.toString().trim()
-        settings.dns = dns.text.toString().trim()
     }
 
     private fun connect() {
@@ -153,7 +148,7 @@ class MainActivity : Activity() {
     private fun startVpn() {
         save()
         if (!VpnController.canStart()) {
-            vpnMessage = "дыр ещё нет: сначала «Подключить»"
+            vpnMessage = "дыр или адреса ещё нет: сначала «Подключить»"
             return
         }
         val consent = VpnService.prepare(this)

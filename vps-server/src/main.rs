@@ -8,8 +8,9 @@
 //!   VPS_PUBLIC_IP — белый IP сервера (обязателен);
 //!   VPS_BOOTSTRAP_PORT — порт знакомства (40000);
 //!   VPS_PORTS — диапазон портов слотов `начало-конец` (40001-49999);
-//!   MY_ID, PEER_ID, TUN_ADDR (`10.80.0.1/16`), TUN_NAME, TUN_MTU, REORDER_WAIT_MS, DATA_HOLES,
-//!   RUST_LOG, LOG_FILE — как у `hp-server`; NAT подсети туннеля наружу настраивается отдельно;
+//!   MY_ID, PEER_ID, TUN_ADDR (`10.80.0.1/16`), TUN_NAME, TUN_MTU, ADDRESS_FILE, REORDER_WAIT_MS,
+//!   DATA_HOLES, RUST_LOG, LOG_FILE — как у `hp-server` (адреса клиенту и его телефонам раздаёт
+//!   сервер); NAT подсети туннеля наружу настраивается отдельно;
 //!   RUNTIME=multi — многопоточный tokio (по умолчанию однопоточный).
 //! Брандмауэр должен пропускать входящий UDP на порт знакомства и весь `VPS_PORTS`.
 
@@ -74,7 +75,8 @@ fn main() -> Result<()> {
     } else {
         tokio::runtime::Builder::new_current_thread().enable_all().build()?
     };
-    runtime.block_on(hp_server::serve(discovery, common))
+    anyhow::ensure!(common.peers.len() == 1, "vps-server пока обслуживает одного клиента (MY_ID/PEER_ID)");
+    runtime.block_on(hp_server::serve(vec![discovery], common))
 }
 
 #[cfg(test)]

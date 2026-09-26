@@ -83,6 +83,8 @@ pub enum LinkEvent {
     PeerWrapped { slot: u8, seq: u64, client_id: u32, flow: Option<u32>, payload: Packet },
     /// Пир прислал IP-пакет с номером в потоке (`Ordered`, TUN-режим).
     PeerOrdered { slot: u8, flow: u32, seq: u64, payload: Packet },
+    /// Служебное сообщение пира (адрес в туннеле).
+    PeerControl(crate::multilink::Control),
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +279,15 @@ impl LinkSender {
         );
         self.send_lite(lite::Payload::DeleteLink(DeleteLink { slot: slot as u32 }))
             .await;
+    }
+
+    /// Служебное сообщение (адрес в туннеле) по этой дыре.
+    pub async fn send_control(&self, control: crate::multilink::Control) {
+        let payload = match control {
+            crate::multilink::Control::AddressRequest(r) => lite::Payload::AddressRequest(r),
+            crate::multilink::Control::AddressAssign(a) => lite::Payload::AddressAssign(a),
+        };
+        self.send_lite(payload).await;
     }
 
     /// Виртуал-брокер: отдать пиру запись `Rendezvous` о нашем слоте по этой
@@ -603,6 +614,12 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
         // last_seen/received уже обновлены выше.
         Some(lite::Payload::KeepAlive(k)) => {
             log::trace!("слот {slot}: keep-alive получен (seq={})", k.seq);
+        }
+        Some(lite::Payload::AddressRequest(r)) => {
+            let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::AddressRequest(r))).await;
+        }
+        Some(lite::Payload::AddressAssign(a)) => {
+            let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::AddressAssign(a))).await;
         }
         None => {}
     }

@@ -91,6 +91,16 @@ pub struct Incoming {
     pub order: Option<(u32, u64)>,
 }
 
+/// Служебное сообщение между пирами (не данные): запрос и выдача адреса в туннеле.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Control {
+    AddressRequest(crate::proto::AddressRequest),
+    AddressAssign(crate::proto::AddressAssign),
+}
+
+/// Сколько служебных сообщений держим, пока приложение их не забрало.
+const CONTROL_CHANNEL_CAPACITY: usize = 16;
+
 /// Порядковые номера обёрнутых пакетов: свой счётчик на каждого клиента.
 #[derive(Default)]
 struct SeqCounters(HashMap<u8, u32>);
@@ -400,6 +410,7 @@ pub struct MultiLink {
     wrap_seq: Mutex<SeqCounters>,
     data_holes: u8,
     redrop_txs: Vec<mpsc::Sender<()>>,
+    control_rx: Mutex<Option<mpsc::Receiver<Control>>>,
 }
 
 impl MultiLink {
@@ -470,6 +481,7 @@ impl MultiLink {
 
         let (events_tx, events_rx) = mpsc::channel::<LinkEvent>(64);
         let (incoming_tx, incoming_rx) = mpsc::channel::<Incoming>(64);
+        let (control_tx, control_rx) = mpsc::channel::<Control>(CONTROL_CHANNEL_CAPACITY);
         let state = Arc::new(StateTracker::new(TARGET_LINKS as usize, label.clone()));
 
         let mut slot_txs: Vec<mpsc::Sender<PeerSession>> = Vec::new();
@@ -545,7 +557,7 @@ impl MultiLink {
             registry.clone(),
             redrop_txs,
             SlotFeed { slot_txs, pair, peer_id },
-            incoming_tx,
+            (incoming_tx, control_tx),
             options,
         ));
 
@@ -557,6 +569,7 @@ impl MultiLink {
             wrap_seq: Mutex::new(SeqCounters::default()),
             data_holes: options.data_holes,
             redrop_txs: redrop_for_api,
+            control_rx: Mutex::new(Some(control_rx)),
         };
         Ok((multilink, incoming_rx))
     }
@@ -614,6 +627,20 @@ impl MultiLink {
         let link = self.choose_link(payload.len())?;
         link.sender.send_ordered(flow, seq, payload).await;
         Ok(link.slot)
+    }
+
+    /// Отправляет пиру служебное сообщение по одной из живых дыр (без гарантии доставки:
+    /// запросы повторяются вызывающим).
+    pub async fn send_control(&self, control: Control) -> Result<u8> {
+        let link = self.choose_link(0)?;
+        link.sender.send_control(control).await;
+        Ok(link.slot)
+    }
+
+    /// Приёмник служебных сообщений пира; отдаётся один раз (дальше `None`). Пока его не
+    /// забрали, сообщения сверх небольшого запаса отбрасываются.
+    pub fn take_control(&self) -> Option<mpsc::Receiver<Control>> {
+        self.control_rx.lock().unwrap().take()
     }
 
     pub fn live_count(&self) -> usize {
@@ -714,7 +741,7 @@ async fn control_loop(
     registry: Arc<Mutex<LinkRegistry>>,
     redrop_txs: Vec<mpsc::Sender<()>>,
     feed: SlotFeed,
-    incoming: mpsc::Sender<Incoming>,
+    (incoming, control): (mpsc::Sender<Incoming>, mpsc::Sender<Control>),
     options: MultiLinkOptions,
 ) {
     let MultiLinkOptions { reorder_wait, reorder_clients, .. } = options;
@@ -789,6 +816,11 @@ async fn control_loop(
             }
             LinkEvent::PeerOrdered { slot, flow, seq, payload } => {
                 deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: Some((flow, seq)) }, &mut ready).await;
+            }
+            LinkEvent::PeerControl(message) => {
+                if control.try_send(message).is_err() {
+                    log::debug!("{label}служебное сообщение пира отброшено: его никто не читает");
+                }
             }
             LinkEvent::PeerRendezvous(r) => {
                 match rendezvous::peer_session_from(&r, &feed.pair, feed.peer_id) {
@@ -923,68 +955,91 @@ async fn slot_worker(mut ctx: SlotCtx) {
         };
 
         ctx.state.set(ctx.slot, SlotPhase::Rendezvous);
-        let peer = match wait_fresh_peer(&mut ctx.peer_rx, last_linked_peer_session).await {
-            Some(peer) => peer,
-            None => return,
-        };
-
-        let identity = PeerIdentity {
-            session_id: my_session,
-            peer_session_id: peer.session_id,
-            my_peer_id: ctx.my_peer_id,
-            peer_id: ctx.peer_id,
-            slot: ctx.slot,
-            pair: ctx.pair.clone(),
-        };
+        let Some(mut peer) = wait_fresh_peer(&mut ctx.peer_rx, last_linked_peer_session).await else { return };
         let my_endpoint = my_endpoints[0];
-        let candidates = match &ctx.mode {
-            SlotMode::Stun(_) => {
-                let candidates = peer.candidates();
-                let (low, high) = port_utils::sweep_bounds(my_endpoint.port(), peer.addr.port(), ctx.punch.margin);
-                log::info!(
-                    "{label}слот {}: пробив {low}..={high} на {} (STUN-порт пира {}){}",
-                    ctx.slot,
-                    peer.addr.ip(),
-                    peer.addr.port(),
-                    if candidates.len() > 1 {
-                        format!(", ещё адреса пира: {:?}", &candidates[1..])
-                    } else {
-                        String::new()
-                    }
-                );
-                candidates
-            }
-            SlotMode::VpsServer { .. } => {
-                log::info!("{label}слот {}: ждём клиента на порту {local_port}", ctx.slot);
-                Vec::new()
-            }
-            SlotMode::VpsClient => {
-                log::info!("{label}слот {}: идём на порт сервера {}", ctx.slot, peer.addr);
-                // Сокет слота говорит только с этим портом сервера: подключаем, чтобы ядро не
-                // искало маршрут на каждый пакет (заодно чужие адреса отсекаются в ядре).
-                if let Err(e) = ctx.socket.connect(peer.addr).await {
-                    log::warn!("{label}слот {}: connect к {}: {e}", ctx.slot, peer.addr);
+
+        // Пробиваем к последней записи пира. Пришла новая запись (пир перезапустился, сменил
+        // сеть) — бросаем текущий пробив и начинаем к ней, не дожидаясь окна: иначе к старой
+        // сессии не пройдёт ни один пакет (подпись у новой другая). Свою сессию при этом не
+        // меняем, чтобы стороны не гоняли друг друга новыми записями. Окно одно на всю
+        // регистрацию: переключения его не продлевают — иначе, если пир всё время заводит новые
+        // записи, а ждёт от нас новую сессию, мы бы никогда не перерегистрировались.
+        let window = tokio::time::sleep(PUNCH_WINDOW);
+        tokio::pin!(window);
+        let result = 'punch: loop {
+            let identity = PeerIdentity {
+                session_id: my_session,
+                peer_session_id: peer.session_id,
+                my_peer_id: ctx.my_peer_id,
+                peer_id: ctx.peer_id,
+                slot: ctx.slot,
+                pair: ctx.pair.clone(),
+            };
+            let candidates = match &ctx.mode {
+                SlotMode::Stun(_) => {
+                    let candidates = peer.candidates();
+                    let (low, high) = port_utils::sweep_bounds(my_endpoint.port(), peer.addr.port(), ctx.punch.margin);
+                    log::info!(
+                        "{label}слот {}: пробив {low}..={high} на {} (STUN-порт пира {}){}",
+                        ctx.slot,
+                        peer.addr.ip(),
+                        peer.addr.port(),
+                        if candidates.len() > 1 {
+                            format!(", ещё адреса пира: {:?}", &candidates[1..])
+                        } else {
+                            String::new()
+                        }
+                    );
+                    candidates
                 }
-                vec![peer.addr]
+                SlotMode::VpsServer { .. } => {
+                    log::info!("{label}слот {}: ждём клиента на порту {local_port}", ctx.slot);
+                    Vec::new()
+                }
+                SlotMode::VpsClient => {
+                    log::info!("{label}слот {}: идём на порт сервера {}", ctx.slot, peer.addr);
+                    // Сокет слота говорит только с этим портом сервера: подключаем, чтобы ядро не
+                    // искало маршрут на каждый пакет (заодно чужие адреса отсекаются в ядре).
+                    if let Err(e) = ctx.socket.connect(peer.addr).await {
+                        log::warn!("{label}слот {}: connect к {}: {e}", ctx.slot, peer.addr);
+                    }
+                    vec![peer.addr]
+                }
+            };
+
+            ctx.state.set(ctx.slot, SlotPhase::Punching);
+            let attempt = punch::establish(
+                ctx.socket.clone(),
+                my_endpoint.port(),
+                candidates,
+                identity,
+                ctx.punch.clone(),
+                ctx.events.clone(),
+            );
+            tokio::pin!(attempt);
+            loop {
+                tokio::select! {
+                    result = &mut attempt => break 'punch Some(result),
+                    () = &mut window => break 'punch None,
+                    newer = ctx.peer_rx.recv() => {
+                        let Some(newer) = newer else { return };
+                        if newer.session_id == peer.session_id || Some(newer.session_id) == last_linked_peer_session {
+                            continue;
+                        }
+                        log::info!("{label}слот {}: у пира новая запись, пробиваем к ней", ctx.slot);
+                        peer = latest_peer(newer, &mut ctx.peer_rx, last_linked_peer_session);
+                        continue 'punch;
+                    }
+                }
             }
         };
-
-        ctx.state.set(ctx.slot, SlotPhase::Punching);
-        let attempt = punch::establish(
-            ctx.socket.clone(),
-            my_endpoint.port(),
-            candidates,
-            identity,
-            ctx.punch.clone(),
-            ctx.events.clone(),
-        );
-        let link = match tokio::time::timeout(PUNCH_WINDOW, attempt).await {
-            Ok(Ok(link)) => link,
-            Ok(Err(e)) => {
+        let link = match result {
+            Some(Ok(link)) => link,
+            Some(Err(e)) => {
                 log::warn!("{label}слот {}: пробив не удался: {e}; новая попытка", ctx.slot);
                 continue;
             }
-            Err(_) => {
+            None => {
                 log::warn!("{label}слот {}: пробив не уложился в {PUNCH_WINDOW:?}; новая попытка", ctx.slot);
                 continue;
             }
@@ -1110,8 +1165,20 @@ async fn wait_fresh_peer(
         if Some(peer.session_id) == already_linked {
             continue;
         }
-        return Some(peer);
+        return Some(latest_peer(peer, peer_rx, already_linked));
     }
+}
+
+/// Самая свежая запись пира: `first` или пришедшие за ней, если они уже в очереди (пир мог
+/// перезапуститься несколько раз, пока мы пробивались к старой записи).
+fn latest_peer(first: PeerSession, peer_rx: &mut mpsc::Receiver<PeerSession>, already_linked: Option<Uuid>) -> PeerSession {
+    let mut latest = first;
+    while let Ok(newer) = peer_rx.try_recv() {
+        if Some(newer.session_id) != already_linked {
+            latest = newer;
+        }
+    }
+    latest
 }
 
 /// Опрашивает все STUN-серверы с сокета слота. Возвращает увиденные адреса без
@@ -1306,7 +1373,7 @@ mod tests {
             Arc::new(Mutex::new(LinkRegistry::default())),
             Vec::new(),
             SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
-            incoming_tx,
+            (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: wait, ..MultiLinkOptions::default() },
         ));
 
@@ -1339,7 +1406,7 @@ mod tests {
             Arc::new(Mutex::new(LinkRegistry::default())),
             Vec::new(),
             SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
-            incoming_tx,
+            (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
         ));
         for counter in [0u64, 2, 1] {
@@ -1372,7 +1439,7 @@ mod tests {
             Arc::new(Mutex::new(LinkRegistry::default())),
             Vec::new(),
             SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
-            incoming_tx,
+            (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::from_millis(500), reorder_clients: false, ..MultiLinkOptions::default() },
         ));
         events_tx.send(ordered_event(3, 0, None)).await.unwrap();
@@ -1388,6 +1455,23 @@ mod tests {
         // Свой пакет 2 придержан (ждали номер 1) и выходит по таймауту — после пакетов клиента.
         let held = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv()).await.unwrap().unwrap();
         assert_eq!((held.wrapped, held.order), (None, Some((3, 2))));
+    }
+
+    fn session(n: u8) -> PeerSession {
+        PeerSession { slot: 0, session_id: Uuid::from_bytes([n; 16]), addr: SocketAddr::from(([203, 0, 113, n], 1000)), extra: vec![] }
+    }
+
+    /// Пир перезапускался, пока мы пробивались: берём последнюю запись, а не первую в очереди.
+    #[tokio::test]
+    async fn the_freshest_peer_record_wins() {
+        let (tx, mut rx) = mpsc::channel(8);
+        for n in [1, 2, 3] {
+            tx.send(session(n)).await.unwrap();
+        }
+        assert_eq!(wait_fresh_peer(&mut rx, None).await.unwrap(), session(3));
+        tx.send(session(4)).await.unwrap();
+        tx.send(session(5)).await.unwrap();
+        assert_eq!(latest_peer(session(9), &mut rx, Some(session(5).session_id)), session(4), "уже залинкованную сессию пропускаем");
     }
 
     #[test]

@@ -2,19 +2,22 @@
 //! ядро библиотеки для Android (`../android-lib`, приложение — `../../android-vpn`), отдельно от
 //! JNI, чтобы его можно было проверять на обычном хосте.
 //!
-//! Порядок: `Client::start` поднимает дыры и keep-alive; TUN (на Android — дескриптор от
-//! `VpnService`) подключается позже, `attach_tun`, когда живёт хотя бы одна дыра, и отключается
-//! `detach_tun`, не трогая дыр. Пока TUN не подключён, пришедшее от пира отбрасывается.
+//! Порядок: `Client::start` поднимает дыры и keep-alive и просит у сервера адрес в туннеле
+//! (сервер — домашний ПК или VPS за роутером: роутер пересылает запрос, телефону всё равно);
+//! TUN (на Android — дескриптор от `VpnService` с этим адресом) подключается позже,
+//! `attach_tun`, когда адрес получен, и отключается `detach_tun`, не трогая дыр. Пока TUN не
+//! подключён, пришедшее от пира отбрасывается.
 
 pub use connection::multilink::DEFAULT_REORDER_WAIT;
 pub use connection::stun::parse_servers as parse_stun_servers;
 
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use connection::multilink::{Discovery, Incoming, MultiLink, MultiLinkOptions, TARGET_LINKS};
+use connection::proto::AddressKind;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -41,6 +44,8 @@ pub struct ClientConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub live_holes: usize,
+    /// Адрес в туннеле от сервера (адрес и префикс); `None`, пока не выдан.
+    pub address: Option<(Ipv4Addr, u8)>,
     pub tun: bool,
     pub to_peer: u32,
     pub from_peer: u32,
@@ -51,8 +56,9 @@ impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "дыры {}/{TARGET_LINKS}, TUN {}, отправлено {}, получено {}, потеряно {}",
+            "дыры {}/{TARGET_LINKS}, адрес {}, TUN {}, отправлено {}, получено {}, потеряно {}",
             self.live_holes,
+            self.address.map(|(a, p)| format!("{a}/{p}")).unwrap_or_else(|| "ещё нет".into()),
             if self.tun { "подключён" } else { "нет" },
             self.to_peer,
             self.from_peer,
@@ -72,6 +78,7 @@ struct Attached {
 pub struct Client {
     multilink: Arc<MultiLink>,
     attached: Arc<Mutex<Option<Attached>>>,
+    address: Arc<Mutex<Option<hp_tun::bridge::Assigned>>>,
 }
 
 impl Client {
@@ -87,10 +94,18 @@ impl Client {
             ..MultiLinkOptions::default()
         };
         let (multilink, incoming) = MultiLink::start_discovery("", discovery, config.my_id, config.peer_id, options).await?;
+        let multilink = Arc::new(multilink);
         let attached = Arc::new(Mutex::new(None));
         tokio::spawn(switch(incoming, attached.clone()));
+        let address = Arc::new(Mutex::new(None));
+        tokio::spawn(obtain_address(multilink.clone(), address.clone()));
         log::info!("клиент запущен: дыры к {}", config.peer_id);
-        Ok(Self { multilink: Arc::new(multilink), attached })
+        Ok(Self { multilink, attached, address })
+    }
+
+    /// Адрес в туннеле от сервера; `None`, пока не выдан.
+    pub fn address(&self) -> Option<hp_tun::bridge::Assigned> {
+        self.address.lock().unwrap().clone()
     }
 
     /// Подключает TUN: IP-пакеты из него уходят пиру, пакеты от пира пишутся в него. Прежний
@@ -113,8 +128,26 @@ impl Client {
         let attached = self.attached.lock().unwrap();
         let (to_peer, _, from_peer, dropped) =
             attached.as_ref().map(|a| a.bridge.stats().snapshot()).unwrap_or_default();
-        Status { live_holes: self.multilink.live_count(), tun: attached.is_some(), to_peer, from_peer, dropped }
+        Status {
+            live_holes: self.multilink.live_count(),
+            address: self.address().map(|a| (a.address, a.prefix)),
+            tun: attached.is_some(),
+            to_peer,
+            from_peer,
+            dropped,
+        }
     }
+}
+
+/// Просит адрес у сервера, запоминает его и дальше повторяет запрос раз в полминуты (сервер после
+/// перезапуска восстановит по нему маршрут; адрес выдастся тот же).
+async fn obtain_address(link: Arc<MultiLink>, address: Arc<Mutex<Option<hp_tun::bridge::Assigned>>>) {
+    let Some(control) = link.take_control() else { return };
+    // Данные читает `switch`; сюда — пустой канал, живой, пока ждём.
+    let (_keep, mut no_data) = mpsc::channel::<Incoming>(1);
+    let (assigned, _control) = hp_tun::bridge::request_address(&link, control, &mut no_data, AddressKind::Phone).await;
+    *address.lock().unwrap() = Some(assigned);
+    let _ = hp_tun::bridge::spawn_address_refresh(link, AddressKind::Phone, None).await;
 }
 
 /// Пакеты от пира — в текущий мост с TUN; пока TUN нет, отбрасываются.
@@ -133,7 +166,8 @@ mod tests {
 
     #[test]
     fn status_line_is_readable() {
-        let status = Status { live_holes: 7, tun: true, to_peer: 12, from_peer: 10, dropped: 1 };
-        assert_eq!(status.to_string(), "дыры 7/10, TUN подключён, отправлено 12, получено 10, потеряно 1");
+        let status =
+            Status { live_holes: 7, address: Some((Ipv4Addr::new(10, 80, 1, 4), 16)), tun: true, to_peer: 12, from_peer: 10, dropped: 1 };
+        assert_eq!(status.to_string(), "дыры 7/10, адрес 10.80.1.4/16, TUN подключён, отправлено 12, получено 10, потеряно 1");
     }
 }

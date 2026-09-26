@@ -40,6 +40,9 @@ mod tests {
 pub mod bridge;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod hub;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

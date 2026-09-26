@@ -3,8 +3,8 @@
 //! номером в потоке).
 //!
 //! Аргументы: `<stun_addr[,stun2_addr]> <mqtt_addr> <mqtt_ca> <my_peer_id> <peer_id>`.
-//! Переменные окружения: `TUN_ADDR` — адрес в туннеле (`10.80.1.7/32`, обязателен; за роутером
-//! последнее число — номер телефона `n` из `PHONE_<n>_*`), `TUN_NAME` (`hp1`), `TUN_MTU` (1400),
+//! Адрес в туннеле выдаёт сервер (ПК или VPS за роутером). Переменные окружения: `TUN_NAME`
+//! (`hp1`), `TUN_MTU` (1400),
 //! `REORDER_WAIT_MS` (по умолчанию 8, 0 — не восстанавливать порядок), `DATA_HOLES` (0 — данные
 //! через все живые дыры). Маршруты в TUN настраиваются отдельно; нужны права root.
 
@@ -36,16 +36,19 @@ async fn main() -> Result<()> {
         reorder_wait_ms: env_number("REORDER_WAIT_MS", hp_client::DEFAULT_REORDER_WAIT.as_millis() as u32)?,
         data_holes: env_number("DATA_HOLES", 0u8)?,
     };
-    let tun_addr = std::env::var("TUN_ADDR").context("не задан TUN_ADDR (например 10.80.1.7/32)")?;
-    let tun_config = hp_tun::TunConfig {
-        name: std::env::var("TUN_NAME").unwrap_or_else(|_| "hp1".into()),
-        address: Some(hp_tun::parse_cidr(&tun_addr).context("TUN_ADDR: ожидается ip/префикс")?),
-        mtu: Some(env_number("TUN_MTU", 1400u16)?),
-        up: true,
-    };
-    let tun = hp_tun::Tun::create(&tun_config).context("создание TUN (нужны права root)")?;
-    log::info!("hp-client: TUN {} {tun_addr}, сервер {}", tun.name(), config.peer_id);
+    let name = std::env::var("TUN_NAME").unwrap_or_else(|_| "hp1".into());
+    let mtu = env_number("TUN_MTU", 1400u16)?;
+    let peer = config.peer_id;
     let client = Client::start(config).await?;
+    let assigned = loop {
+        if let Some(assigned) = client.address() {
+            break assigned;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    let tun_config = hp_tun::TunConfig { name, address: Some((assigned.address, assigned.prefix)), mtu: Some(mtu), up: true };
+    let tun = hp_tun::Tun::create(&tun_config).context("создание TUN (нужны права root)")?;
+    log::info!("hp-client: TUN {} {}/{}, сервер {peer}", tun.name(), assigned.address, assigned.prefix);
     client.attach_tun(tun);
     let mut last = None;
     loop {

@@ -96,7 +96,7 @@ message ControlMessage {
   (Раньше в замысле были ключи WireGuard через `x25519-dalek` и `wg set` — от WireGuard
   отказались.)
 - **Новый телефон — новый набор дыр:** у `hp-router` это ещё одна пара `PHONE_<n>_*` (адрес
-  `10.80.1.<n>`), запускается на ходу и дописывается в `router.env`, чтобы пережить перезапуск;
+  его адрес выдаст VPS), запускается на ходу и дописывается в `router.env`, чтобы пережить перезапуск;
   у `hp-server` — смена `PEER_ID` (один телефон на службу, как сейчас).
 
 Открытое: `hp-server` пока держит одного пира; несколько телефонов на ПК — по образцу
@@ -129,10 +129,11 @@ message PairingBundle {
   bytes  mqtt_ca_pem    = 6;   // ca.crt брокера
   reserved 7;                  // было: конфиг WireGuard
   uint64 expires_unix   = 8;
-  string tun_addr       = 9;   // адрес телефона в туннеле, 10.80.1.<n>
-  string dns            = 10;  // DNS внутри VPN
 }
 ```
+
+Адрес в туннеле и DNS в пакет не входят: их телефон получает от сервера при подключении
+(`AddressRequest`/`AddressAssign`).
 
 Внутри лежат полные GUID пары — из них выводятся все ключи, поэтому пакет — **секрет**:
 показывается только по кнопке, живёт несколько минут (`expires_unix`), после успешного
@@ -153,8 +154,8 @@ message PairingBundle {
   (`zxing-android-embedded`, работает без Google Play Services; альтернатива — ML Kit).
 - Также deep link `homeproxy://pair?d=<base64url>`: QR можно открыть штатной камерой, а
   приложение подхватит ссылку.
-- Разбор `PairingBundle` заполняет `Settings`: `myId`, `peerId`, `stun`, `mqtt`, `tunAddr`,
-  `dns`, CA (то, что сейчас делается аргументами `am start`).
+- Разбор `PairingBundle` заполняет `Settings`: `myId`, `peerId`, `stun`, `mqtt`, CA (то, что
+  сейчас делается аргументами `am start`).
 - После сопряжения запускаются дыры, VPN включается при первой живой дыре.
 
 ## Что дальше

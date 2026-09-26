@@ -13,7 +13,8 @@
 //! если есть, иначе только окружение). Настройки:
 //!   VPS_SERVER — адрес VPS `ip[:порт знакомства]` (порт по умолчанию 40000);
 //!   VPS_MY_ID / VPS_PEER_ID — GUID роутера и VPS-сервера;
-//!   TUN_ADDR — адрес роутера в туннеле (`10.80.0.2/24`), TUN_NAME (`hp0`), TUN_MTU (1400);
+//!   TUN_NAME (`hp0`), TUN_MTU (1400) — адрес в туннеле роутеру выдаёт VPS (и телефонам тоже:
+//!   их запросы роутер пересылает на VPS со своим номером телефона);
 //!   STUN_ADDR (один или несколько через запятую), MQTT_ADDR, MQTT_CA — для телефонов;
 //!   PHONE_<n>_MY_ID / PHONE_<n>_PEER_ID — GUID роутера и телефона n, n = 1, 2, 3 … подряд
 //!   (до 255); `n` и есть `client_id`. У каждого набора свой GUID роутера: брокер различает
@@ -25,13 +26,14 @@
 //! умолчанию в `hp0` — только для LAN (правило по источнику), см. `OpenWRT/Router.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use connection::multilink::{Discovery, Incoming, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::multilink::{Control, Discovery, Incoming, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::proto::AddressKind;
 use hp_server::settings::Settings;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -57,7 +59,6 @@ struct Config {
     vps_server: SocketAddr,
     vps_my_id: Uuid,
     vps_peer_id: Uuid,
-    tun_addr: (Ipv4Addr, u8),
     tun_name: String,
     tun_mtu: u16,
     reorder_wait: Duration,
@@ -90,7 +91,6 @@ impl Config {
             vps_server: connection::vps::parse_server(&need("VPS_SERVER")?).context("VPS_SERVER: ожидается ip или ip:порт")?,
             vps_my_id: parse_id("VPS_MY_ID")?,
             vps_peer_id: parse_id("VPS_PEER_ID")?,
-            tun_addr: hp_tun::parse_cidr(&need("TUN_ADDR")?).context("TUN_ADDR: ожидается ip/префикс")?,
             tun_name: get("TUN_NAME").unwrap_or_else(|| "hp0".into()),
             tun_mtu: u16::try_from(number("TUN_MTU", 1400)?).context("TUN_MTU")?,
             reorder_wait: Duration::from_millis(number("REORDER_WAIT_MS", DEFAULT_REORDER_WAIT.as_millis() as u64)?),
@@ -180,23 +180,7 @@ struct RelayStats {
 }
 
 async fn run(config: Config) -> Result<()> {
-    let tun_config = hp_tun::TunConfig {
-        name: config.tun_name.clone(),
-        address: Some(config.tun_addr),
-        mtu: Some(config.tun_mtu),
-        up: true,
-    };
-    let tun = hp_tun::Tun::create(&tun_config).context("создание TUN (нужны права root)")?;
-    log::info!(
-        "hp-router: VPS {} (я {}), TUN {} {}/{}, телефонов {}",
-        config.vps_server,
-        config.vps_my_id,
-        tun.name(),
-        config.tun_addr.0,
-        config.tun_addr.1,
-        config.phones.len()
-    );
-
+    log::info!("hp-router: VPS {} (я {}), телефонов {}", config.vps_server, config.vps_my_id, config.phones.len());
     // Пакеты телефонов роутер перекладывает насквозь: порядок им вернёт VPS или сам телефон.
     let vps_options = MultiLinkOptions {
         reorder_wait: config.reorder_wait,
@@ -204,7 +188,7 @@ async fn run(config: Config) -> Result<()> {
         reorder_clients: false,
         ..MultiLinkOptions::default()
     };
-    let (vps, vps_rx) = MultiLink::start_discovery(
+    let (vps, mut vps_rx) = MultiLink::start_discovery(
         "vps",
         Discovery::VpsClient { server: config.vps_server },
         config.vps_my_id,
@@ -213,6 +197,19 @@ async fn run(config: Config) -> Result<()> {
     )
     .await?;
     let vps = Arc::new(vps);
+
+    // Адрес в туннеле выдаёт VPS; TUN поднимаем, когда он получен.
+    let control = vps.take_control().expect("приёмник служебных сообщений забираем один раз");
+    let (assigned, vps_control) = hp_tun::bridge::request_address(&vps, control, &mut vps_rx, AddressKind::Host).await;
+    let tun_config = hp_tun::TunConfig {
+        name: config.tun_name.clone(),
+        address: Some((assigned.address, assigned.prefix)),
+        mtu: Some(config.tun_mtu),
+        up: true,
+    };
+    let tun = hp_tun::Tun::create(&tun_config).context("создание TUN (нужны права root)")?;
+    log::info!("hp-router: TUN {} {}/{}", tun.name(), assigned.address, assigned.prefix);
+    let _refresh = AbortOnDrop(hp_tun::bridge::spawn_address_refresh(vps.clone(), AddressKind::Host, None));
     let (to_phones_tx, to_phones_rx) = mpsc::channel::<Incoming>(256);
     let bridge = hp_tun::bridge::Bridge::start_relay(tun, vps.clone(), vps_rx, to_phones_tx);
 
@@ -240,11 +237,14 @@ async fn run(config: Config) -> Result<()> {
             .with_context(|| format!("телефон {}", phone.client_id))?;
             let link = Arc::new(link);
             tokio::spawn(phone_to_vps(phone.client_id, rx, vps.clone(), stats.clone()));
+            let control = link.take_control().expect("приёмник служебных сообщений забираем один раз");
+            tokio::spawn(phone_requests_to_vps(phone.client_id, control, vps.clone()));
             phones.insert(phone.client_id, link);
         }
     }
     let phones = Arc::new(phones);
     tokio::spawn(vps_to_phones(to_phones_rx, phones.clone(), stats.clone()));
+    tokio::spawn(vps_answers_to_phones(vps_control, phones.clone()));
 
     let mut last = None;
     loop {
@@ -269,6 +269,39 @@ async fn run(config: Config) -> Result<()> {
                 now.3 .1,
             );
             last = Some(now);
+        }
+    }
+}
+
+/// Задача, которая останавливается вместе с хэндлом.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Запрос адреса от телефона — на VPS с номером телефона (адреса раздаёт VPS, роутер — нет).
+async fn phone_requests_to_vps(client_id: u8, mut control: mpsc::Receiver<Control>, vps: Arc<MultiLink>) {
+    while let Some(message) = control.recv().await {
+        if let Control::AddressRequest(mut request) = message {
+            request.client_id = Some(u32::from(client_id));
+            let _ = vps.send_control(Control::AddressRequest(request)).await;
+        }
+    }
+}
+
+/// Ответы VPS на адреса телефонов — телефону по `client_id` (без номера: телефон его не знает).
+async fn vps_answers_to_phones(mut control: mpsc::Receiver<Control>, phones: Arc<HashMap<u8, Arc<MultiLink>>>) {
+    while let Some(message) = control.recv().await {
+        let Control::AddressAssign(mut assign) = message else { continue };
+        let Some(client_id) = assign.client_id.take().and_then(|c| u8::try_from(c).ok()) else { continue };
+        match phones.get(&client_id) {
+            Some(phone) => {
+                let _ = phone.send_control(Control::AddressAssign(assign)).await;
+            }
+            None => log::debug!("VPS выдал адрес неизвестному телефону {client_id}"),
         }
     }
 }

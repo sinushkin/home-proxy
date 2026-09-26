@@ -27,8 +27,9 @@ hp-router [--config router.env]     # без --config: router.env рядом с 
 ```
 
 Настройки — [`router.env.example`](router.env.example): VPS (`VPS_SERVER`, `VPS_MY_ID`,
-`VPS_PEER_ID`), адрес в туннеле (`TUN_ADDR`), рандеву для телефонов (`STUN_ADDR`, `MQTT_ADDR`,
-`MQTT_CA`) и пары GUID телефонов. Телефонов может не быть — тогда только шлюз. Нужны root,
+`VPS_PEER_ID`), рандеву для телефонов (`STUN_ADDR`, `MQTT_ADDR`, `MQTT_CA`) и пары GUID
+телефонов. Телефонов может не быть — тогда только шлюз. Адрес в туннеле и DNS роутеру и его
+телефонам выдаёт VPS (запросы телефонов роутер пересылает с их номером). Нужны root,
 `kmod-tun`, маршрут по умолчанию в `hp0` только для LAN (сам роутер ходит через WAN) и
 перезагрузка firewall после каждого запуска (flowtable) — по шагам в
 [`../OpenWRT/Tun.md`](../OpenWRT/Tun.md).

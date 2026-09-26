@@ -1,13 +1,19 @@
 //! Сервер: принимает IP-пакеты клиентов по дырам и пишет их в TUN, ответы из TUN — обратно по
-//! дырам (`hp_tun::bridge`); в интернет пакеты выходят через NAT подсети туннеля на этой машине
-//! (настраивается отдельно). Пиром может быть телефон напрямую (`Ordered`/`Data`) или роутер
-//! OpenWrt (пакеты его телефонов — `WrappedData` с `client_id`, клиент узнаётся по адресу
-//! источника). Набор из 10 дыр к пиру постоянный.
+//! дырам (`hp_tun::hub`); в интернет пакеты выходят через NAT подсети туннеля на этой машине
+//! (настраивается отдельно). Пиров может быть несколько (у каждого свой набор из 10 дыр): телефоны
+//! напрямую (`Ordered`/`Data`) или роутер OpenWrt (пакеты его телефонов — `WrappedData` с
+//! `client_id`). Адреса в туннеле раздаёт сервер (`addresses`): клиент просит адрес
+//! (`AddressRequest`), сервер выдаёт постоянный для этого клиента.
 //!
 //! Настройки — переменные окружения и/или файл `KEY=VALUE` (`--config server.env`):
 //!   STUN_ADDR, MQTT_ADDR, MQTT_CA — как у `peer` (STUN_ADDR — один или несколько
 //!   серверов через запятую: `ip:порт,ip2:порт`);
-//!   MY_ID / PEER_ID — GUID сервера и GUID пира (телефона или роутера);
+//!   MY_ID / PEER_ID — GUID сервера и GUID пира (телефона или роутера); несколько пиров —
+//!   PEER_<n>_MY_ID / PEER_<n>_PEER_ID, n = 1, 2, … подряд (GUID сервера у каждого свой: брокер
+//!   различает соединения по нему);
+//!   ADDRESS_FILE — где хранить выданные адреса (`addresses.state` рядом с файлом настроек);
+//!   DNS — DNS для клиентов через запятую (по умолчанию — резолверы этой машины из resolv.conf;
+//!   в конце всегда 8.8.8.8, 1.1.1.1);
 //!   TUN_ADDR — адрес сервера в туннеле и подсеть клиентов (`10.80.0.1/16`, по умолчанию так),
 //!   TUN_NAME (`hp0`), TUN_MTU (1400); нужны права root (`CAP_NET_ADMIN`);
 //!   REORDER_WAIT_MS — сколько мс ждать недостающий TCP-пакет при восстановлении порядка (8;
@@ -21,17 +27,22 @@
 //! `server.env` рядом с бинарником, если есть, иначе только окружение). Linux (в т.ч. WSL2 на
 //! Windows, см. `wsl/README.md`).
 
+pub mod addresses;
 pub mod settings;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use connection::multilink::{Discovery, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::auth::peer_name;
+use connection::multilink::{Control, Discovery, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::proto::{AddressAssign, AddressKind};
 use settings::Settings;
+use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use addresses::{client_key, AddressBook};
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -39,11 +50,21 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 /// телефоны (`10.80.1.<n>`).
 pub const DEFAULT_TUN_ADDR: &str = "10.80.0.1/16";
 
-/// Настройки, общие для `hp-server` и `vps-server`.
-pub struct Common {
+/// Пара GUID: сервер и пир (у каждого пира свой набор дыр).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Peer {
     pub my_id: Uuid,
     pub peer_id: Uuid,
+}
+
+/// Настройки, общие для `hp-server` и `vps-server`.
+pub struct Common {
+    pub peers: Vec<Peer>,
     pub tun: hp_tun::TunConfig,
+    /// Где хранить выданные адреса (`None` — только в памяти).
+    pub address_file: Option<PathBuf>,
+    /// DNS, которые сервер отдаёт клиентам вместе с адресом.
+    pub dns: Vec<std::net::Ipv4Addr>,
     pub reorder_wait: Duration,
     pub data_holes: u8,
 }
@@ -51,11 +72,11 @@ pub struct Common {
 impl Common {
     pub fn from_settings(settings: &Settings) -> Result<Self> {
         let get = |name: &str| settings.get(name);
-        let need = |name: &str| get(name).with_context(|| format!("не задана переменная {name}"));
         let tun_addr = get("TUN_ADDR").unwrap_or_else(|| DEFAULT_TUN_ADDR.to_string());
         Ok(Self {
-            my_id: need("MY_ID")?.trim().parse().context("MY_ID: некорректный GUID")?,
-            peer_id: need("PEER_ID")?.trim().parse().context("PEER_ID: некорректный GUID")?,
+            peers: parse_peers(&get)?,
+            address_file: Some(settings.resolve(get("ADDRESS_FILE").as_deref().unwrap_or("addresses.state").trim())),
+            dns: addresses::client_dns(get("DNS").as_deref())?,
             tun: hp_tun::TunConfig {
                 name: get("TUN_NAME").unwrap_or_else(|| "hp0".into()),
                 address: Some(hp_tun::parse_cidr(&tun_addr).context("TUN_ADDR: ожидается ip/префикс")?),
@@ -75,6 +96,30 @@ impl Common {
             },
         })
     }
+}
+
+/// Пиры: `PEER_<n>_MY_ID` / `PEER_<n>_PEER_ID` (n = 1, 2, … подряд) или один — `MY_ID` / `PEER_ID`.
+fn parse_peers(get: &impl Fn(&str) -> Option<String>) -> Result<Vec<Peer>> {
+    let parse = |name: &str, value: String| -> Result<Uuid> { value.trim().parse().with_context(|| format!("{name}: некорректный GUID")) };
+    let mut peers = Vec::new();
+    for n in 1.. {
+        let (my, peer) = (format!("PEER_{n}_MY_ID"), format!("PEER_{n}_PEER_ID"));
+        match (get(&my), get(&peer)) {
+            (None, None) => break,
+            (Some(a), Some(b)) => peers.push(Peer { my_id: parse(&my, a)?, peer_id: parse(&peer, b)? }),
+            _ => anyhow::bail!("пир {n}: нужны обе переменные {my} и {peer}"),
+        }
+    }
+    if peers.is_empty() {
+        let my = get("MY_ID").context("не задан ни MY_ID, ни PEER_1_MY_ID")?;
+        let peer = get("PEER_ID").context("не задан ни PEER_ID, ни PEER_1_PEER_ID")?;
+        peers.push(Peer { my_id: parse("MY_ID", my)?, peer_id: parse("PEER_ID", peer)? });
+    }
+    let mut mine = std::collections::HashSet::new();
+    for peer in &peers {
+        anyhow::ensure!(mine.insert(peer.my_id), "GUID сервера {} повторяется: у каждого пира он должен быть свой", peer.my_id);
+    }
+    Ok(peers)
 }
 
 /// Логи по настройкам: `LOG_FILE` считается от каталога файла настроек.
@@ -121,41 +166,86 @@ pub fn main() -> Result<()> {
     init_logging(&settings)?;
     let common = Common::from_settings(&settings)?;
     let discovery = p2p_discovery(&settings)?;
-    tokio::runtime::Runtime::new()?.block_on(serve(discovery, common))
+    let discoveries = vec![discovery; common.peers.len()];
+    tokio::runtime::Runtime::new()?.block_on(serve(discoveries, common))
 }
 
-/// Сервер на TUN: поднимает интерфейс и `MultiLink` с заданным способом встречи и гоняет мост
-/// TUN ↔ дыры, пока жив процесс.
-pub async fn serve(discovery: Discovery, common: Common) -> Result<()> {
+/// Сервер на TUN: поднимает интерфейс и по набору дыр на каждого пира (`discoveries[i]` — способ
+/// встречи с `common.peers[i]`), раздаёт адреса и гоняет мост TUN ↔ дыры, пока жив процесс.
+pub async fn serve(discoveries: Vec<Discovery>, common: Common) -> Result<()> {
+    anyhow::ensure!(discoveries.len() == common.peers.len(), "способов встречи {} на {} пиров", discoveries.len(), common.peers.len());
+    let (server_addr, prefix) = common.tun.address.context("у TUN сервера нет адреса")?;
+    let book = Arc::new(std::sync::Mutex::new(AddressBook::load(server_addr, prefix, common.address_file.clone())?));
     let tun = hp_tun::Tun::create(&common.tun).context("создание TUN (нужны права root)")?;
-    let (addr, prefix) = common.tun.address.unwrap_or((std::net::Ipv4Addr::UNSPECIFIED, 0));
     log::info!(
-        "сервер: я {}, пир {}, TUN {} {addr}/{prefix}, порядок пакетов: ожидание {} мс, дыр для данных: {}",
-        common.my_id,
-        common.peer_id,
+        "сервер: TUN {} {server_addr}/{prefix}, пиров {}, порядок пакетов: ожидание {} мс, дыр для данных: {}",
         tun.name(),
+        common.peers.len(),
         common.reorder_wait.as_millis(),
         if common.data_holes == 0 { "все".to_string() } else { common.data_holes.to_string() }
     );
+    log::info!("сервер: DNS для клиентов {:?}", common.dns);
+    let hub = Arc::new(hp_tun::hub::Hub::start(tun));
+    let dns: Arc<Vec<Vec<u8>>> = Arc::new(common.dns.iter().map(|a| a.octets().to_vec()).collect());
     let options = MultiLinkOptions { reorder_wait: common.reorder_wait, data_holes: common.data_holes, ..MultiLinkOptions::default() };
-    let (link, incoming) = MultiLink::start_discovery("", discovery, common.my_id, common.peer_id, options).await?;
-    let link = Arc::new(link);
-    let bridge = hp_tun::bridge::Bridge::start(tun, link.clone(), incoming);
+    let mut links = Vec::new();
+    for (peer, discovery) in common.peers.iter().zip(discoveries) {
+        log::info!("сервер: я {} ищу пира {}", peer.my_id, peer.peer_id);
+        let label = if common.peers.len() > 1 { peer_name(&peer.peer_id) } else { String::new() };
+        let (link, incoming) = MultiLink::start_discovery(&label, discovery, peer.my_id, peer.peer_id, options).await?;
+        let link = Arc::new(link);
+        hub.add_link(&link, incoming);
+        let control = link.take_control().expect("приёмник служебных сообщений забираем один раз");
+        tokio::spawn(serve_addresses(link.clone(), control, hub.clone(), book.clone(), dns.clone()));
+        links.push(link);
+    }
     let mut last = None;
     loop {
         tokio::time::sleep(STATUS_INTERVAL).await;
-        let stats = bridge.stats();
-        let phones = (stats.clients_to.load(Relaxed), stats.clients_from.load(Relaxed));
-        let now = (link.live_count(), stats.snapshot(), phones);
-        if Some(now) != last {
+        let holes: Vec<usize> = links.iter().map(|l| l.live_count()).collect();
+        let now = (holes, hub.stats().snapshot());
+        if Some(&now) != last.as_ref() {
             let (to, ordered, from, dropped) = now.1;
-            log::info!(
-                "дыры {}/{TARGET_LINKS}, к пиру {to} (TCP с номером {ordered}), от пира {from}, потеряно {dropped}; из них телефонам за роутером {}, от них {}",
-                now.0,
-                phones.0,
-                phones.1
-            );
+            let holes: Vec<String> = now.0.iter().map(|n| format!("{n}/{TARGET_LINKS}")).collect();
+            log::info!("дыры {}, к пирам {to} (TCP с номером {ordered}), от пиров {from}, потеряно {dropped}", holes.join(" "));
             last = Some(now);
+        }
+    }
+}
+
+/// Отвечает на запросы адреса пира `link` (и клиентов за ним): выдаёт адрес из книги и
+/// закрепляет его в мосту.
+async fn serve_addresses(
+    link: Arc<MultiLink>,
+    mut control: mpsc::Receiver<Control>,
+    hub: Arc<hp_tun::hub::Hub>,
+    book: Arc<std::sync::Mutex<AddressBook>>,
+    dns: Arc<Vec<Vec<u8>>>,
+) {
+    while let Some(message) = control.recv().await {
+        let Control::AddressRequest(request) = message else { continue };
+        let Ok(client) = request.client_id.map(u8::try_from).transpose() else {
+            log::warn!("запрос адреса с client_id {:?} вне 0..=255", request.client_id);
+            continue;
+        };
+        let kind = AddressKind::try_from(request.kind).unwrap_or(AddressKind::Host);
+        let key = client_key(&peer_name(&link.peer_id()), client);
+        let assigned = {
+            let mut book = book.lock().unwrap();
+            book.get_or_assign(&key, kind).map(|address| (address, book.prefix()))
+        };
+        match assigned {
+            Ok((address, prefix)) => {
+                hub.assign(address, &link, client);
+                let reply = AddressAssign {
+                    address: address.octets().to_vec(),
+                    prefix: u32::from(prefix),
+                    client_id: request.client_id,
+                    dns: dns.as_ref().clone(),
+                };
+                let _ = link.send_control(Control::AddressAssign(reply)).await;
+            }
+            Err(e) => log::warn!("адрес для {key}: {e:#}"),
         }
     }
 }
@@ -174,5 +264,28 @@ mod tests {
         assert_eq!(parse_args(args(&["--config", "/etc/hp/server.env"])).unwrap(), Some(PathBuf::from("/etc/hp/server.env")));
         assert!(parse_args(args(&["--config"])).is_err());
         assert!(parse_args(args(&["install"])).is_err());
+    }
+
+    fn getter(vars: &[(&str, String)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: std::collections::HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn one_peer_or_a_numbered_list() {
+        let (a, b, c, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let single = parse_peers(&getter(&[("MY_ID", a.to_string()), ("PEER_ID", b.to_string())])).unwrap();
+        assert_eq!(single, vec![Peer { my_id: a, peer_id: b }]);
+        let list = parse_peers(&getter(&[
+            ("PEER_1_MY_ID", a.to_string()),
+            ("PEER_1_PEER_ID", b.to_string()),
+            ("PEER_2_MY_ID", c.to_string()),
+            ("PEER_2_PEER_ID", d.to_string()),
+        ]))
+        .unwrap();
+        assert_eq!(list, vec![Peer { my_id: a, peer_id: b }, Peer { my_id: c, peer_id: d }]);
+        let repeated = getter(&[("PEER_1_MY_ID", a.to_string()), ("PEER_1_PEER_ID", b.to_string()), ("PEER_2_MY_ID", a.to_string()), ("PEER_2_PEER_ID", d.to_string())]);
+        assert!(parse_peers(&repeated).is_err(), "GUID сервера у пиров должен различаться");
+        assert!(parse_peers(&getter(&[])).is_err());
     }
 }

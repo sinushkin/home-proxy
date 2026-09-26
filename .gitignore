@@ -29,3 +29,6 @@ wireguard/out/
 # Образ WSL2 (сборка wsl/build.sh)
 wsl/out/
 /target-musl/
+
+# Книга выданных адресов в туннеле (hp-server, vps-server)
+addresses.state

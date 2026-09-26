@@ -1,4 +1,6 @@
-//! Мост TUN ↔ дыры (`MultiLink`) без WireGuard: IP-пакеты идут по дырам как есть.
+//! Мост TUN ↔ дыры (`MultiLink`) без WireGuard: IP-пакеты идут по дырам как есть. Это мост
+//! клиентского конца — телефона, хоста (`vps-client`), роутера: одна связь с сервером. Сервер с
+//! многими пирами и выдачей адресов — `hub`.
 //!
 //! Из TUN: пакет TCP получает корзину потока (`flow_hash % FLOW_BUCKETS`) и номер в ней и уходит
 //! как `Ordered` — получатель вернёт порядок внутри корзины (буфер порядка), так что потеря в одном
@@ -6,17 +8,16 @@
 //! отдаются сразу: им задержка хуже перестановки (QUIC, DNS, звонки сами с ней справляются).
 //! В TUN: всё, что пришло из дыр, пишется как есть.
 //!
-//! Клиенты за роутером (телефоны): их пакеты приходят обёрнутыми (`WrappedData` с `client_id`).
-//! Мост пишет их в TUN и запоминает адрес источника → клиент; пакет из TUN на такой адрес уходит
-//! этому клиенту — со своими счётчиками номеров на клиента, роутер их не трогает.
+//! Адрес в туннеле клиент не выбирает сам, а получает от сервера: `request_address`.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
-use connection::multilink::{Incoming, MultiLink, MAX_DATA_LEN};
+use connection::multilink::{Control, Incoming, MultiLink, MAX_DATA_LEN};
 use connection::pool::PACKET_CAP;
+use connection::proto::{AddressAssign, AddressKind, AddressRequest};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -66,13 +67,6 @@ impl Sequencer {
     }
 }
 
-/// Клиенты за роутером: адрес → номер клиента (узнаётся по входящим) и счётчики номеров на клиента.
-#[derive(Default)]
-struct Clients {
-    by_addr: HashMap<IpAddr, u8>,
-    sequencers: HashMap<u8, Sequencer>,
-}
-
 /// Счётчики моста (32 бита: на MIPS32 64-битных атомиков нет).
 #[derive(Default)]
 pub struct BridgeStats {
@@ -80,9 +74,6 @@ pub struct BridgeStats {
     pub ordered: AtomicU32,
     pub from_peer: AtomicU32,
     pub dropped: AtomicU32,
-    /// Из них — пакеты клиентов за роутером (к ним и от них).
-    pub clients_to: AtomicU32,
-    pub clients_from: AtomicU32,
 }
 
 impl BridgeStats {
@@ -94,6 +85,37 @@ impl BridgeStats {
             self.from_peer.load(Ordering::Relaxed),
             self.dropped.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// Отправляет IP-пакет пиру по маршруту `route`: своему пиру напрямую или (`client` задан) —
+/// клиенту за роутером обёрнутым. Общая часть моста и `hub`.
+pub(crate) async fn send_routed(link: &MultiLink, client: Option<u8>, route: Route, packet: &[u8], stats: &BridgeStats) {
+    let sent = match (route, client) {
+        (Route::Ordered { flow, seq }, None) => {
+            stats.ordered.fetch_add(1, Ordering::Relaxed);
+            link.send_ordered(flow, seq, packet).await
+        }
+        (Route::Ordered { flow, seq }, Some(client)) => {
+            stats.ordered.fetch_add(1, Ordering::Relaxed);
+            link.send_client(client, Some((flow, seq)), packet).await
+        }
+        (Route::Plain, None) => link.send_data(packet).await,
+        (Route::Plain, Some(client)) => link.send_client(client, None, packet).await,
+        (Route::Drop, _) => {
+            stats.dropped.fetch_add(1, Ordering::Relaxed);
+            log::debug!("TUN: пакет {} байт не отправлен (не IP или больше {MAX_DATA_LEN})", packet.len());
+            return;
+        }
+    };
+    match sent {
+        Ok(_) => {
+            stats.to_peer.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            stats.dropped.fetch_add(1, Ordering::Relaxed);
+            log::trace!("TUN: пакет {} байт потерян: {e:#}", packet.len());
+        }
     }
 }
 
@@ -112,7 +134,7 @@ impl Drop for Bridge {
 }
 
 impl Bridge {
-    /// Конечная точка (VPS, телефон): пакеты клиентов за роутером пишутся в TUN.
+    /// Клиентский конец: всё от сервера пишется в TUN.
     pub fn start(tun: Tun, link: Arc<MultiLink>, incoming: mpsc::Receiver<Incoming>) -> Self {
         Self::spawn(tun, link, incoming, None)
     }
@@ -136,9 +158,8 @@ impl Bridge {
     ) -> Self {
         let tun = Arc::new(tun);
         let stats = Arc::new(BridgeStats::default());
-        let clients = Arc::new(Mutex::new(Clients::default()));
-        let up = tokio::spawn(uplink(tun.clone(), link, clients.clone(), stats.clone()));
-        let down = tokio::spawn(downlink(tun, incoming, clients, relay, stats.clone()));
+        let up = tokio::spawn(uplink(tun.clone(), link, stats.clone()));
+        let down = tokio::spawn(downlink(tun, incoming, relay, stats.clone()));
         Self { stats, tasks: [up, down] }
     }
 
@@ -147,7 +168,7 @@ impl Bridge {
     }
 }
 
-async fn uplink(tun: Arc<Tun>, link: Arc<MultiLink>, clients: Arc<Mutex<Clients>>, stats: Arc<BridgeStats>) {
+async fn uplink(tun: Arc<Tun>, link: Arc<MultiLink>, stats: Arc<BridgeStats>) {
     let mut buf = [0u8; PACKET_CAP];
     let mut sequencer = Sequencer::default();
     loop {
@@ -159,81 +180,26 @@ async fn uplink(tun: Arc<Tun>, link: Arc<MultiLink>, clients: Arc<Mutex<Clients>
             }
         };
         let packet = &buf[..n];
-        let info = packet::inspect(packet);
-        // Адресовано клиенту за роутером — ему, со счётчиками этого клиента.
-        let client_route = info.as_ref().and_then(|info| {
-            let mut clients = clients.lock().unwrap();
-            let client = *clients.by_addr.get(&info.dst)?;
-            Some((client, clients.sequencers.entry(client).or_default().route_inspected(n, Some(info))))
-        });
-        if let Some((client, route)) = client_route {
-            let sent = match route {
-                Route::Ordered { flow, seq } => {
-                    stats.ordered.fetch_add(1, Ordering::Relaxed);
-                    link.send_client(client, Some((flow, seq)), packet).await
-                }
-                Route::Plain => link.send_client(client, None, packet).await,
-                Route::Drop => {
-                    stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-            };
-            match sent {
-                Ok(_) => {
-                    stats.to_peer.fetch_add(1, Ordering::Relaxed);
-                    stats.clients_to.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    log::trace!("TUN: пакет клиенту {client} ({n} байт) потерян: {e:#}");
-                }
-            }
-            continue;
-        }
-        let sent = match sequencer.route_inspected(n, info.as_ref()) {
-            Route::Ordered { flow, seq } => {
-                stats.ordered.fetch_add(1, Ordering::Relaxed);
-                link.send_ordered(flow, seq, packet).await
-            }
-            Route::Plain => link.send_data(packet).await,
-            Route::Drop => {
-                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                log::debug!("TUN: пакет {n} байт не отправлен (не IP или больше {MAX_DATA_LEN})");
-                continue;
-            }
-        };
-        match sent {
-            Ok(_) => {
-                stats.to_peer.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                log::trace!("TUN: пакет {n} байт потерян: {e:#}");
-            }
-        }
+        let route = sequencer.route(packet);
+        send_routed(&link, None, route, packet, &stats).await;
     }
 }
 
-async fn downlink(
-    tun: Arc<Tun>,
-    mut incoming: mpsc::Receiver<Incoming>,
-    clients: Arc<Mutex<Clients>>,
-    relay: Option<mpsc::Sender<Incoming>>,
-    stats: Arc<BridgeStats>,
-) {
+async fn downlink(tun: Arc<Tun>, mut incoming: mpsc::Receiver<Incoming>, relay: Option<mpsc::Sender<Incoming>>, stats: Arc<BridgeStats>) {
     while let Some(packet) = incoming.recv().await {
-        if let Some(wrapped) = packet.wrapped {
-            stats.clients_from.fetch_add(1, Ordering::Relaxed);
-            if let Some(relay) = &relay {
-                if relay.send(packet).await.is_err() {
-                    log::warn!("TUN: ретрансляция клиентам остановлена");
-                    return;
+        if packet.wrapped.is_some() {
+            match &relay {
+                Some(relay) => {
+                    if relay.send(packet).await.is_err() {
+                        log::warn!("TUN: ретрансляция клиентам остановлена");
+                        return;
+                    }
                 }
-                continue;
+                None => {
+                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            if let Some(info) = packet::inspect(&packet.payload) {
-                learn_client(&clients, info.src, wrapped.client_id);
-            }
+            continue;
         }
         match tun.send(&packet.payload).await {
             Ok(_) => {
@@ -248,12 +214,77 @@ async fn downlink(
     log::warn!("TUN: канал входящих закрыт");
 }
 
-/// Запоминает, что адрес `src` — клиент `client_id` (последний присланный пакет выигрывает).
-fn learn_client(clients: &Mutex<Clients>, src: IpAddr, client_id: u8) {
-    let mut clients = clients.lock().unwrap();
-    let previous = clients.by_addr.insert(src, client_id);
-    if previous != Some(client_id) {
-        log::info!("TUN: адрес {src} — клиент {client_id}{}", previous.map(|p| format!(" (был клиент {p})")).unwrap_or_default());
+/// Повторяет запрос адреса раз в `ADDRESS_REFRESH`, пока задачу не остановят (ответы читает
+/// тот, кто держит приёмник служебных сообщений; им можно пренебречь).
+pub fn spawn_address_refresh(link: Arc<MultiLink>, kind: AddressKind, client_id: Option<u32>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let request = Control::AddressRequest(AddressRequest { kind: kind as i32, client_id });
+        let mut ticker = tokio::time::interval(ADDRESS_REFRESH);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let _ = link.send_control(request.clone()).await;
+        }
+    })
+}
+
+/// Выданный сервером адрес в туннеле и DNS для клиента.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assigned {
+    pub address: Ipv4Addr,
+    pub prefix: u8,
+    /// DNS от сервера по порядку (его резолверы, затем запасные); некорректные записи пропущены.
+    pub dns: Vec<Ipv4Addr>,
+}
+
+impl Assigned {
+    /// Из ответа сервера; `None`, если ответ некорректный.
+    pub fn from_proto(assign: &AddressAssign) -> Option<Self> {
+        let octets: [u8; 4] = assign.address.as_slice().try_into().ok()?;
+        let prefix = u8::try_from(assign.prefix).ok().filter(|p| *p <= 32)?;
+        let dns = assign.dns.iter().filter_map(|d| <[u8; 4]>::try_from(d.as_slice()).ok()).map(Ipv4Addr::from).collect();
+        Some(Self { address: Ipv4Addr::from(octets), prefix, dns })
+    }
+}
+
+/// Как часто повторять запрос адреса, пока нет ответа.
+const ADDRESS_RETRY: Duration = Duration::from_secs(1);
+/// Как часто повторять запрос, когда адрес уже есть: сервер после перезапуска восстановит по нему
+/// маршрут к нам (адрес у него записан в книге, выдастся тот же).
+pub const ADDRESS_REFRESH: Duration = Duration::from_secs(30);
+
+/// Просит адрес в туннеле у сервера по дырам `link` и ждёт ответа (запрос повторяется раз в
+/// секунду: дыр может ещё не быть, ответ может потеряться). `control` — приёмник служебных
+/// сообщений этого `MultiLink` (`take_control`); ответы для клиентов за роутером (`client_id`)
+/// здесь пропускаются. Возвращает приёмник обратно: по нему дальше могут прийти ещё сообщения.
+/// Данные от сервера (`incoming`), пришедшие до адреса, отбрасываются: TUN ещё нет, а
+/// непрочитанный канал данных остановил бы и приём служебных сообщений.
+pub async fn request_address(
+    link: &MultiLink,
+    mut control: mpsc::Receiver<Control>,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    kind: AddressKind,
+) -> (Assigned, mpsc::Receiver<Control>) {
+    let request = Control::AddressRequest(AddressRequest { kind: kind as i32, client_id: None });
+    let mut retry = tokio::time::interval(ADDRESS_RETRY);
+    loop {
+        tokio::select! {
+            _ = retry.tick() => {
+                let _ = link.send_control(request.clone()).await;
+            }
+            message = control.recv() => match message {
+                Some(Control::AddressAssign(assign)) if assign.client_id.is_none() => {
+                    if let Some(assigned) = Assigned::from_proto(&assign) {
+                        log::info!("адрес в туннеле: {}/{}, DNS {:?}", assigned.address, assigned.prefix, assigned.dns);
+                        return (assigned, control);
+                    }
+                    log::warn!("некорректный адрес от сервера: {assign:?}");
+                }
+                Some(_) => {}
+                None => std::future::pending::<()>().await,
+            },
+            Some(_) = incoming.recv() => {}
+        }
     }
 }
 

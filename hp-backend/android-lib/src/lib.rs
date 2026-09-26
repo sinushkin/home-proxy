@@ -116,6 +116,28 @@ fn attach_tun(fd: i32) -> Result<()> {
     Ok(())
 }
 
+/// Адрес в туннеле от сервера (`10.80.1.4/16`) или пустая строка, пока его нет.
+fn address() -> String {
+    RUNNING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|running| running.client.address())
+        .map(|a| format!("{}/{}", a.address, a.prefix))
+        .unwrap_or_default()
+}
+
+/// DNS от сервера через запятую (пусто, пока адреса нет).
+fn dns() -> String {
+    RUNNING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|running| running.client.address())
+        .map(|a| a.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","))
+        .unwrap_or_default()
+}
+
 fn detach_tun() {
     if let Some(running) = RUNNING.lock().unwrap().as_ref() {
         running.client.detach_tun();
@@ -231,6 +253,28 @@ pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeAttachTun<'local>(
     }
 }
 
+/// `HomeProxy.nativeAddress(): String` — адрес в туннеле от сервера (`10.80.1.4/16`), пусто —
+/// ещё не выдан. VPN поднимается с этим адресом.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeAddress<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let text = guarded(|_| String::new(), address);
+    to_jstring(&mut env, &text)
+}
+
+/// `HomeProxy.nativeDns(): String` — DNS от сервера через запятую (его резолверы, затем
+/// 8.8.8.8 и 1.1.1.1); пусто, пока адрес не выдан.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeDns<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let text = guarded(|_| String::new(), dns);
+    to_jstring(&mut env, &text)
+}
+
 /// `HomeProxy.nativeDetachTun()` — отключает TUN, дыры остаются.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeDetachTun<'local>(
@@ -281,6 +325,8 @@ mod tests {
     fn status_and_tun_when_stopped() {
         assert_eq!(status(), "остановлен");
         assert_eq!(live_holes(), 0);
+        assert_eq!(address(), "");
+        assert_eq!(dns(), "");
         assert!(attach_tun(-1).is_err());
         detach_tun(); // отключение без клиента ничего не ломает
         stop(); // остановка неработающего клиента ничего не ломает

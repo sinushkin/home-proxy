@@ -211,7 +211,11 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   `router.env` (`router.env.example`), `hp-router/README.md`, `OpenWRT/Tun.md`. Раньше на этом
   месте был `router` — релей телефоны ↔ ПК для WireGuard.
 - `hp-server/` — крейт (библиотека + бинарник `hp-server`), домашний ПК: дыры (STUN + MQTT) → TUN
-  (`TUN_ADDR`, по умолчанию `10.80.0.1/16`) → NAT на ПК. `serve(discovery, common)` поднимает TUN,
+  (`TUN_ADDR`, по умолчанию `10.80.0.1/16`) → NAT на ПК. Адреса в туннеле раздаёт сервер
+  (`addresses.rs`: хосты и роутеры — `10.80.0.x`, телефоны — `10.80.1.x`+, закрепляются за
+  клиентом в `addresses.state`; вместе с адресом — DNS: `DNS=` или резолверы машины, в конце
+  8.8.8.8, 1.1.1.1). Пиров может быть несколько (`PEER_<n>_*`), мост — `hp_tun::hub` (маршрут
+  по выданному адресу, проверка адреса источника). `serve(discoveries, common)` поднимает TUN,
   `MultiLink` и мост `hp_tun::bridge`; клиенты — телефон напрямую или телефоны за роутером
   (адрес источника → `client_id`). `src/settings.rs` — файл настроек `server.env` (`KEY=VALUE`,
   `--config`, по умолчанию `server.env` рядом с бинарником; переменная окружения главнее файла;
@@ -240,7 +244,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
 - `iPhone/` — только заметки (`README.md`): что нужно для iOS-клиента (Mac, платный
   Apple Developer Program, Network Extension) и почему это отложено. Кода нет.
 - `android-vpn/` — Android-приложение (Kotlin, Gradle): экран, foreground-сервис, свой
-  `HpVpnService` (TUN `10.80.1.<n>/32`, маршрут на всё, приложение исключено из VPN, дескриптор
+  `HpVpnService` (TUN с адресом и DNS от сервера, маршрут на всё, приложение исключено из VPN, дескриптор
   отдаётся ядру через JNI); сначала поднимаются дыры с keep-alive, VPN включается только при
   наличии живых дыр. Раньше — библиотека WireGuard. Тулчейн — NDK 26.1 как в
   `build-android.sh`. Сборка, проверка из adb — `android-vpn/README.md`.
@@ -291,6 +295,9 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     - `Stats { links: [LinkStat{slot, sent, received}] }` — статистика пакетов
       по всем дырам (раз в 10 c).
     - `DeleteLink { slot }` — команда пиру удалить линк (пробиваем заново).
+    - `AddressRequest { kind, client_id? }` / `AddressAssign { address, prefix, client_id?, dns }`
+      — адрес в туннеле: клиент просит, сервер (VPS или ПК) выдаёт; роутер пересылает запрос
+      телефона на VPS с `client_id` и возвращает ответ телефону.
     - `WrappedData { seq, payload, client_id }` — пакет, обёрнутый роутером:
       исходная датаграмма как есть, порядковый номер (свой счётчик на
       клиента и направление) и номер клиента `client_id` (u8, 0..=255), по

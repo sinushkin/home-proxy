@@ -15,8 +15,8 @@ object VpnController {
     /** Итог последнего включения (null — успех или ещё не включали). */
     @Volatile var lastMessage: String? = null
 
-    /** Можно ли сейчас включать VPN: хотя бы одна дыра к роутеру уже живая. */
-    fun canStart(): Boolean = HomeProxy.liveHoles() >= 1
+    /** Можно ли сейчас включать VPN: хотя бы одна дыра уже живая и сервер выдал адрес. */
+    fun canStart(): Boolean = HomeProxy.liveHoles() >= 1 && HomeProxy.address() != null
 
     /** Включает VPN (согласие `VpnService.prepare` уже должно быть получено). */
     fun start(context: Context) {
