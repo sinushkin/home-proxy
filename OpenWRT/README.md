@@ -247,3 +247,6 @@ dropbear нет sftp. `ldd` на роутере (это символическа
 | ошибки `cc`/`ring` про компилятор | не заданы `CC_<таргет>`/`AR_<таргет>` или `PATH` без тулчейна |
 | `cannot find crt1.o` при линковке | не заданы `LINKER` и `link-self-contained=no` |
 | на роутере `Not found`/`can't execute` | не тот интерпретатор: бинарник под другой ABI (mips vs mipsel, hard/soft float) |
+
+WireGuard на роутере поверх `vps-client` (весь трафик LAN через VPS с белым IP), настройка по шагам
+и замер скорости — [`Wireguard.md`](Wireguard.md).

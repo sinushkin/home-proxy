@@ -7,38 +7,112 @@
 //! Окружение: `HOLE_PORT_BASE` (первый локальный порт слотов, 0 — любые), `DATA_HOLES`
 //! (0 — все дыры), `PAYLOAD` (байт в пакете, по умолчанию 1392 — как пакет WireGuard при MTU 1360),
 //! `MIN_HOLES` (сколько живых дыр ждать перед отправкой, по умолчанию 10).
+//!
+//! VPS-режим (без STUN и MQTT; `<stun> <mqtt> <mqtt_ca>` тогда игнорируются, можно `-`):
+//! `VPS_SERVER=ip:порт` — клиент; `VPS_PUBLIC_IP` (+ `VPS_BOOTSTRAP_PORT`, `VPS_PORTS=a-b`) — сервер.
+//!
+//! `mlbench codec [итераций]` — стоимость кодека на этой машине без сети: XOR, protobuf,
+//! encode/decode пакета `Data` из `PAYLOAD` байт.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use connection::multilink::{MultiLink, MultiLinkOptions};
+use connection::codec;
+use connection::multilink::{Discovery, MultiLink, MultiLinkOptions};
+use connection::proto::{lite, peer_message, Data, Lite, PeerMessage};
 use uuid::Uuid;
 
 fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
+fn discovery(a: &[String]) -> Result<Discovery> {
+    if let Ok(server) = std::env::var("VPS_SERVER") {
+        return Ok(Discovery::VpsClient { server: server.parse().context("VPS_SERVER: ip:порт")? });
+    }
+    if let Ok(ip) = std::env::var("VPS_PUBLIC_IP") {
+        let ports = std::env::var("VPS_PORTS").unwrap_or_else(|_| "40001-49999".into());
+        let (low, high) = ports.split_once('-').context("VPS_PORTS: a-b")?;
+        return Ok(Discovery::VpsServer {
+            public_ip: ip.parse().context("VPS_PUBLIC_IP")?,
+            bootstrap_port: env_num("VPS_BOOTSTRAP_PORT", connection::vps::DEFAULT_BOOTSTRAP_PORT),
+            ports: low.parse()?..=high.parse()?,
+        });
+    }
+    Ok(Discovery::StunMqtt {
+        stun_addrs: connection::stun::parse_servers(&a[0])?,
+        mqtt_addr: a[1].parse::<SocketAddr>().context("MQTT")?,
+        mqtt_ca_pem: std::fs::read(&a[2]).context("CA")?,
+    })
+}
+
+/// Сколько стоит кодек на пакет: XOR префикса, protobuf-кодирование и разбор.
+fn codec_bench(iterations: u32, payload_len: usize) {
+    let key = codec::random_key();
+    let message = PeerMessage {
+        body: Some(peer_message::Body::Lite(Lite {
+            slot: 3,
+            payload: Some(lite::Payload::Data(Data { payload: vec![0xa5; payload_len] })),
+        })),
+    };
+    let encoded = codec::encode(&message, &key);
+    let per_op = |start: Instant| start.elapsed().as_nanos() as f64 / f64::from(iterations) / 1000.0;
+
+    let start = Instant::now();
+    let mut buf = encoded.clone();
+    for _ in 0..iterations {
+        connection::xor::xor_in_place(std::hint::black_box(&mut buf[..codec::MASKED_PREFIX]), &key);
+    }
+    let xor64 = per_op(start);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        connection::xor::xor_in_place(std::hint::black_box(&mut buf[..]), &key);
+    }
+    let xor_all = per_op(start);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(codec::encode(std::hint::black_box(&message), &key));
+    }
+    let encode = per_op(start);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(codec::decode(std::hint::black_box(encoded.clone()), &key).unwrap());
+    }
+    let decode = per_op(start);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(std::hint::black_box(&encoded).clone());
+    }
+    let copy = per_op(start);
+    println!(
+        "кодек, пакет {} байт, мкс на пакет: XOR 64 байт {xor64:.2}, XOR всего пакета {xor_all:.2}, encode {encode:.2}, decode {decode:.2} (в т.ч. копия буфера {copy:.2})",
+        encoded.len()
+    );
+    println!(
+        "  это потолок только кодека: encode+decode ≈ {:.0} пакетов/с ≈ {:.0} Мбит/с",
+        1e6 / (encode + decode),
+        1e6 / (encode + decode) * payload_len as f64 * 8.0 / 1e6
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     hp_logging::init()?;
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if a.first().map(String::as_str) == Some("codec") {
+        let iterations = a.get(1).and_then(|n| n.parse().ok()).unwrap_or(20_000);
+        codec_bench(iterations, env_num("PAYLOAD", 1392usize));
+        return Ok(());
+    }
     anyhow::ensure!(a.len() >= 7, "использование: mlbench <stun> <mqtt> <ca> <my_id> <peer_id> recv|send <секунд> [Мбит/с,...]");
     let options = MultiLinkOptions {
         reorder_wait: Duration::ZERO,
         data_holes: env_num("DATA_HOLES", 0u8),
         local_port_base: env_num("HOLE_PORT_BASE", 0u16),
     };
-    let (link, mut incoming) = MultiLink::start_with(
-        "",
-        connection::stun::parse_servers(&a[0])?,
-        a[1].parse::<SocketAddr>().context("MQTT")?,
-        std::fs::read(&a[2]).context("CA")?,
-        a[3].parse::<Uuid>()?,
-        a[4].parse::<Uuid>()?,
-        options,
-    )
-    .await?;
+    let (link, mut incoming) =
+        MultiLink::start_discovery("", discovery(&a)?, a[3].parse::<Uuid>()?, a[4].parse::<Uuid>()?, options).await?;
     let secs: u64 = a[6].parse().context("секунд")?;
     let payload_len: usize = env_num("PAYLOAD", 1392usize).max(16);
 
