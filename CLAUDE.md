@@ -174,6 +174,10 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   - `android-lib/` — крейт `homeproxy-android`: JNI-обёртка над `hp-client`
     (`libhomeproxy.so`, `Java_ru_homeproxy_HomeProxy_*`); собирается под NDK
     скриптом `android-vpn/build-native.sh`.
+  - `tun/` — крейт `hp-tun`: свой TUN (`libc` + `AsyncFd`, без сторонних tun-крейтов): `Tun::create`
+    (Linux, OpenWrt — нужен `kmod-tun`, WSL2), `Tun::from_fd` (Android `VpnService`), `packet` —
+    разбор IPv4/IPv6 (протокол, порты, `flow_hash`). Тест с ядром — `unshare -rn cargo test -p hp-tun`.
+    Проверка на машине — `hp-tun-check`. `hp-backend/tun/README.md`.
   - `logging/` — крейт `hp-logging`: общая инициализация логов (`env_logger`
     без regex, `LOG_TARGET=syslog` — в syslog для OpenWrt (только Unix), `LOG_FILE=путь` —
     дописывать в файл: у службы Windows нет консоли; `init_with(get)` берёт настройки

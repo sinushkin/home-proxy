@@ -400,6 +400,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hp-tun"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
