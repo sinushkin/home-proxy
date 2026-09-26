@@ -20,15 +20,15 @@ use crate::multilink::{Incoming, MultiLink};
 
 /// Куда пересылаем пакеты одного направления.
 pub trait Outbound: Send + Sync + 'static {
-    /// Отправляет пакет; `Ok(slot)` — по какой дыре ушёл.
-    fn send(&self, payload: Vec<u8>) -> impl Future<Output = Result<u8>> + Send;
+    /// Отправляет пакет; `Ok(slot)` — по какой дыре ушёл. Пакет только читается (без копии).
+    fn send(&self, payload: &[u8]) -> impl Future<Output = Result<u8>> + Send;
 }
 
 /// Отправка обычной `Data` (к телефону: он про обёртку ничего не знает).
 pub struct PlainOut(pub Arc<MultiLink>);
 
 impl Outbound for PlainOut {
-    async fn send(&self, payload: Vec<u8>) -> Result<u8> {
+    async fn send(&self, payload: &[u8]) -> Result<u8> {
         self.0.send_data(payload).await
     }
 }
@@ -40,7 +40,7 @@ pub struct WrappedOut {
 }
 
 impl Outbound for WrappedOut {
-    async fn send(&self, payload: Vec<u8>) -> Result<u8> {
+    async fn send(&self, payload: &[u8]) -> Result<u8> {
         self.link.send_wrapped(self.client_id, payload).await.map(|(slot, _seq)| slot)
     }
 }
@@ -102,7 +102,7 @@ pub async fn route_by_client<O: Outbound>(
 async fn deliver<O: Outbound>(name: &str, packet: Incoming, out: &O, stats: &DirectionStats) {
     let len = packet.payload.len();
     let from_slot = packet.slot;
-    match out.send(packet.payload).await {
+    match out.send(&packet.payload).await {
         Ok(to_slot) => {
             stats.forwarded.fetch_add(1, Ordering::Relaxed);
             log::trace!("{name}: {len} байт, дыра #{from_slot} -> дыра #{to_slot}");
@@ -133,23 +133,23 @@ mod tests {
     }
 
     impl Outbound for Collect {
-        async fn send(&self, payload: Vec<u8>) -> Result<u8> {
+        async fn send(&self, payload: &[u8]) -> Result<u8> {
             if self.fail {
                 anyhow::bail!("нет живых дыр");
             }
-            self.sent.lock().unwrap().push(payload);
+            self.sent.lock().unwrap().push(payload.to_vec());
             Ok(3)
         }
     }
 
     fn incoming(slot: u8, payload: &[u8]) -> Incoming {
-        Incoming { slot, payload: payload.to_vec(), wrapped: None }
+        Incoming { slot, payload: crate::pool::Packet::copy_from(payload).unwrap(), wrapped: None }
     }
 
     fn wrapped(client_id: u8, payload: &[u8]) -> Incoming {
         Incoming {
             slot: 0,
-            payload: payload.to_vec(),
+            payload: crate::pool::Packet::copy_from(payload).unwrap(),
             wrapped: Some(WrappedInfo { client_id, seq: 0 }),
         }
     }

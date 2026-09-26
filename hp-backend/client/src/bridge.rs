@@ -101,7 +101,7 @@ async fn uplink<O: Outbound>(
             log::debug!("мост: датаграмма {len} байт длиннее лимита {MAX_DATA_LEN}, снижайте MTU WireGuard");
             continue;
         }
-        match out.send(buf[..len].to_vec()).await {
+        match out.send(&buf[..len]).await {
             Ok(slot) => {
                 stats.to_router.fetch_add(1, Ordering::Relaxed);
                 log::trace!("мост: WireGuard -> роутер {len} байт по дыре #{slot}");
@@ -152,8 +152,8 @@ mod tests {
     struct Collect(mpsc::UnboundedSender<Vec<u8>>);
 
     impl Outbound for Collect {
-        async fn send(&self, payload: Vec<u8>) -> anyhow::Result<u8> {
-            let _ = self.0.send(payload);
+        async fn send(&self, payload: &[u8]) -> anyhow::Result<u8> {
+            let _ = self.0.send(payload.to_vec());
             Ok(4)
         }
     }
@@ -161,7 +161,7 @@ mod tests {
     struct Down;
 
     impl Outbound for Down {
-        async fn send(&self, _payload: Vec<u8>) -> anyhow::Result<u8> {
+        async fn send(&self, _payload: &[u8]) -> anyhow::Result<u8> {
             anyhow::bail!("нет живых дыр")
         }
     }
@@ -178,7 +178,7 @@ mod tests {
     }
 
     fn from_router(payload: &[u8]) -> Incoming {
-        Incoming { slot: 2, payload: payload.to_vec(), wrapped: None }
+        Incoming { slot: 2, payload: connection::pool::Packet::copy_from(payload).unwrap(), wrapped: None }
     }
 
     #[tokio::test]

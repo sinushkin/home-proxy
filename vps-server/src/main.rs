@@ -9,7 +9,8 @@
 //!   VPS_BOOTSTRAP_PORT — порт знакомства (40000);
 //!   VPS_PORTS — диапазон портов слотов `начало-конец` (40001-49999);
 //!   MY_ID, PEER_ID, WG_ADDR, CLIENT_TIMEOUT_SECS, REORDER_WAIT_MS, DATA_HOLES,
-//!   RUST_LOG, LOG_FILE — как у `hp-server`.
+//!   RUST_LOG, LOG_FILE — как у `hp-server`;
+//!   RUNTIME=multi — многопоточный tokio (по умолчанию однопоточный).
 //! Брандмауэр должен пропускать входящий UDP на порт знакомства и весь `VPS_PORTS`.
 
 use std::net::IpAddr;
@@ -67,7 +68,13 @@ fn main() -> Result<()> {
     if let Discovery::VpsServer { public_ip, bootstrap_port, ports } = &discovery {
         log::info!("vps-server: белый IP {public_ip}, порт знакомства {bootstrap_port}, порты слотов {}-{}", ports.start(), ports.end());
     }
-    tokio::runtime::Runtime::new()?.block_on(hp_server::serve(discovery, common))
+    // Однопоточный tokio по умолчанию (VPS часто с одним vCPU), `RUNTIME=multi` — многопоточный.
+    let runtime = if settings.get("RUNTIME").as_deref() == Some("multi") {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+    } else {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+    };
+    runtime.block_on(hp_server::serve(discovery, common))
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@
 //!
 //! Модуль чистый: время передаётся снаружи, таймеров и каналов здесь нет.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::multilink::Incoming;
@@ -19,9 +19,9 @@ use crate::multilink::Incoming;
 const TRANSPORT_HEADER: usize = 16;
 const MIN_TRANSPORT_LEN: usize = 32;
 /// Дальше этого «прыжка» вперёд считаем, что сессия сбилась: буфер не копим.
-const MAX_GAP: u64 = 4096;
+const MAX_GAP: u64 = RING as u64 - 1;
 /// Сколько пакетов держим на одну сессию.
-const MAX_HELD: usize = 512;
+const RING: usize = 512;
 const MAX_SESSIONS: usize = 16;
 
 /// Пределы адаптивного ожидания.
@@ -70,10 +70,83 @@ struct Held {
     arrived: Instant,
 }
 
+/// Придержанные пакеты одной сессии: кольцо фиксированного размера по счётчику (без выделения
+/// памяти на пакет; кольцо выделяется один раз, при первом придержанном пакете). Хранит счётчики
+/// из окна `[next, next + RING)`, поэтому пробел больше `RING - 1` не ждём (`MAX_GAP`).
+struct HeldRing {
+    slots: Vec<Option<Held>>,
+    count: usize,
+    /// Наименьший и наибольший придержанный счётчик (при `count > 0`).
+    lo: u64,
+    hi: u64,
+    /// Самый ранний приход среди придержанных (от него считается ожидание).
+    oldest: Option<Instant>,
+}
+
+impl HeldRing {
+    fn new() -> Self {
+        Self { slots: Vec::new(), count: 0, lo: 0, hi: 0, oldest: None }
+    }
+
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    fn first(&self) -> Option<u64> {
+        (self.count > 0).then_some(self.lo)
+    }
+
+    fn index(counter: u64) -> usize {
+        (counter % RING as u64) as usize
+    }
+
+    fn insert(&mut self, counter: u64, held: Held) {
+        if self.slots.is_empty() {
+            self.slots.resize_with(RING, || None);
+        }
+        let arrived = held.arrived;
+        let slot = &mut self.slots[Self::index(counter)];
+        if slot.is_none() {
+            self.count += 1;
+        }
+        *slot = Some(held);
+        if self.count == 1 {
+            self.lo = counter;
+            self.hi = counter;
+        } else {
+            self.lo = self.lo.min(counter);
+            self.hi = self.hi.max(counter);
+        }
+        self.oldest = Some(self.oldest.map_or(arrived, |o| o.min(arrived)));
+    }
+
+    fn remove(&mut self, counter: u64) -> Option<Held> {
+        if self.count == 0 || counter < self.lo || counter > self.hi {
+            return None;
+        }
+        let held = self.slots[Self::index(counter)].take()?;
+        self.count -= 1;
+        if self.count == 0 {
+            self.oldest = None;
+            return Some(held);
+        }
+        if counter == self.lo {
+            self.lo = (counter + 1..=self.hi).find(|c| self.slots[Self::index(*c)].is_some()).expect("count > 0");
+        }
+        if counter == self.hi {
+            self.hi = (self.lo..counter).rev().find(|c| self.slots[Self::index(*c)].is_some()).expect("count > 0");
+        }
+        if self.oldest == Some(held.arrived) {
+            self.oldest = (self.lo..=self.hi).filter_map(|c| self.slots[Self::index(c)].as_ref().map(|h| h.arrived)).min();
+        }
+        Some(held)
+    }
+}
+
 struct Session {
     /// Следующий ожидаемый счётчик.
     next: u64,
-    held: BTreeMap<u64, Held>,
+    held: HeldRing,
     last_seen: Instant,
     /// Номера, выданные дальше без ожидания (не дождались), и когда был замечен их пробел.
     skipped: HashMap<u64, Instant>,
@@ -81,15 +154,16 @@ struct Session {
 
 impl Session {
     fn oldest_arrival(&self) -> Option<Instant> {
-        self.held.values().map(|h| h.arrived).min()
+        self.held.oldest
     }
 }
 
 pub struct Resequencer {
     wait: Duration,
     adaptive: bool,
-    /// Последние измеренные отставания (кольцо).
+    /// Последние измеренные отставания (кольцо) и место под их сортировку.
     lateness: Vec<Duration>,
+    lateness_sorted: Vec<Duration>,
     lateness_pos: usize,
     since_recalc: usize,
     sessions: HashMap<u32, Session>,
@@ -103,6 +177,7 @@ impl Resequencer {
             wait,
             adaptive: false,
             lateness: Vec::new(),
+            lateness_sorted: Vec::new(),
             lateness_pos: 0,
             since_recalc: 0,
             sessions: HashMap::new(),
@@ -132,6 +207,9 @@ impl Resequencer {
             return;
         }
         if self.lateness.len() < LATENESS_WINDOW {
+            if self.lateness.capacity() == 0 {
+                self.lateness.reserve_exact(LATENESS_WINDOW);
+            }
             self.lateness.push(lateness);
         } else {
             self.lateness[self.lateness_pos] = lateness;
@@ -145,8 +223,11 @@ impl Resequencer {
     }
 
     fn recalc_wait(&mut self) {
-        let mut sorted = self.lateness.clone();
-        sorted.sort_unstable();
+        // Сортируем копию в заранее выделенном месте (без выделения памяти после первого раза).
+        self.lateness_sorted.clear();
+        self.lateness_sorted.extend_from_slice(&self.lateness);
+        self.lateness_sorted.sort_unstable();
+        let sorted = &self.lateness_sorted;
         let p99 = sorted[((sorted.len() - 1) as f64 * 0.99).round() as usize];
         let wait = (p99 + p99 / 4).clamp(MIN_WAIT, MAX_WAIT);
         if wait != self.wait {
@@ -162,11 +243,13 @@ impl Resequencer {
         }
     }
 
-    /// Принимает пакет и возвращает те, что можно отдавать дальше сейчас (по порядку).
-    pub fn push(&mut self, packet: Incoming, now: Instant) -> Vec<Incoming> {
+    /// Принимает пакет и дописывает в `out` те, что можно отдавать дальше сейчас (по порядку).
+    /// `out` вызывающий переиспользует между пакетами: выделения памяти на пакет нет.
+    pub fn push_into(&mut self, packet: Incoming, now: Instant, out: &mut Vec<Incoming>) {
         let Some((index, counter)) = parse_transport(&packet.payload) else {
             self.stats.passthrough += 1;
-            return vec![packet];
+            out.push(packet);
+            return;
         };
         if self.sessions.len() >= MAX_SESSIONS && !self.sessions.contains_key(&index) {
             self.prune();
@@ -175,45 +258,48 @@ impl Resequencer {
         let session = self
             .sessions
             .entry(index)
-            .or_insert_with(|| Session { next: counter, held: BTreeMap::new(), last_seen: now, skipped: HashMap::new() });
+            .or_insert_with(|| Session { next: counter, held: HeldRing::new(), last_seen: now, skipped: HashMap::new() });
         session.last_seen = now;
 
         if counter < session.next {
             stats.late += 1;
             let noticed = session.skipped.remove(&counter);
             log::trace!("порядок: сессия {index:#x}: опоздавший пакет {counter} (ждём {}), отдаём сразу", session.next);
+            out.push(packet);
             if let Some(noticed) = noticed {
                 self.record_lateness(now - noticed);
             }
-            return vec![packet];
+            return;
         }
         if counter == session.next {
             stats.in_order += 1;
             let gap_noticed = session.oldest_arrival();
-            let mut out = vec![packet];
+            let before = out.len();
+            out.push(packet);
             session.next = counter + 1;
             let held_before = session.held.len();
-            drain(session, &mut out, &mut stats.reordered);
+            drain(session, out, &mut stats.reordered);
             if held_before > 0 {
                 log::trace!(
                     "порядок: сессия {index:#x}: пришёл недостающий {counter}, выдано {} придержанных, осталось {}",
-                    out.len() - 1,
+                    out.len() - before - 1,
                     session.held.len()
                 );
             }
             if let Some(noticed) = gap_noticed {
                 self.record_lateness(now - noticed);
             }
-            return out;
+            return;
         }
         if counter - session.next > MAX_GAP {
             // Сессия ушла далеко вперёд: пробел не ждём.
-            let mut out = Vec::new();
-            stats.forced += flush(session, &mut out);
-            log::trace!("порядок: сессия {index:#x}: скачок {} -> {counter}, выдано {} придержанных", session.next, out.len());
+            let before = out.len();
+            flush(session, out);
+            stats.forced += (out.len() - before) as u64;
+            log::trace!("порядок: сессия {index:#x}: скачок {} -> {counter}, выдано {} придержанных", session.next, out.len() - before);
             out.push(packet);
             session.next = counter + 1;
-            return out;
+            return;
         }
         log::trace!(
             "порядок: сессия {index:#x}: пакет {counter} раньше ожидаемого {} (пробел {}), придержано {}",
@@ -223,24 +309,15 @@ impl Resequencer {
         );
         session.held.insert(counter, Held { packet, arrived: now });
         stats.max_held = stats.max_held.max(session.held.len());
-        if session.held.len() > MAX_HELD {
-            let mut out = Vec::new();
-            release_lowest(session, &mut out);
-            stats.forced += out.len() as u64;
-            log::trace!("порядок: сессия {index:#x}: буфер переполнен, выдано {}", out.len());
-            return out;
-        }
-        Vec::new()
     }
 
-    /// Ближайший момент, когда `expire` что-то выдаст (для таймера).
+    /// Ближайший момент, когда `expire_into` что-то выдаст (для таймера).
     pub fn next_deadline(&self) -> Option<Instant> {
         self.sessions.values().filter_map(Session::oldest_arrival).min().map(|t| t + self.wait)
     }
 
-    /// Выдаёт придержанные пакеты, недостающего для которых мы не дождались.
-    pub fn expire(&mut self, now: Instant) -> Vec<Incoming> {
-        let mut out = Vec::new();
+    /// Дописывает в `out` придержанные пакеты, недостающего для которых мы не дождались.
+    pub fn expire_into(&mut self, now: Instant, out: &mut Vec<Incoming>) {
         for (index, session) in self.sessions.iter_mut() {
             while let Some(oldest) = session.oldest_arrival() {
                 if now < oldest + self.wait {
@@ -248,7 +325,7 @@ impl Resequencer {
                 }
                 let before = out.len();
                 let missing = session.next;
-                if let Some(&lowest) = session.held.keys().next() {
+                if let Some(lowest) = session.held.first() {
                     if session.skipped.len() + (lowest - missing) as usize > MAX_SKIPPED {
                         session.skipped.clear();
                     }
@@ -256,7 +333,7 @@ impl Resequencer {
                         session.skipped.insert(skipped, oldest);
                     }
                 }
-                release_lowest(session, &mut out);
+                release_lowest(session, out);
                 self.stats.timed_out += (out.len() - before) as u64;
                 log::trace!(
                     "порядок: сессия {index:#x}: не дождались {missing} за {} мс, выдано {}, дальше ждём {}",
@@ -266,7 +343,6 @@ impl Resequencer {
                 );
             }
         }
-        out
     }
 
     fn prune(&mut self) {
@@ -274,11 +350,27 @@ impl Resequencer {
             self.sessions.remove(&oldest);
         }
     }
+
+    /// Для тестов: `push_into` с новым `Vec`.
+    #[cfg(test)]
+    pub fn push(&mut self, packet: Incoming, now: Instant) -> Vec<Incoming> {
+        let mut out = Vec::new();
+        self.push_into(packet, now, &mut out);
+        out
+    }
+
+    /// Для тестов: `expire_into` с новым `Vec`.
+    #[cfg(test)]
+    pub fn expire(&mut self, now: Instant) -> Vec<Incoming> {
+        let mut out = Vec::new();
+        self.expire_into(now, &mut out);
+        out
+    }
 }
 
 /// Выдаёт подряд идущие придержанные пакеты, начиная с `session.next`.
 fn drain(session: &mut Session, out: &mut Vec<Incoming>, counted: &mut u64) {
-    while let Some(held) = session.held.remove(&session.next) {
+    while let Some(held) = session.held.remove(session.next) {
         out.push(held.packet);
         session.next += 1;
         *counted += 1;
@@ -287,19 +379,21 @@ fn drain(session: &mut Session, out: &mut Vec<Incoming>, counted: &mut u64) {
 
 /// Пропускает пробел: выдаёт самый младший придержанный пакет и всё, что идёт за ним подряд.
 fn release_lowest(session: &mut Session, out: &mut Vec<Incoming>) {
-    let Some(&lowest) = session.held.keys().next() else { return };
+    let Some(lowest) = session.held.first() else { return };
     session.next = lowest;
-    while let Some(held) = session.held.remove(&session.next) {
+    while let Some(held) = session.held.remove(session.next) {
         out.push(held.packet);
         session.next += 1;
     }
 }
 
 /// Выдаёт все придержанные пакеты по возрастанию счётчика.
-fn flush(session: &mut Session, out: &mut Vec<Incoming>) -> u64 {
-    let count = session.held.len() as u64;
-    out.extend(std::mem::take(&mut session.held).into_values().map(|h| h.packet));
-    count
+fn flush(session: &mut Session, out: &mut Vec<Incoming>) {
+    while let Some(lowest) = session.held.first() {
+        if let Some(held) = session.held.remove(lowest) {
+            out.push(held.packet);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -313,7 +407,7 @@ mod tests {
         payload[0] = 4;
         payload[4..8].copy_from_slice(&index.to_le_bytes());
         payload[8..16].copy_from_slice(&counter.to_le_bytes());
-        Incoming { slot: (counter % 10) as u8, payload, wrapped: None }
+        Incoming { slot: (counter % 10) as u8, payload: crate::pool::Packet::copy_from(&payload).unwrap(), wrapped: None }
     }
 
     fn counters(packets: &[Incoming]) -> Vec<u64> {
@@ -386,7 +480,7 @@ mod tests {
         let mut handshake = wg(1, 0);
         handshake.payload[0] = 1;
         assert_eq!(r.push(handshake, Instant::now()).len(), 1);
-        let short = Incoming { slot: 0, payload: vec![4, 0, 0, 0], wrapped: None };
+        let short = Incoming { slot: 0, payload: crate::pool::Packet::copy_from(&[4, 0, 0, 0]).unwrap(), wrapped: None };
         assert_eq!(r.push(short, Instant::now()).len(), 1);
         assert_eq!(r.stats().passthrough, 2);
     }
@@ -420,11 +514,11 @@ mod tests {
         let now = Instant::now();
         r.push(wg(1, 0), now);
         let mut released = 0;
-        for counter in 2..(MAX_HELD as u64 + 4) {
+        for counter in 2..(RING as u64 + 4) {
             released += r.push(wg(1, counter), now).len();
         }
         assert!(released > 0, "переполнение должно выдать накопленное");
-        assert!(r.stats().max_held <= MAX_HELD + 1);
+        assert!(r.stats().max_held <= RING);
     }
 
     #[test]

@@ -32,7 +32,13 @@ pub fn decode(mut data: Vec<u8>, key: &XorKey) -> Result<PeerMessage, prost::Dec
     PeerMessage::decode(data.as_slice())
 }
 
-fn mask(data: &mut [u8], key: &XorKey) {
+/// Разбор уже снятого с маски буфера (без копии).
+pub fn decode_unmasked(data: &[u8]) -> Result<PeerMessage, prost::DecodeError> {
+    PeerMessage::decode(data)
+}
+
+/// Маскирует (или снимает маску: XOR симметричен) первые `MASKED_PREFIX` байт на месте.
+pub fn mask(data: &mut [u8], key: &XorKey) {
     let len = data.len().min(MASKED_PREFIX);
     xor_in_place(&mut data[..len], key);
 }

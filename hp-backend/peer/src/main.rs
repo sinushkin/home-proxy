@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
                     if text.is_empty() {
                         continue;
                     }
-                    let payload = text.as_bytes().to_vec();
+                    let payload = text.as_bytes();
                     if wrap {
                         match multilink.send_wrapped(client_id, payload).await {
                             Ok((slot, seq)) => log::info!(

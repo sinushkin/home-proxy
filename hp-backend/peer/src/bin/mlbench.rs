@@ -6,13 +6,18 @@
 //! `mlbench <stun> <mqtt> <mqtt_ca> <my_id> <peer_id> send <секунд> <Мбит/с>[,<Мбит/с>...]`
 //! Окружение: `HOLE_PORT_BASE` (первый локальный порт слотов, 0 — любые), `DATA_HOLES`
 //! (0 — все дыры), `PAYLOAD` (байт в пакете, по умолчанию 1392 — как пакет WireGuard при MTU 1360),
-//! `MIN_HOLES` (сколько живых дыр ждать перед отправкой, по умолчанию 10).
+//! `MIN_HOLES` (сколько живых дыр ждать перед отправкой, по умолчанию 10), `RUNTIME=current`
+//! (однопоточный tokio).
 //!
 //! VPS-режим (без STUN и MQTT; `<stun> <mqtt> <mqtt_ca>` тогда игнорируются, можно `-`):
 //! `VPS_SERVER=ip:порт` — клиент; `VPS_PUBLIC_IP` (+ `VPS_BOOTSTRAP_PORT`, `VPS_PORTS=a-b`) — сервер.
 //!
 //! `mlbench codec [итераций]` — стоимость кодека на этой машине без сети: XOR, protobuf,
 //! encode/decode пакета `Data` из `PAYLOAD` байт.
+//!
+//! «Голый» UDP без MultiLink и tokio (потолок ядра и сети):
+//! `mlbench udp-send <порт> <секунд> <Мбит/с>[,...]` — ждёт приветствие и шлёт его отправителю;
+//! `mlbench udp-recv <ip:порт> <секунд>` — стучится первым (открывает NAT) и принимает.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -89,6 +94,26 @@ fn codec_bench(iterations: u32, payload_len: usize) {
         "кодек, пакет {} байт, мкс на пакет: XOR 64 байт {xor64:.2}, XOR всего пакета {xor_all:.2}, encode {encode:.2}, decode {decode:.2} (в т.ч. копия буфера {copy:.2})",
         encoded.len()
     );
+    let payload = vec![0xa5u8; payload_len];
+    let mut out = [0u8; connection::pool::PACKET_CAP];
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(connection::wire::encode_data(3, std::hint::black_box(&payload), &key, &mut out));
+    }
+    let fast_encode = per_op(start);
+    let n = connection::wire::encode_data(3, &payload, &key, &mut out).unwrap();
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let mut rx = out;
+        codec::mask(&mut rx[..n], &key);
+        if let Some(connection::wire::Fast::Data { payload, .. }) = connection::wire::parse(&rx[..n]) {
+            std::hint::black_box(connection::pool::Packet::copy_from(payload));
+        }
+    }
+    let fast_decode = per_op(start);
+    println!(
+        "  быстрый путь (wire + банк буферов): encode {fast_encode:.2}, decode {fast_decode:.2} (в decode входит копия 1500 байт стекового буфера для теста)"
+    );
     println!(
         "  это потолок только кодека: encode+decode ≈ {:.0} пакетов/с ≈ {:.0} Мбит/с",
         1e6 / (encode + decode),
@@ -96,10 +121,25 @@ fn codec_bench(iterations: u32, payload_len: usize) {
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// `RUNTIME=current` — однопоточный tokio (на одноядерном роутере нет пробуждений между
+/// потоками), иначе многопоточный по умолчанию.
+fn main() -> Result<()> {
+    let runtime = if std::env::var("RUNTIME").as_deref() == Ok("current") {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+    };
+    runtime.block_on(run())
+}
+
+async fn run() -> Result<()> {
     hp_logging::init()?;
     let a: Vec<String> = std::env::args().skip(1).collect();
+    match a.first().map(String::as_str) {
+        Some("udp-send") => return udp_send(&a[1..]),
+        Some("udp-recv") => return udp_recv(&a[1..]),
+        _ => {}
+    }
     if a.first().map(String::as_str) == Some("codec") {
         let iterations = a.get(1).and_then(|n| n.parse().ok()).unwrap_or(20_000);
         codec_bench(iterations, env_num("PAYLOAD", 1392usize));
@@ -145,6 +185,8 @@ async fn main() -> Result<()> {
         println!("живых дыр перед отправкой: {}", link.live_count());
         tokio::time::sleep(Duration::from_secs(3)).await;
         let mut seq = 0u64;
+        let mut p = vec![0u8; payload_len];
+        p[..4].copy_from_slice(b"MLBN");
         for rate in rates {
             let pps = rate * 1e6 / 8.0 / payload_len as f64;
             let start = Instant::now();
@@ -152,11 +194,9 @@ async fn main() -> Result<()> {
             while start.elapsed() < Duration::from_secs(secs) {
                 let due = (start.elapsed().as_secs_f64() * pps) as u64;
                 while sent + failed < due {
-                    let mut p = vec![0u8; payload_len];
-                    p[..4].copy_from_slice(b"MLBN");
                     p[8..16].copy_from_slice(&seq.to_le_bytes());
                     seq += 1;
-                    if link.send_data(p).await.is_ok() { sent += 1 } else { failed += 1 }
+                    if link.send_data(&p).await.is_ok() { sent += 1 } else { failed += 1 }
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -227,4 +267,79 @@ impl Burst {
             pct(0.5), pct(0.9), pct(0.99), pct(1.0), self.lateness.len()
         );
     }
+}
+
+/// «Голый» UDP: ждёт приветствие получателя и шлёт ему пакеты с заданной скоростью.
+fn udp_send(a: &[String]) -> Result<()> {
+    anyhow::ensure!(a.len() == 3, "mlbench udp-send <порт> <секунд> <Мбит/с>[,...]");
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", a[0].parse::<u16>()?))?;
+    let secs: u64 = a[1].parse()?;
+    let payload_len: usize = env_num("PAYLOAD", 1403usize);
+    let mut buf = [0u8; 64];
+    let (_, peer) = socket.recv_from(&mut buf)?;
+    println!("получатель {peer}");
+    let mut packet = vec![0u8; payload_len];
+    let mut seq = 0u64;
+    for rate in a[2].split(',') {
+        let rate: f64 = rate.parse()?;
+        let pps = rate * 1e6 / 8.0 / payload_len as f64;
+        let start = Instant::now();
+        let mut sent = 0u64;
+        while start.elapsed() < Duration::from_secs(secs) {
+            let due = (start.elapsed().as_secs_f64() * pps) as u64;
+            while sent < due {
+                packet[..8].copy_from_slice(&seq.to_le_bytes());
+                socket.send_to(&packet, peer)?;
+                sent += 1;
+                seq += 1;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        println!("отправка {rate} Мбит/с: {sent} пакетов");
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Ok(())
+}
+
+/// «Голый» UDP: стучится отправителю и считает принятое по секундам (без tokio).
+fn udp_recv(a: &[String]) -> Result<()> {
+    anyhow::ensure!(a.len() == 2, "mlbench udp-recv <ip:порт> <секунд>");
+    let sender: SocketAddr = a[0].parse()?;
+    let secs: u64 = a[1].parse()?;
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+    socket.set_read_timeout(Some(Duration::from_millis(1500)))?;
+    for _ in 0..5 {
+        socket.send_to(b"hello", sender)?;
+    }
+    let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let (mut count, mut bytes, mut first_seq, mut max_seq, mut t0, mut t1) = (0u64, 0u64, u64::MAX, 0u64, None, Instant::now());
+    while Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) if n >= 8 => {
+                let seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let now = Instant::now();
+                t0.get_or_insert(now);
+                t1 = now;
+                first_seq = first_seq.min(seq);
+                max_seq = max_seq.max(seq);
+                count += 1;
+                bytes += n as u64;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                if let Some(start) = t0.take() {
+                    let dur = t1.duration_since(start).as_secs_f64().max(0.001);
+                    let sent = max_seq - first_seq + 1;
+                    println!(
+                        "ИТОГ пачки UDP: {:.1} Мбит/с, {count} из {sent} пакетов, потеряно {:.1}%",
+                        bytes as f64 * 8.0 / dur / 1e6,
+                        100.0 * sent.saturating_sub(count) as f64 / sent as f64
+                    );
+                    (count, bytes, first_seq, max_seq) = (0, 0, u64::MAX, 0);
+                }
+            }
+        }
+    }
+    Ok(())
 }

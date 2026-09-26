@@ -29,10 +29,11 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::codec::{self, XorKey};
+use crate::pool::Packet;
 use crate::label::Label;
 use crate::link_id::PeerLinkId;
 use crate::port_utils;
-use crate::proto::{LinkStat, Rendezvous, WrappedData};
+use crate::proto::{LinkStat, Rendezvous};
 use crate::reorder::{ReorderStats, Resequencer};
 use crate::punch::{self, LinkEvent, LinkSender, PeerIdentity, PeerLinkStat, PunchConfig};
 use crate::rendezvous::{self, PeerSession, Registrar};
@@ -84,7 +85,8 @@ pub struct WrappedInfo {
 #[derive(Debug)]
 pub struct Incoming {
     pub slot: u8,
-    pub payload: Vec<u8>,
+    /// Нагрузка в буфере из банка (`pool`): буфер вернётся в банк, когда пакет отправят дальше.
+    pub payload: Packet,
     pub wrapped: Option<WrappedInfo>,
 }
 
@@ -191,33 +193,78 @@ impl StateTracker {
 /// выберут все; затем цикл начинается заново. Так порядок непредсказуем, а
 /// нагрузка делится поровну. Слоты, которые перестали быть живыми, из цикла
 /// выпадают; новые живые слоты попадают в него со следующего цикла.
-#[derive(Default)]
 struct SlotPicker {
-    remaining: Vec<u8>,
+    /// Ещё не использованные в этом цикле слоты (без выделения памяти: слотов ≤ `TARGET_LINKS`).
+    remaining: [u8; TARGET_LINKS as usize],
+    len: usize,
+    rng: XorShift32,
+}
+
+impl Default for SlotPicker {
+    fn default() -> Self {
+        Self { remaining: [0; TARGET_LINKS as usize], len: 0, rng: XorShift32::seeded() }
+    }
 }
 
 impl SlotPicker {
     /// `random_below(n)` — случайное число из `0..n`.
     fn pick(&mut self, live: &[u8], mut random_below: impl FnMut(usize) -> usize) -> Option<u8> {
-        self.remaining.retain(|slot| live.contains(slot));
-        if self.remaining.is_empty() {
-            self.remaining = live.to_vec();
+        let mut kept = 0;
+        for i in 0..self.len {
+            if live.contains(&self.remaining[i]) {
+                self.remaining[kept] = self.remaining[i];
+                kept += 1;
+            }
         }
-        if self.remaining.is_empty() {
+        self.len = kept;
+        if self.len == 0 {
+            self.len = live.len().min(self.remaining.len());
+            self.remaining[..self.len].copy_from_slice(&live[..self.len]);
+        }
+        if self.len == 0 {
             return None;
         }
-        let index = random_below(self.remaining.len());
-        Some(self.remaining.swap_remove(index))
+        let index = random_below(self.len);
+        let slot = self.remaining[index];
+        self.len -= 1;
+        self.remaining[index] = self.remaining[self.len];
+        Some(slot)
+    }
+
+    /// То же со своим генератором случайных чисел.
+    fn pick_random(&mut self, live: &[u8]) -> Option<u8> {
+        let mut rng = self.rng;
+        let slot = self.pick(live, |n| rng.below(n));
+        self.rng = rng;
+        slot
     }
 }
 
-/// Случайное число из `0..n` (`n > 0`) из CSPRNG ОС (через v4 UUID: свежие
-/// случайные байты без лишней зависимости). Смещение от взятия остатка от
-/// 64 бит при `n` порядка десятка пренебрежимо.
-fn random_below(n: usize) -> usize {
-    let bytes = Uuid::new_v4().into_bytes();
-    let random = u64::from_le_bytes(bytes[..8].try_into().expect("8 байт"));
-    (random % n as u64) as usize
+/// Быстрый генератор случайных чисел для выбора дыры (xorshift32, 32 бита — годится и для
+/// MIPS32). Это распределение нагрузки, а не криптография: сид один раз из CSPRNG ОС (v4 UUID),
+/// дальше без системных вызовов (раньше на каждый пакет был `getrandom`).
+#[derive(Clone, Copy)]
+struct XorShift32(u32);
+
+impl XorShift32 {
+    fn seeded() -> Self {
+        let bytes = Uuid::new_v4().into_bytes();
+        Self(u32::from_le_bytes(bytes[..4].try_into().expect("4 байта")) | 1)
+    }
+
+    fn next(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+
+    /// Случайное число из `0..n` (`n > 0`); смещение от остатка при `n` порядка десятка пренебрежимо.
+    fn below(&mut self, n: usize) -> usize {
+        self.next() as usize % n
+    }
 }
 
 /// Сендер одной живой дыры плюс её слот.
@@ -333,13 +380,11 @@ fn slot_port(base: u16, slot: u8) -> u16 {
     if base == 0 { 0 } else { base.saturating_add(u16::from(slot)) }
 }
 
-/// Оставляет для отправки не больше `max` слотов с наименьшими номерами (0 — все).
-fn limit_slots(mut slots: Vec<u8>, max: u8) -> Vec<u8> {
+/// Оставляет для отправки не больше `max` слотов с наименьшими номерами (0 — все); сортирует
+/// на месте, возвращает, сколько слотов оставить.
+fn limit_slots(slots: &mut [u8], max: u8) -> usize {
     slots.sort_unstable();
-    if max > 0 {
-        slots.truncate(usize::from(max));
-    }
-    slots
+    if max > 0 { slots.len().min(usize::from(max)) } else { slots.len() }
 }
 
 pub struct MultiLink {
@@ -515,19 +560,27 @@ impl MultiLink {
             payload_len <= MAX_DATA_LEN,
             "сообщение {payload_len} байт длиннее лимита {MAX_DATA_LEN}"
         );
-        let mut links = self.registry.lock().unwrap().links();
-        links.sort_by_key(|l| l.slot);
-        let slots = limit_slots(links.iter().map(|l| l.slot).collect(), self.data_holes);
-        let picked = self.picker.lock().unwrap().pick(&slots, random_below);
+        // Без выделения памяти: живых дыр ≤ TARGET_LINKS, список — на стеке.
+        let registry = self.registry.lock().unwrap();
+        let mut slots = [0u8; TARGET_LINKS as usize];
+        let mut count = 0;
+        for &slot in registry.by_slot.keys() {
+            if count < slots.len() {
+                slots[count] = slot;
+                count += 1;
+            }
+        }
+        let count = limit_slots(&mut slots[..count], self.data_holes);
+        let picked = self.picker.lock().unwrap().pick_random(&slots[..count]);
         let Some(slot) = picked else {
             anyhow::bail!("нет живых дыр");
         };
-        Ok(links.into_iter().find(|l| l.slot == slot).expect("слот выбран из этого списка"))
+        Ok(registry.by_slot.get(&slot).expect("слот выбран из живых").clone())
     }
 
     /// Отправляет полезную нагрузку пиру по одной из живых дыр обычной `Data`.
     /// Возвращает номер дыры, по которой ушло.
-    pub async fn send_data(&self, payload: Vec<u8>) -> Result<u8> {
+    pub async fn send_data(&self, payload: &[u8]) -> Result<u8> {
         let link = self.choose_link(payload.len())?;
         link.sender.send_data(payload).await;
         Ok(link.slot)
@@ -536,11 +589,10 @@ impl MultiLink {
     /// Оборачивает `payload` в `WrappedData` для клиента `client_id` (с его
     /// порядковым номером) и отправляет по одной из живых дыр. Возвращает номер
     /// дыры и присвоенный `seq`.
-    pub async fn send_wrapped(&self, client_id: u8, payload: Vec<u8>) -> Result<(u8, u64)> {
+    pub async fn send_wrapped(&self, client_id: u8, payload: &[u8]) -> Result<(u8, u64)> {
         let link = self.choose_link(payload.len())?;
         let seq = self.wrap_seq.lock().unwrap().next(client_id);
-        let wrapped = WrappedData { seq, payload, client_id: u32::from(client_id) };
-        link.sender.send_wrapped(wrapped).await;
+        link.sender.send_wrapped(seq, u32::from(client_id), payload).await;
         Ok((link.slot, seq))
     }
 
@@ -638,6 +690,7 @@ async fn control_loop(
     reorder_wait: Duration,
 ) {
     let mut reorder = (!reorder_wait.is_zero()).then(|| Resequencer::adaptive(reorder_wait));
+    let mut ready: Vec<Incoming> = Vec::with_capacity(64);
     let mut stats_tick = tokio::time::interval(REORDER_STATS_INTERVAL);
     let mut logged = ReorderStats::default();
     loop {
@@ -647,7 +700,8 @@ async fn control_loop(
             event = events.recv() => event,
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(sleep_until)), if deadline.is_some() => {
                 if let Some(reorder) = reorder.as_mut() {
-                    for packet in reorder.expire(Instant::now()) {
+                    reorder.expire_into(Instant::now(), &mut ready);
+                    for packet in ready.drain(..) {
                         let _ = incoming.send(packet).await;
                     }
                 }
@@ -689,19 +743,15 @@ async fn control_loop(
                 request_redrop(&redrop_txs, slot);
             }
             LinkEvent::PeerData { slot, payload } => {
-                deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None }).await;
+                deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None }, &mut ready).await;
             }
-            LinkEvent::PeerWrapped { slot, wrapped } => {
-                let Ok(client_id) = u8::try_from(wrapped.client_id) else {
-                    log::warn!("{label}слот {slot}: WrappedData с client_id {} вне 0..=255", wrapped.client_id);
+            LinkEvent::PeerWrapped { slot, seq, client_id, payload } => {
+                let Ok(client_id) = u8::try_from(client_id) else {
+                    log::warn!("{label}слот {slot}: WrappedData с client_id {client_id} вне 0..=255");
                     continue;
                 };
-                let packet = Incoming {
-                    slot,
-                    payload: wrapped.payload,
-                    wrapped: Some(WrappedInfo { client_id, seq: wrapped.seq }),
-                };
-                deliver(&incoming, &mut reorder, packet).await;
+                let packet = Incoming { slot, payload, wrapped: Some(WrappedInfo { client_id, seq }) };
+                deliver(&incoming, &mut reorder, packet, &mut ready).await;
             }
             LinkEvent::PeerRendezvous(r) => {
                 match rendezvous::peer_session_from(&r) {
@@ -714,12 +764,19 @@ async fn control_loop(
 }
 
 /// Отдаёт пакет приложению: через буфер порядка (если включён) или сразу.
-async fn deliver(incoming: &mpsc::Sender<Incoming>, reorder: &mut Option<Resequencer>, packet: Incoming) {
-    let ready = match reorder {
-        Some(reorder) => reorder.push(packet, Instant::now()),
-        None => vec![packet],
+/// `ready` — переиспользуемый буфер выдачи (без выделения памяти на пакет).
+async fn deliver(
+    incoming: &mpsc::Sender<Incoming>,
+    reorder: &mut Option<Resequencer>,
+    packet: Incoming,
+    ready: &mut Vec<Incoming>,
+) {
+    let Some(reorder) = reorder else {
+        let _ = incoming.send(packet).await;
+        return;
     };
-    for packet in ready {
+    reorder.push_into(packet, Instant::now(), ready);
+    for packet in ready.drain(..) {
         let _ = incoming.send(packet).await;
     }
 }
@@ -1162,7 +1219,8 @@ mod tests {
 
     #[test]
     fn random_below_stays_in_range_and_varies() {
-        let values: Vec<usize> = (0..200).map(|_| random_below(10)).collect();
+        let mut rng = XorShift32::seeded();
+        let values: Vec<usize> = (0..200).map(|_| rng.below(10)).collect();
         assert!(values.iter().all(|v| *v < 10));
         assert!(values.iter().collect::<std::collections::HashSet<_>>().len() > 5);
     }
@@ -1196,7 +1254,7 @@ mod tests {
         payload[0] = 4;
         payload[4..8].copy_from_slice(&7u32.to_le_bytes());
         payload[8..16].copy_from_slice(&counter.to_le_bytes());
-        LinkEvent::PeerData { slot: (counter % 10) as u8, payload }
+        LinkEvent::PeerData { slot: (counter % 10) as u8, payload: Packet::copy_from(&payload).unwrap() }
     }
 
     fn counter_of(packet: &Incoming) -> u64 {
@@ -1264,11 +1322,16 @@ mod tests {
 
     #[test]
     fn limit_slots_keeps_the_lowest_numbers_and_zero_means_all() {
-        assert_eq!(limit_slots(vec![5, 1, 9, 3], 0), vec![1, 3, 5, 9]);
-        assert_eq!(limit_slots(vec![5, 1, 9, 3], 1), vec![1]);
-        assert_eq!(limit_slots(vec![5, 1, 9, 3], 2), vec![1, 3]);
-        assert_eq!(limit_slots(vec![4], 3), vec![4]);
-        assert_eq!(limit_slots(vec![], 1), Vec::<u8>::new());
+        let limited = |mut v: Vec<u8>, max: u8| {
+            let n = limit_slots(&mut v, max);
+            v.truncate(n);
+            v
+        };
+        assert_eq!(limited(vec![5, 1, 9, 3], 0), vec![1, 3, 5, 9]);
+        assert_eq!(limited(vec![5, 1, 9, 3], 1), vec![1]);
+        assert_eq!(limited(vec![5, 1, 9, 3], 2), vec![1, 3]);
+        assert_eq!(limited(vec![4], 3), vec![4]);
+        assert_eq!(limited(vec![], 1), Vec::<u8>::new());
     }
 
     #[test]
@@ -1318,10 +1381,10 @@ mod tests {
             assert!((47100..=47299).contains(&port), "клиент ходит на порт из диапазона сервера: {port}");
         }
 
-        client.send_data(b"ping".to_vec()).await.unwrap();
+        client.send_data(b"ping").await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), server_rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.payload, b"ping");
-        server.send_data(b"pong".to_vec()).await.unwrap();
+        server.send_data(b"pong").await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), client_rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.payload, b"pong");
 

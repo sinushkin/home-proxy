@@ -44,7 +44,7 @@ impl fmt::Display for ClientKey {
 
 /// Куда отправлять ответы WireGuard'а (в проде — обратно по дырам).
 pub trait Reply: Send + Sync + 'static {
-    fn send(&self, client: ClientKey, payload: Vec<u8>) -> impl Future<Output = Result<()>> + Send;
+    fn send(&self, client: ClientKey, payload: &[u8]) -> impl Future<Output = Result<()>> + Send;
 }
 
 struct Client {
@@ -170,7 +170,7 @@ async fn read_replies<R: Reply>(
         match socket.recv(&mut buf).await {
             Ok(len) => {
                 *last_activity.lock().unwrap() = Instant::now();
-                if let Err(e) = reply.send(client, buf[..len].to_vec()).await {
+                if let Err(e) = reply.send(client, &buf[..len]).await {
                     log::debug!("клиент {client}: ответ {len} байт потерян: {e:#}");
                 }
             }
@@ -198,8 +198,8 @@ mod tests {
     struct Collect(mpsc::UnboundedSender<(ClientKey, Vec<u8>)>);
 
     impl Reply for Collect {
-        async fn send(&self, client: ClientKey, payload: Vec<u8>) -> Result<()> {
-            let _ = self.0.send((client, payload));
+        async fn send(&self, client: ClientKey, payload: &[u8]) -> Result<()> {
+            let _ = self.0.send((client, payload.to_vec()));
             Ok(())
         }
     }

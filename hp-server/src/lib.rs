@@ -50,7 +50,7 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(60);
 struct ToPeer(Arc<MultiLink>);
 
 impl Reply for ToPeer {
-    async fn send(&self, client: ClientKey, payload: Vec<u8>) -> Result<()> {
+    async fn send(&self, client: ClientKey, payload: &[u8]) -> Result<()> {
         match client {
             ClientKey::Routed(client_id) => self.0.send_wrapped(client_id, payload).await.map(|_| ()),
             ClientKey::Direct => self.0.send_data(payload).await.map(|_| ()),

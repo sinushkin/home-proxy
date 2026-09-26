@@ -31,11 +31,12 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::codec::{self, XorKey};
+use crate::pool::{Packet, PACKET_CAP};
+use crate::wire::{self, Fast};
 use crate::link_id::PeerLinkId;
 use crate::port_utils::{sweep_bounds, zigzag_ports};
 use crate::proto::{
-    Data, DeleteLink, InitMessage, KeepAlive, Lite, PeerMessage, Punch, PunchAck, Rendezvous, Stats,
-    WrappedData,
+    DeleteLink, InitMessage, KeepAlive, Lite, PeerMessage, Punch, PunchAck, Rendezvous, Stats,
 };
 use crate::proto::{init_message, lite, peer_message};
 
@@ -74,10 +75,10 @@ pub enum LinkEvent {
     /// Виртуал-брокер: пир прислал по этой дыре запись `Rendezvous` о своём
     /// другом слоте (то, что иначе ушло бы в MQTT).
     PeerRendezvous(Rendezvous),
-    /// Пир прислал полезную нагрузку (`Data`) по дыре `slot`.
-    PeerData { slot: u8, payload: Vec<u8> },
+    /// Пир прислал полезную нагрузку (`Data`) по дыре `slot` (буфер из банка).
+    PeerData { slot: u8, payload: Packet },
     /// Пир прислал обёрнутый пакет (`WrappedData`) по дыре `slot`.
-    PeerWrapped { slot: u8, wrapped: WrappedData },
+    PeerWrapped { slot: u8, seq: u64, client_id: u32, payload: Packet },
 }
 
 #[derive(Clone, Debug)]
@@ -204,24 +205,35 @@ impl LinkSender {
     }
 
     /// Отправить полезную нагрузку (в перспективе — WireGuard) по этой дыре.
-    pub async fn send_data(&self, payload: Vec<u8>) {
-        log::debug!(
-            "слот {}: отправлено {} байт данных",
-            self.identity.slot,
-            payload.len()
-        );
-        self.send_lite(lite::Payload::Data(Data { payload })).await;
+    /// Отправить полезную нагрузку (WireGuard) по этой дыре. Пакет собирается в буфере на
+    /// стеке (`wire`), без выделения памяти.
+    pub async fn send_data(&self, payload: &[u8]) {
+        log::trace!("слот {}: отправлено {} байт данных", self.identity.slot, payload.len());
+        let mut buf = [0u8; PACKET_CAP];
+        let Some(n) = wire::encode_data(u32::from(self.identity.slot), payload, &self.identity.peer_key, &mut buf) else {
+            log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
+            return;
+        };
+        self.send_raw(&buf[..n]).await;
     }
 
     /// Отправить обёрнутый пакет (роутер ↔ сервер) по этой дыре.
-    pub async fn send_wrapped(&self, wrapped: WrappedData) {
-        log::debug!(
-            "слот {}: отправлен WrappedData seq={} ({} байт)",
-            self.identity.slot,
-            wrapped.seq,
-            wrapped.payload.len()
-        );
-        self.send_lite(lite::Payload::Wrapped(wrapped)).await;
+    pub async fn send_wrapped(&self, seq: u64, client_id: u32, payload: &[u8]) {
+        log::trace!("слот {}: отправлен WrappedData seq={seq} ({} байт)", self.identity.slot, payload.len());
+        let mut buf = [0u8; PACKET_CAP];
+        let slot = u32::from(self.identity.slot);
+        let Some(n) = wire::encode_wrapped(slot, seq, payload, client_id, &self.identity.peer_key, &mut buf) else {
+            log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
+            return;
+        };
+        self.send_raw(&buf[..n]).await;
+    }
+
+    async fn send_raw(&self, packet: &[u8]) {
+        let Some(peer_addr) = self.peer_addr() else { return };
+        if self.socket.send_to(packet, peer_addr).await.is_ok() {
+            self.stats.sent.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Отправить нашу статистику по всем дырам.
@@ -433,9 +445,27 @@ async fn receive_loop(
             Ok(v) => v,
             Err(_) => continue,
         };
-        // Битый/чужой protobuf (случайный пакет, скан, мусор) — просто
-        // игнорируем: XOR нашим вектором + decode дадут Err, и мы пропускаем пакет.
-        let Ok(msg) = codec::decode(buf[..n].to_vec(), &identity.my_key) else {
+        // Маску снимаем на месте. Пакет данных разбираем без выделения памяти (`wire`),
+        // остальное — prost'ом. Битый/чужой protobuf (скан, мусор) — просто пропускаем.
+        codec::mask(&mut buf[..n], &identity.my_key);
+        if let Some(fast) = wire::parse(&buf[..n]) {
+            let (lite_slot, event) = match fast {
+                Fast::Data { slot, payload } => (slot, Packet::copy_from(payload).map(|payload| LinkEvent::PeerData { slot: identity.slot, payload })),
+                Fast::Wrapped { slot, seq, payload, client_id } => (
+                    slot,
+                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerWrapped { slot: identity.slot, seq, client_id, payload }),
+                ),
+            };
+            if lite_slot != u32::from(identity.slot) {
+                continue;
+            }
+            note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
+            if let Some(event) = event {
+                let _ = events.send(event).await;
+            }
+            continue;
+        }
+        let Ok(msg) = codec::decode_unmasked(&buf[..n]) else {
             continue;
         };
         match msg.body {
@@ -509,22 +539,17 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
             log::debug!("слот {slot}: получен Rendezvous слота {}", r.slot);
             let _ = events.send(LinkEvent::PeerRendezvous(r)).await;
         }
+        // Обычно пакеты данных разбирает быстрый путь (`wire`); сюда они попадают, только если
+        // закодированы необычно (например, с повторными полями).
         Some(lite::Payload::Data(d)) => {
-            log::debug!("слот {slot}: получено {} байт данных", d.payload.len());
-            let _ = events
-                .send(LinkEvent::PeerData {
-                    slot,
-                    payload: d.payload,
-                })
-                .await;
+            if let Some(payload) = Packet::copy_from(&d.payload) {
+                let _ = events.send(LinkEvent::PeerData { slot, payload }).await;
+            }
         }
         Some(lite::Payload::Wrapped(w)) => {
-            log::debug!(
-                "слот {slot}: получен WrappedData seq={} ({} байт)",
-                w.seq,
-                w.payload.len()
-            );
-            let _ = events.send(LinkEvent::PeerWrapped { slot, wrapped: w }).await;
+            if let Some(payload) = Packet::copy_from(&w.payload) {
+                let _ = events.send(LinkEvent::PeerWrapped { slot, seq: w.seq, client_id: w.client_id, payload }).await;
+            }
         }
         // last_seen/received уже обновлены выше.
         Some(lite::Payload::KeepAlive(k)) => {
@@ -537,6 +562,7 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::Data;
     use std::net::IpAddr;
 
     fn test_config() -> PunchConfig {
@@ -725,7 +751,7 @@ mod tests {
         let link_a = link_a.unwrap();
         let _link_b = link_b.unwrap();
 
-        link_a.sender.send_data(b"hello".to_vec()).await;
+        link_a.sender.send_data(b"hello").await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), b_events.recv())
             .await
@@ -764,7 +790,7 @@ mod tests {
 
         link_a
             .sender
-            .send_wrapped(WrappedData { seq: 42, payload: b"wg-packet".to_vec(), client_id: 5 })
+            .send_wrapped(42, 5, b"wg-packet")
             .await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), b_events.recv())
@@ -772,11 +798,11 @@ mod tests {
             .expect("событие с обёрнутым пакетом не пришло")
             .unwrap();
         match event {
-            LinkEvent::PeerWrapped { slot, wrapped } => {
+            LinkEvent::PeerWrapped { slot, seq, client_id, payload } => {
                 assert_eq!(slot, 0);
-                assert_eq!(wrapped.seq, 42);
-                assert_eq!(wrapped.client_id, 5);
-                assert_eq!(wrapped.payload, b"wg-packet");
+                assert_eq!(seq, 42);
+                assert_eq!(client_id, 5);
+                assert_eq!(payload, b"wg-packet");
             }
             other => panic!("ожидали PeerWrapped, пришло {other:?}"),
         }

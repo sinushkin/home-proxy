@@ -5,7 +5,8 @@
 //! Аргументы: `<ip_сервера[:порт_знакомства]> <мой_guid> <guid_сервера> [порт моста]`
 //! (порт знакомства по умолчанию 40000, моста — 51821). Окружение: `REORDER_WAIT_MS`
 //! (начальное ожидание буфера порядка, 8; 0 — выключить), `DATA_HOLES` (0 — данные через
-//! все живые дыры), `RUST_LOG`, `LOG_TARGET=syslog` (OpenWrt).
+//! все живые дыры), `RUNTIME=multi` (многопоточный tokio; по умолчанию однопоточный), `RUST_LOG`,
+//! `LOG_TARGET=syslog` (OpenWrt).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,8 +39,18 @@ fn parse_server(value: &str) -> Result<SocketAddr> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Однопоточный tokio по умолчанию: на одноядерном роутере многопоточный тратит процессор на
+/// пробуждения потоков (`futex` на каждый пакет). `RUNTIME=multi` — многопоточный.
+fn main() -> Result<()> {
+    let runtime = if std::env::var("RUNTIME").as_deref() == Ok("multi") {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+    } else {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+    };
+    runtime.block_on(run())
+}
+
+async fn run() -> Result<()> {
     hp_logging::init()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     anyhow::ensure!(
