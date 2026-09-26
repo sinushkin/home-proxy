@@ -10,3 +10,4 @@ uuid = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
 connection = { path = "../connection" }
+hp-tun = { path = "../tun" }

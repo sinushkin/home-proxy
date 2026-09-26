@@ -466,6 +466,7 @@ dependencies = [
  "android_logger",
  "anyhow",
  "hp-client",
+ "hp-tun",
  "jni",
  "log",
  "tokio",
@@ -478,6 +479,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "connection",
+ "hp-tun",
  "log",
  "tokio",
  "uuid",

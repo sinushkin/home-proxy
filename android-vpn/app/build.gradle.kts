@@ -29,8 +29,6 @@ android {
     }
 
     compileOptions {
-        // Библиотека WireGuard требует десугаринга (Java record и др. на minSdk < 34).
-        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
@@ -41,9 +39,5 @@ android {
 }
 
 dependencies {
-    // Официальная библиотека WireGuard для Android: GoBackend со своим VpnService
-    // и prebuilt-libwg-go.so под все ABI.
-    implementation(libs.wireguard.tunnel)
-    coreLibraryDesugaring(libs.desugar.jdk.libs)
     testImplementation(libs.junit)
 }

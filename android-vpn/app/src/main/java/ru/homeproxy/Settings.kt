@@ -20,21 +20,18 @@ class Settings(context: Context) {
         get() = prefs.getString("peerId", "") ?: ""
         set(value) = prefs.edit().putString("peerId", value).apply()
 
-    /** Конфиг WireGuard (формат wg-quick) целиком, как его выдаёт сервер. */
-    var wgConfig: String
-        get() = prefs.getString("wgConfig", null) ?: bundledWgConfig()
-        set(value) = prefs.edit().putString("wgConfig", value).apply()
+    /**
+     * Адрес телефона в туннеле (`/32`). За роутером — `10.80.1.<n>`, где `n` — номер телефона
+     * в настройках роутера (`PHONE_<n>_*`): по этому адресу VPS отвечает именно ему.
+     */
+    var tunAddr: String
+        get() = prefs.getString("tunAddr", DEFAULT_TUN_ADDR) ?: DEFAULT_TUN_ADDR
+        set(value) = prefs.edit().putString("tunAddr", value).apply()
 
-    /** Конфиг, вложенный в APK при сборке (build-native.sh копирует wireguard/out/client.conf). */
-    private fun bundledWgConfig(): String = try {
-        appContext.assets.open("wg.conf").bufferedReader().use { it.readText() }
-    } catch (_: java.io.IOException) {
-        ""
-    }
-
-    var localPort: Int
-        get() = prefs.getInt("localPort", DEFAULT_LOCAL_PORT)
-        set(value) = prefs.edit().putInt("localPort", value).apply()
+    /** DNS-сервер внутри VPN (запросы идут по туннелю). */
+    var dns: String
+        get() = prefs.getString("dns", DEFAULT_DNS) ?: DEFAULT_DNS
+        set(value) = prefs.edit().putString("dns", value).apply()
 
     /** GUID телефона: создаётся при первом запуске и дальше не меняется. */
     var myId: String
@@ -49,19 +46,16 @@ class Settings(context: Context) {
     /**
      * Принимает настройки из intent (для проверки из adb):
      * `am start -n ru.homeproxy/.MainActivity --es stun ip:порт --es mqtt ip:порт
-     * --es peerId GUID [--es myId GUID] --ei localPort 51821 [--ei reorderMs 8] [--ei dataHoles 1] [--es wgConfigB64 …]
-     * --ez autostart true [--ez vpn true]`.
+     * --es peerId GUID [--es myId GUID] [--es tunAddr 10.80.1.1] [--es dns 1.1.1.1]
+     * [--ei reorderMs 8] [--ei dataHoles 1] --ez autostart true [--ez vpn true]`.
      */
     fun applyExtras(intent: android.content.Intent) {
         intent.getStringExtra("stun")?.let { stun = it }
         intent.getStringExtra("mqtt")?.let { mqtt = it }
         intent.getStringExtra("peerId")?.let { peerId = it }
         intent.getStringExtra("myId")?.let { myId = it }
-        // Конфиг WireGuard base64 (в одну строку, чтобы передать из adb).
-        intent.getStringExtra("wgConfigB64")?.let {
-            wgConfig = String(android.util.Base64.decode(it, android.util.Base64.DEFAULT))
-        }
-        if (intent.hasExtra("localPort")) localPort = intent.getIntExtra("localPort", DEFAULT_LOCAL_PORT)
+        intent.getStringExtra("tunAddr")?.let { tunAddr = it }
+        intent.getStringExtra("dns")?.let { dns = it }
         if (intent.hasExtra("reorderMs")) reorderMs = intent.getIntExtra("reorderMs", DEFAULT_REORDER_MS)
         if (intent.hasExtra("dataHoles")) dataHoles = intent.getIntExtra("dataHoles", 0)
     }
@@ -75,12 +69,13 @@ class Settings(context: Context) {
         set(value) = prefs.edit().putInt("dataHoles", value).apply()
 
     fun toConfig() = HomeProxy.Config(
-        stun = stun, mqtt = mqtt, caPem = caPem(), myId = myId, peerId = peerId, localPort = localPort,
+        stun = stun, mqtt = mqtt, caPem = caPem(), myId = myId, peerId = peerId,
         reorderMs = reorderMs, dataHoles = dataHoles,
     )
 
     companion object {
-        const val DEFAULT_LOCAL_PORT = 51821
+        const val DEFAULT_TUN_ADDR = "10.80.1.1"
+        const val DEFAULT_DNS = "1.1.1.1"
         const val DEFAULT_REORDER_MS = 8
     }
 }

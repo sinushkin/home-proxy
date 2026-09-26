@@ -62,16 +62,8 @@ for abi in $ABIS; do
   ls -la "$out/libhomeproxy.so"
 done
 
-# Конфиг WireGuard клиента (ключи из wireguard/out) — в assets: приложение берёт
-# его по умолчанию. Внутри приватный ключ, поэтому файл в git не попадает.
-WG="${WG_CONF:-$HERE/../wireguard/out/client.conf}"
-if [[ -f "$WG" ]]; then
-  mkdir -p "$HERE/app/src/main/assets"
-  cp "$WG" "$HERE/app/src/main/assets/wg.conf"
-  echo "client.conf скопирован в assets/wg.conf"
-else
-  echo "предупреждение: $WG не найден — выполните wireguard/gen.sh (или вставьте конфиг в приложении)" >&2
-fi
+# Старый конфиг WireGuard из assets больше не нужен (VPN — свой TUN).
+rm -f "$HERE/app/src/main/assets/wg.conf"
 
 # CA брокера — публичный сертификат, кладём в assets (в git не попадает).
 CA="$HERE/../cert/out/ca.crt"

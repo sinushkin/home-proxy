@@ -26,5 +26,15 @@
             android:name=".ProxyService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Свой VPN (TUN без WireGuard): дескриптор интерфейса отдаётся клиенту. -->
+        <service
+            android:name=".HpVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

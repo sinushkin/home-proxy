@@ -9,8 +9,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
-import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
@@ -29,8 +27,8 @@ class MainActivity : Activity() {
     private lateinit var stun: EditText
     private lateinit var mqtt: EditText
     private lateinit var peerId: EditText
-    private lateinit var port: EditText
-    private lateinit var wgConfig: EditText
+    private lateinit var tunAddr: EditText
+    private lateinit var dns: EditText
     private lateinit var status: TextView
     private lateinit var connectButton: Button
     private lateinit var vpnOnButton: Button
@@ -63,20 +61,12 @@ class MainActivity : Activity() {
         stun = field(column, "STUN (ip:порт)", settings.stun)
         mqtt = field(column, "MQTT, TLS (ip:порт)", settings.mqtt)
         peerId = field(column, "GUID пира (ПК или роутера)", settings.peerId)
-        port = field(column, "Порт моста на 127.0.0.1 (endpoint WireGuard)", settings.localPort.toString()).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        column.addView(label("Конфиг WireGuard (wg-quick). Endpoint подменится на мост, MTU не больше 1368"))
-        wgConfig = EditText(this).apply {
-            setText(settings.wgConfig)
-            minLines = 6
-            gravity = Gravity.TOP
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-        }.also { column.addView(it) }
+        tunAddr = field(column, "Адрес в туннеле (10.80.1.<номер телефона на роутере>)", settings.tunAddr)
+        dns = field(column, "DNS внутри VPN", settings.dns)
 
         connectButton = button(column, "1. Подключить (дыры и keep-alive)") { connect() }
         vpnOnButton = button(column, "2. Включить VPN") { startVpn() }
-        vpnOffButton = button(column, "Выключить VPN") { thread { vpnMessage = VpnController.stop(applicationContext) } }
+        vpnOffButton = button(column, "Выключить VPN") { VpnController.stop(applicationContext) }
         button(column, "Остановить всё") { stopAll() }
         status = TextView(this).apply { setPadding(0, 24, 0, 0) }
         column.addView(status)
@@ -138,7 +128,7 @@ class MainActivity : Activity() {
         status.text = buildString {
             append(if (error != null) "Ошибка: $error" else HomeProxy.status())
             append("\nVPN: ").append(if (VpnController.isUp) "включён" else "выключен")
-            vpnMessage?.let { append("\n").append(it) }
+            (vpnMessage ?: VpnController.lastMessage)?.let { append("\n").append(it) }
             if (holes < 1) append("\nVPN можно включить, когда появится хотя бы одна живая дыра")
         }
         vpnOnButton.isEnabled = holes >= 1 && !VpnController.isUp
@@ -149,8 +139,8 @@ class MainActivity : Activity() {
         settings.stun = stun.text.toString().trim()
         settings.mqtt = mqtt.text.toString().trim()
         settings.peerId = peerId.text.toString().trim()
-        settings.localPort = port.text.toString().trim().toIntOrNull() ?: Settings.DEFAULT_LOCAL_PORT
-        settings.wgConfig = wgConfig.text.toString()
+        settings.tunAddr = tunAddr.text.toString().trim()
+        settings.dns = dns.text.toString().trim()
     }
 
     private fun connect() {
@@ -171,17 +161,14 @@ class MainActivity : Activity() {
     }
 
     private fun launchVpn() {
-        vpnMessage = "VPN включается…"
-        thread(name = "homeproxy-vpn") {
-            vpnMessage = VpnController.start(applicationContext, settings.wgConfig, settings.localPort)
-        }
+        vpnMessage = null
+        VpnController.start(applicationContext)
     }
 
     private fun stopAll() {
-        thread(name = "homeproxy-stop-all") {
-            vpnMessage = VpnController.stop(applicationContext)
-            ProxyService.stop(this)
-        }
+        vpnMessage = null
+        VpnController.stop(applicationContext)
+        ProxyService.stop(this)
     }
 
     private fun label(text: String) = TextView(this).apply { this.text = text; setPadding(0, 24, 0, 0) }

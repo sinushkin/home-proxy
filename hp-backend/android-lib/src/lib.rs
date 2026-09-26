@@ -2,11 +2,14 @@
 //!
 //! Kotlin-сторона — `ru.homeproxy.HomeProxy` (`android-vpn/app/src/main/java`).
 //! Одновременно работает не больше одного клиента: `nativeStart` поднимает
-//! свой tokio-рантайм, `nativeStop` останавливает его вместе со всеми задачами.
+//! свой tokio-рантайм и дыры, `nativeAttachTun` отдаёт клиенту дескриптор TUN от
+//! `VpnService` (IP-пакеты по дырам без WireGuard), `nativeDetachTun` его закрывает,
+//! `nativeStop` останавливает рантайм вместе со всеми задачами.
 //! Ошибки в Kotlin возвращаются строкой (null — успех), паники ловятся и не
 //! роняют процесс.
 
 use std::net::SocketAddr;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Mutex, Once};
 
@@ -45,7 +48,6 @@ fn parse_config(
     ca_pem: &str,
     my_id: &str,
     peer_id: &str,
-    local_port: i32,
 ) -> Result<ClientConfig> {
     anyhow::ensure!(
         ca_pem.contains("-----BEGIN CERTIFICATE-----"),
@@ -57,7 +59,6 @@ fn parse_config(
         mqtt_ca_pem: ca_pem.as_bytes().to_vec(),
         my_id: my_id.trim().parse::<Uuid>().context("мой GUID некорректен")?,
         peer_id: peer_id.trim().parse::<Uuid>().context("GUID роутера некорректен")?,
-        local_port: u16::try_from(local_port).context("локальный порт вне 0..=65535")?,
         reorder_wait_ms: hp_client::DEFAULT_REORDER_WAIT.as_millis() as u32,
         data_holes: 0,
     })
@@ -102,13 +103,23 @@ fn live_holes() -> i32 {
         .unwrap_or(0)
 }
 
-fn local_port() -> i32 {
-    RUNNING
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|running| i32::from(running.client.local_addr().port()))
-        .unwrap_or(0)
+/// Отдаёт клиенту дескриптор TUN (владение переходит к нему: закроется при отключении).
+fn attach_tun(fd: i32) -> Result<()> {
+    anyhow::ensure!(fd >= 0, "некорректный дескриптор TUN {fd}");
+    // SAFETY: Kotlin отдаёт дескриптор через ParcelFileDescriptor.detachFd() — теперь он наш.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let running = RUNNING.lock().unwrap();
+    let running = running.as_ref().context("клиент не запущен")?;
+    let _context = running.runtime.enter();
+    let tun = hp_tun::Tun::from_fd(fd).context("дескриптор TUN")?;
+    running.client.attach_tun(tun);
+    Ok(())
+}
+
+fn detach_tun() {
+    if let Some(running) = RUNNING.lock().unwrap().as_ref() {
+        running.client.detach_tun();
+    }
 }
 
 /// Выполняет `f`, превращая панику в сообщение (в JNI паника через границу — UB).
@@ -135,7 +146,7 @@ fn to_jstring(env: &mut JNIEnv, text: &str) -> jstring {
     env.new_string(text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
-/// `HomeProxy.nativeStart(stun, mqtt, caPem, myId, peerId, localPort): String?`
+/// `HomeProxy.nativeStart(stun, mqtt, caPem, myId, peerId, reorderMs, dataHoles): String?`
 /// Возвращает null при успехе, иначе текст ошибки.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeStart<'local>(
@@ -146,7 +157,6 @@ pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeStart<'local>(
     ca_pem: JString<'local>,
     my_id: JString<'local>,
     peer_id: JString<'local>,
-    local_port: jint,
     reorder_ms: jint,
     data_holes: jint,
 ) -> jstring {
@@ -160,7 +170,6 @@ pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeStart<'local>(
                 &read(&mut env, &ca_pem)?,
                 &read(&mut env, &my_id)?,
                 &read(&mut env, &peer_id)?,
-                local_port,
             )?;
             config.reorder_wait_ms = u32::try_from(reorder_ms).context("reorderMs: ожидается 0 или больше")?;
             config.data_holes = u8::try_from(data_holes).context("dataHoles: ожидается 0..=255")?;
@@ -205,13 +214,30 @@ pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeLiveHoles<'local>(
     guarded(|_| 0, live_holes)
 }
 
-/// `HomeProxy.nativeLocalPort(): Int` — порт моста для WireGuard (0, если не запущен).
+/// `HomeProxy.nativeAttachTun(fd): String?` — дескриптор TUN от `VpnService.Builder.establish()`
+/// (`ParcelFileDescriptor.detachFd()`). null — успех, иначе текст ошибки.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeLocalPort<'local>(
+pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeAttachTun<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    fd: jint,
+) -> jstring {
+    match guarded(|message| Err(anyhow::anyhow!(message)), || attach_tun(fd)) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(e) => {
+            log::warn!("TUN не подключён: {e:#}");
+            to_jstring(&mut env, &format!("{e:#}"))
+        }
+    }
+}
+
+/// `HomeProxy.nativeDetachTun()` — отключает TUN, дыры остаются.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeDetachTun<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
-) -> jint {
-    guarded(|_| 0, local_port)
+) {
+    guarded(|_| (), detach_tun);
 }
 
 #[cfg(test)]
@@ -224,34 +250,25 @@ mod tests {
 
     #[test]
     fn valid_settings_parse_and_trim() {
-        let config =
-            parse_config(" 1.2.3.4:3478 , 5.6.7.8:19302", "1.2.3.4:8883\n", CA, &format!(" {A}"), B, 51821).unwrap();
+        let config = parse_config(" 1.2.3.4:3478 , 5.6.7.8:19302", "1.2.3.4:8883\n", CA, &format!(" {A}"), B).unwrap();
         assert_eq!(config.stun_addrs.len(), 2);
         assert_eq!(config.stun_addrs[0].to_string(), "1.2.3.4:3478");
         assert_eq!(config.my_id.to_string(), A);
-        assert_eq!(config.local_port, 51821);
     }
 
     #[test]
     fn each_bad_field_is_named_in_the_error() {
         let cases = [
-            (parse_config("nope", "1.2.3.4:1", CA, A, B, 1), "STUN"),
-            (parse_config("1.2.3.4:1", "1.2.3.4", CA, A, B, 1), "MQTT"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", "text", A, B, 1), "CA"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, "x", B, 1), "мой GUID"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, A, "x", 1), "GUID роутера"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, A, B, 70000), "порт"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, A, B, -1), "порт"),
+            (parse_config("nope", "1.2.3.4:1", CA, A, B), "STUN"),
+            (parse_config("1.2.3.4:1", "1.2.3.4", CA, A, B), "MQTT"),
+            (parse_config("1.2.3.4:1", "1.2.3.4:1", "text", A, B), "CA"),
+            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, "x", B), "мой GUID"),
+            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, A, "x"), "GUID роутера"),
         ];
         for (result, expected) in cases {
             let error = format!("{:#}", result.err().expect("должна быть ошибка"));
             assert!(error.contains(expected), "ожидали «{expected}» в: {error}");
         }
-    }
-
-    #[test]
-    fn port_zero_means_any_free_port() {
-        assert_eq!(parse_config("1.2.3.4:1", "1.2.3.4:1", CA, A, B, 0).unwrap().local_port, 0);
     }
 
     #[test]
@@ -261,10 +278,11 @@ mod tests {
     }
 
     #[test]
-    fn status_and_port_when_stopped() {
+    fn status_and_tun_when_stopped() {
         assert_eq!(status(), "остановлен");
-        assert_eq!(local_port(), 0);
         assert_eq!(live_holes(), 0);
+        assert!(attach_tun(-1).is_err());
+        detach_tun(); // отключение без клиента ничего не ломает
         stop(); // остановка неработающего клиента ничего не ломает
     }
 }
