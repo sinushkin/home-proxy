@@ -10,7 +10,7 @@ members = [
     "hp-server",
     "vps-server",
     "vps-client",
-    "router",
+    "hp-router",
 ]
 
 [workspace.package]
@@ -34,3 +34,9 @@ jni = "0.21"
 android_logger = { version = "0.15", default-features = false }
 # Служба Windows для server (SCM: запуск, остановка, установка).
 windows-service = "0.8"
+# Подпись пакетов: ChaCha20-Poly1305 (шифруется пустое сообщение, пакет — присоединённые данные),
+# вывод ключей из секрета пары — SHA-256, подпись `Rendezvous` — HMAC-SHA256. Без атомиков и SIMD
+# под MIPS32 (роутеры) — чистый Rust.
+chacha20poly1305 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = "0.12"

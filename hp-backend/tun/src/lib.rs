@@ -16,6 +16,26 @@
 
 pub mod packet;
 
+use std::net::Ipv4Addr;
+
+/// Адрес интерфейса `ip/префикс` (`10.80.0.2/24`); `None`, если записано не так.
+pub fn parse_cidr(value: &str) -> Option<(Ipv4Addr, u8)> {
+    let (ip, prefix) = value.trim().split_once('/')?;
+    let prefix: u8 = prefix.parse().ok().filter(|p| *p <= 32)?;
+    Some((ip.parse().ok()?, prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cidr_parses() {
+        assert_eq!(super::parse_cidr("10.80.0.2/24"), Some(("10.80.0.2".parse().unwrap(), 24)));
+        assert_eq!(super::parse_cidr("10.80.0.2"), None);
+        assert_eq!(super::parse_cidr("10.80.0.2/33"), None);
+        assert_eq!(super::parse_cidr("vps/24"), None);
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod bridge;
 

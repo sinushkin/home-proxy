@@ -116,6 +116,7 @@ fn options(reorder_wait_ms: u32, data_holes: u8) -> MultiLinkOptions {
         reorder_wait: std::time::Duration::from_millis(u64::from(reorder_wait_ms)),
         data_holes,
         local_port_base: 0,
+        ..MultiLinkOptions::default()
     }
 }
 

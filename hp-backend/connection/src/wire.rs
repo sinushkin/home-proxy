@@ -2,9 +2,10 @@
 //! буфер вызывающего и разбор без выделения памяти. Формат — тот же protobuf, что даёт prost
 //! (проверяется тестами байт-в-байт); всё остальное (`Init`, keep-alive, статистика, оферы)
 //! по-прежнему кодируется prost'ом. Маскировка — как в `codec` (XOR первых
-//! `codec::MASKED_PREFIX` байт).
+//! `codec::MASKED_PREFIX` байт, после подписи — `auth`).
 
-use crate::codec::{self, XorKey};
+use crate::auth::{SendKeys, AUTH_LEN};
+use crate::codec;
 
 // Теги protobuf: (номер поля << 3) | тип (0 — varint, 2 — длина + байты).
 const PEER_LITE: u8 = 2 << 3 | 2;
@@ -15,6 +16,7 @@ const DATA_PAYLOAD: u8 = 1 << 3 | 2;
 const WRAPPED_SEQ: u8 = 1 << 3;
 const WRAPPED_PAYLOAD: u8 = 2 << 3 | 2;
 const WRAPPED_CLIENT: u8 = 3 << 3;
+const WRAPPED_FLOW: u8 = 4 << 3;
 const LITE_ORDERED: u8 = 8 << 3 | 2;
 const ORDERED_FLOW: u8 = 1 << 3;
 const ORDERED_SEQ: u8 = 2 << 3;
@@ -24,7 +26,7 @@ const ORDERED_PAYLOAD: u8 = 3 << 3 | 2;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Fast<'a> {
     Data { slot: u32, payload: &'a [u8] },
-    Wrapped { slot: u32, seq: u64, payload: &'a [u8], client_id: u32 },
+    Wrapped { slot: u32, seq: u64, payload: &'a [u8], client_id: u32, flow: Option<u32> },
     Ordered { slot: u32, flow: u32, seq: u64, payload: &'a [u8] },
 }
 
@@ -73,18 +75,19 @@ fn varint_field_len(v: u64) -> usize {
     if v == 0 { 0 } else { 1 + varint_len(v) }
 }
 
-/// Пишет `PeerMessage { lite: Lite { slot, <inner_tag>: <inner> } }` и маскирует; `inner`
-/// дописывает тело вложенного сообщения длины `inner_len`.
+/// Пишет `PeerMessage { lite: Lite { slot, <inner_tag>: <inner> } }`, подписывает и маскирует;
+/// `inner` дописывает тело вложенного сообщения длины `inner_len`.
 fn write_lite(
     out: &mut [u8],
-    key: &XorKey,
+    keys: &SendKeys,
     slot: u32,
     inner_tag: u8,
     inner_len: usize,
     inner: impl FnOnce(&mut Writer) -> Option<()>,
 ) -> Option<usize> {
     let lite_len = varint_field_len(u64::from(slot)) + 1 + varint_len(inner_len as u64) + inner_len;
-    let mut w = Writer { out, pos: 0 };
+    // Место под подпись — в начале; protobuf пишем сразу за ним.
+    let mut w = Writer { out, pos: AUTH_LEN };
     w.byte(PEER_LITE)?;
     w.varint(lite_len as u64)?;
     if slot != 0 {
@@ -94,14 +97,15 @@ fn write_lite(
     w.byte(inner_tag)?;
     w.varint(inner_len as u64)?;
     inner(&mut w)?;
-    let n = w.pos;
-    codec::mask(&mut out[..n], key);
+    let len = w.pos - AUTH_LEN;
+    let n = keys.sealer.seal(out, len)?;
+    codec::mask(&mut out[..n], &keys.xor);
     Some(n)
 }
 
 /// `Lite { slot, data: Data { payload } }` в `out`, замаскированный; длина или `None`, если не влезло.
-pub fn encode_data(slot: u32, payload: &[u8], key: &XorKey, out: &mut [u8]) -> Option<usize> {
-    write_lite(out, key, slot, LITE_DATA, bytes_field_len(payload.len()), |w| {
+pub fn encode_data(slot: u32, payload: &[u8], keys: &SendKeys, out: &mut [u8]) -> Option<usize> {
+    write_lite(out, keys, slot, LITE_DATA, bytes_field_len(payload.len()), |w| {
         if !payload.is_empty() {
             w.byte(DATA_PAYLOAD)?;
             w.varint(payload.len() as u64)?;
@@ -111,10 +115,20 @@ pub fn encode_data(slot: u32, payload: &[u8], key: &XorKey, out: &mut [u8]) -> O
     })
 }
 
-/// `Lite { slot, wrapped: WrappedData { seq, payload, client_id } }` в `out`, замаскированный.
-pub fn encode_wrapped(slot: u32, seq: u64, payload: &[u8], client_id: u32, key: &XorKey, out: &mut [u8]) -> Option<usize> {
-    let inner_len = varint_field_len(seq) + bytes_field_len(payload.len()) + varint_field_len(u64::from(client_id));
-    write_lite(out, key, slot, LITE_WRAPPED, inner_len, |w| {
+/// `Lite { slot, wrapped: WrappedData { seq, payload, client_id, flow } }` в `out`, замаскированный.
+pub fn encode_wrapped(
+    slot: u32,
+    seq: u64,
+    payload: &[u8],
+    client_id: u32,
+    flow: Option<u32>,
+    keys: &SendKeys,
+    out: &mut [u8],
+) -> Option<usize> {
+    // `optional`-поле пишется всегда, когда задано (и нулём тоже).
+    let flow_len = flow.map_or(0, |f| 1 + varint_len(u64::from(f)));
+    let inner_len = varint_field_len(seq) + bytes_field_len(payload.len()) + varint_field_len(u64::from(client_id)) + flow_len;
+    write_lite(out, keys, slot, LITE_WRAPPED, inner_len, |w| {
         if seq != 0 {
             w.byte(WRAPPED_SEQ)?;
             w.varint(seq)?;
@@ -128,14 +142,18 @@ pub fn encode_wrapped(slot: u32, seq: u64, payload: &[u8], client_id: u32, key: 
             w.byte(WRAPPED_CLIENT)?;
             w.varint(u64::from(client_id))?;
         }
+        if let Some(flow) = flow {
+            w.byte(WRAPPED_FLOW)?;
+            w.varint(u64::from(flow))?;
+        }
         Some(())
     })
 }
 
 /// `Lite { slot, ordered: Ordered { flow, seq, payload } }` в `out`, замаскированный.
-pub fn encode_ordered(slot: u32, flow: u32, seq: u64, payload: &[u8], key: &XorKey, out: &mut [u8]) -> Option<usize> {
+pub fn encode_ordered(slot: u32, flow: u32, seq: u64, payload: &[u8], keys: &SendKeys, out: &mut [u8]) -> Option<usize> {
     let inner_len = varint_field_len(u64::from(flow)) + varint_field_len(seq) + bytes_field_len(payload.len());
-    write_lite(out, key, slot, LITE_ORDERED, inner_len, |w| {
+    write_lite(out, keys, slot, LITE_ORDERED, inner_len, |w| {
         if flow != 0 {
             w.byte(ORDERED_FLOW)?;
             w.varint(u64::from(flow))?;
@@ -235,12 +253,13 @@ pub fn parse(buf: &[u8]) -> Option<Fast<'_>> {
         }
         return Some(Fast::Ordered { slot, flow: flow.unwrap_or(0), seq: seq.unwrap_or(0), payload: payload.unwrap_or(&[]) });
     }
-    let (mut seq, mut payload, mut client_id) = (None, None, None);
+    let (mut seq, mut payload, mut client_id, mut flow) = (None, None, None, None);
     while !r.done() {
         match r.byte()? {
             WRAPPED_SEQ if seq.is_none() => seq = Some(r.varint()?),
             WRAPPED_PAYLOAD if payload.is_none() => payload = Some(r.bytes()?),
             WRAPPED_CLIENT if client_id.is_none() => client_id = Some(r.varint()? as u32),
+            WRAPPED_FLOW if flow.is_none() => flow = Some(r.varint()? as u32),
             _ => return None,
         }
     }
@@ -249,6 +268,7 @@ pub fn parse(buf: &[u8]) -> Option<Fast<'_>> {
         seq: seq.unwrap_or(0),
         payload: payload.unwrap_or(&[]),
         client_id: client_id.unwrap_or(0),
+        flow,
     })
 }
 
@@ -258,15 +278,23 @@ mod tests {
     use crate::proto::{lite, peer_message, Data, KeepAlive, Lite, Ordered, PeerMessage, WrappedData};
     use prost::Message as _;
 
+    /// Два подписчика с одним ключом и счётчиками с нуля: при одинаковом числе вызовов дают
+    /// одинаковые подписи — так быстрый путь сверяется с prost байт-в-байт.
+    fn twin_sealers() -> (SendKeys, SendKeys) {
+        let xor = codec::random_key();
+        let keys = || SendKeys { xor, sealer: crate::auth::Sealer::new(&[4u8; 32]) };
+        (keys(), keys())
+    }
+
     fn data_msg(slot: u32, payload: Vec<u8>) -> PeerMessage {
         PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(lite::Payload::Data(Data { payload })) })) }
     }
 
-    fn wrapped_msg(slot: u32, seq: u64, payload: Vec<u8>, client_id: u32) -> PeerMessage {
+    fn wrapped_msg(slot: u32, seq: u64, payload: Vec<u8>, client_id: u32, flow: Option<u32>) -> PeerMessage {
         PeerMessage {
             body: Some(peer_message::Body::Lite(Lite {
                 slot,
-                payload: Some(lite::Payload::Wrapped(WrappedData { seq, payload, client_id })),
+                payload: Some(lite::Payload::Wrapped(WrappedData { seq, payload, client_id, flow })),
             })),
         }
     }
@@ -277,13 +305,13 @@ mod tests {
 
     #[test]
     fn data_is_byte_for_byte_what_prost_produces() {
-        let key = codec::random_key();
+        let (prost_sealer, fast_sealer) = twin_sealers();
         let mut out = [0u8; 1500];
         for slot in [0u32, 1, 9, 127, 128, 300] {
             for len in lens() {
                 let payload: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
-                let expected = codec::encode(&data_msg(slot, payload.clone()), &key);
-                let n = encode_data(slot, &payload, &key, &mut out).unwrap();
+                let expected = codec::encode(&data_msg(slot, payload.clone()), &prost_sealer);
+                let n = encode_data(slot, &payload, &fast_sealer, &mut out).unwrap();
                 assert_eq!(&out[..n], &expected[..], "slot {slot}, len {len}");
             }
         }
@@ -291,14 +319,19 @@ mod tests {
 
     #[test]
     fn wrapped_is_byte_for_byte_what_prost_produces() {
-        let key = codec::random_key();
+        let (prost_sealer, fast_sealer) = twin_sealers();
         let mut out = [0u8; 1500];
         for (seq, client_id) in [(0u64, 0u32), (1, 1), (127, 255), (u64::from(u32::MAX) + 5, 3), (u64::MAX, 200)] {
-            for len in lens() {
-                let payload: Vec<u8> = (0..len).map(|i| (i * 3) as u8).collect();
-                let expected = codec::encode(&wrapped_msg(4, seq, payload.clone(), client_id), &key);
-                let n = encode_wrapped(4, seq, &payload, client_id, &key, &mut out).unwrap();
-                assert_eq!(&out[..n], &expected[..], "seq {seq}, client {client_id}, len {len}");
+            for flow in [None, Some(0u32), Some(15), Some(300)] {
+                for len in lens() {
+                    let payload: Vec<u8> = (0..len).map(|i| (i * 3) as u8).collect();
+                    let msg = wrapped_msg(4, seq, payload.clone(), client_id, flow);
+                    let expected = codec::encode(&msg, &prost_sealer);
+                    let n = encode_wrapped(4, seq, &payload, client_id, flow, &fast_sealer, &mut out).unwrap();
+                    assert_eq!(&out[..n], &expected[..], "seq {seq}, client {client_id}, flow {flow:?}, len {len}");
+                    let plain = msg.encode_to_vec();
+                    assert_eq!(parse(&plain), Some(Fast::Wrapped { slot: 4, seq, payload: &payload, client_id, flow }));
+                }
             }
         }
     }
@@ -311,13 +344,13 @@ mod tests {
 
     #[test]
     fn ordered_is_byte_for_byte_what_prost_produces_and_parses_back() {
-        let key = codec::random_key();
+        let (prost_sealer, fast_sealer) = twin_sealers();
         let mut out = [0u8; 1500];
         for (flow, seq) in [(0u32, 0u64), (1, 1), (15, 127), (7, 128), (3, u64::from(u32::MAX) + 9)] {
             for len in lens() {
                 let payload: Vec<u8> = (0..len).map(|i| (i * 5) as u8).collect();
-                let expected = codec::encode(&ordered_msg(6, flow, seq, payload.clone()), &key);
-                let n = encode_ordered(6, flow, seq, &payload, &key, &mut out).unwrap();
+                let expected = codec::encode(&ordered_msg(6, flow, seq, payload.clone()), &prost_sealer);
+                let n = encode_ordered(6, flow, seq, &payload, &fast_sealer, &mut out).unwrap();
                 assert_eq!(&out[..n], &expected[..], "flow {flow}, seq {seq}, len {len}");
                 let plain = ordered_msg(6, flow, seq, payload.clone()).encode_to_vec();
                 assert_eq!(parse(&plain), Some(Fast::Ordered { slot: 6, flow, seq, payload: &payload }));
@@ -331,8 +364,8 @@ mod tests {
             let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
             let bytes = data_msg(7, payload.clone()).encode_to_vec();
             assert_eq!(parse(&bytes), Some(Fast::Data { slot: 7, payload: &payload }));
-            let bytes = wrapped_msg(0, 42, payload.clone(), 9).encode_to_vec();
-            assert_eq!(parse(&bytes), Some(Fast::Wrapped { slot: 0, seq: 42, payload: &payload, client_id: 9 }));
+            let bytes = wrapped_msg(0, 42, payload.clone(), 9, None).encode_to_vec();
+            assert_eq!(parse(&bytes), Some(Fast::Wrapped { slot: 0, seq: 42, payload: &payload, client_id: 9, flow: None }));
         }
     }
 
@@ -354,7 +387,8 @@ mod tests {
 
     #[test]
     fn too_small_output_is_refused() {
-        let key = codec::random_key();
-        assert_eq!(encode_data(1, &[0u8; 1400], &key, &mut [0u8; 100]), None);
+        let keys = SendKeys { xor: codec::random_key(), sealer: crate::auth::Sealer::new(&[1u8; 32]) };
+        assert_eq!(encode_data(1, &[0u8; 1400], &keys, &mut [0u8; 100]), None);
+        assert_eq!(encode_data(1, &[0u8; 80], &keys, &mut [0u8; 100]), None, "без места под подпись");
     }
 }

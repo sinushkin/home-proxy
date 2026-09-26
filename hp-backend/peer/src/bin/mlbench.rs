@@ -52,16 +52,23 @@ fn discovery(a: &[String]) -> Result<Discovery> {
     })
 }
 
-/// Сколько стоит кодек на пакет: XOR префикса, protobuf-кодирование и разбор.
+/// Сколько стоит кодек на пакет: XOR префикса, подпись и её проверка, protobuf-кодирование и
+/// разбор.
 fn codec_bench(iterations: u32, payload_len: usize) {
-    let key = codec::random_key();
+    use connection::auth::{Opener, PairSecret, RecvKeys, AUTH_LEN};
+    let pair = PairSecret::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (me, peer) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (send, _) = pair.link_keys(me, peer);
+    // Один и тот же пакет разбираем много раз — окно против повтора отключаем.
+    let recv = || RecvKeys { xor: send.xor, opener: Opener::without_replay_window(&pair.link_key(me, peer)) };
+    let key = send.xor;
     let message = PeerMessage {
         body: Some(peer_message::Body::Lite(Lite {
             slot: 3,
             payload: Some(lite::Payload::Data(Data { payload: vec![0xa5; payload_len] })),
         })),
     };
-    let encoded = codec::encode(&message, &key);
+    let encoded = codec::encode(&message, &send);
     let per_op = |start: Instant| start.elapsed().as_nanos() as f64 / f64::from(iterations) / 1000.0;
 
     let start = Instant::now();
@@ -77,36 +84,53 @@ fn codec_bench(iterations: u32, payload_len: usize) {
     let xor_all = per_op(start);
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(codec::encode(std::hint::black_box(&message), &key));
+        std::hint::black_box(codec::encode(std::hint::black_box(&message), &send));
     }
     let encode = per_op(start);
+    let mut rx_keys = recv();
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(codec::decode(std::hint::black_box(encoded.clone()), &key).unwrap());
+        std::hint::black_box(codec::decode(std::hint::black_box(encoded.clone()), &mut rx_keys).unwrap());
     }
     let decode = per_op(start);
+    let mut sealed = encoded.clone();
+    codec::mask(&mut sealed, &key);
+    let message_len = sealed.len() - AUTH_LEN;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(send.sealer.seal(std::hint::black_box(&mut buf[..]), message_len));
+    }
+    let seal = per_op(start);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(rx_keys.opener.open(std::hint::black_box(&sealed)).unwrap());
+    }
+    let open = per_op(start);
     let start = Instant::now();
     for _ in 0..iterations {
         std::hint::black_box(std::hint::black_box(&encoded).clone());
     }
     let copy = per_op(start);
     println!(
-        "кодек, пакет {} байт, мкс на пакет: XOR 64 байт {xor64:.2}, XOR всего пакета {xor_all:.2}, encode {encode:.2}, decode {decode:.2} (в т.ч. копия буфера {copy:.2})",
-        encoded.len()
+        "кодек, пакет {} байт, мкс на пакет: XOR {} байт {xor64:.2}, XOR всего пакета {xor_all:.2}, encode {encode:.2}, decode {decode:.2} (в т.ч. копия буфера {copy:.2})",
+        encoded.len(),
+        codec::MASKED_PREFIX
     );
+    println!("  подпись (ChaCha20-Poly1305, метка по первым 128 байт и длине): поставить {seal:.2}, проверить {open:.2}");
     let payload = vec![0xa5u8; payload_len];
     let mut out = [0u8; connection::pool::PACKET_CAP];
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(connection::wire::encode_data(3, std::hint::black_box(&payload), &key, &mut out));
+        std::hint::black_box(connection::wire::encode_data(3, std::hint::black_box(&payload), &send, &mut out));
     }
     let fast_encode = per_op(start);
-    let n = connection::wire::encode_data(3, &payload, &key, &mut out).unwrap();
+    let n = connection::wire::encode_data(3, &payload, &send, &mut out).unwrap();
     let start = Instant::now();
     for _ in 0..iterations {
         let mut rx = out;
         codec::mask(&mut rx[..n], &key);
-        if let Some(connection::wire::Fast::Data { payload, .. }) = connection::wire::parse(&rx[..n]) {
+        let Some(len) = rx_keys.opener.open(&rx[..n]) else { continue };
+        if let Some(connection::wire::Fast::Data { payload, .. }) = connection::wire::parse(&rx[AUTH_LEN..AUTH_LEN + len]) {
             std::hint::black_box(connection::pool::Packet::copy_from(payload));
         }
     }
@@ -150,6 +174,7 @@ async fn run() -> Result<()> {
         reorder_wait: Duration::ZERO,
         data_holes: env_num("DATA_HOLES", 0u8),
         local_port_base: env_num("HOLE_PORT_BASE", 0u16),
+        ..MultiLinkOptions::default()
     };
     let (link, mut incoming) =
         MultiLink::start_discovery("", discovery(&a)?, a[3].parse::<Uuid>()?, a[4].parse::<Uuid>()?, options).await?;

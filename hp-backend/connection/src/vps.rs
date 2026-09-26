@@ -9,9 +9,9 @@
 //! диапазона: плохую дыру сервер пробивает заново на новом порту, и клиент узнаёт
 //! новый адрес из той же записи `Rendezvous`.
 //!
-//! Обмен на порту знакомства — обычный `PeerMessage::Lite` с `Rendezvous` внутри,
-//! замаскированный XOR-вектором, который обе стороны выводят из пары GUID
-//! (`bootstrap_key`). Как и остальная маскировка, это не защита.
+//! Обмен на порту знакомства — обычный `PeerMessage::Lite` с `Rendezvous` внутри, подписанный и
+//! замаскированный ключами знакомства из секрета пары (`auth::PairSecret::bootstrap_keys`); сама
+//! запись тоже подписана. Без полного GUID обеих сторон такой пакет не подделать.
 
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
@@ -22,7 +22,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::codec::{self, XorKey};
+use crate::auth::{PairSecret, RecvKeys, SendKeys};
+use crate::codec;
 use crate::proto::{lite, peer_message, Lite, PeerMessage, Rendezvous};
 use crate::rendezvous::{self, PeerSession};
 
@@ -30,14 +31,14 @@ use crate::rendezvous::{self, PeerSession};
 pub const DEFAULT_BOOTSTRAP_PORT: u16 = 40000;
 pub const DEFAULT_SLOT_PORTS: RangeInclusive<u16> = 40001..=49999;
 
+/// Адрес VPS-сервера: `ip:порт` или просто `ip` (тогда порт знакомства по умолчанию).
+pub fn parse_server(value: &str) -> Option<SocketAddr> {
+    let value = value.trim();
+    value.parse().ok().or_else(|| Some(SocketAddr::new(value.parse().ok()?, DEFAULT_BOOTSTRAP_PORT)))
+}
+
 /// Сколько раз пробуем занять случайный порт из диапазона, прежде чем сдаться.
 const BIND_ATTEMPTS: usize = 64;
-
-/// XOR-вектор обмена на порту знакомства: одинаков у обеих сторон, зависит от пары GUID.
-pub fn bootstrap_key(a: Uuid, b: Uuid) -> XorKey {
-    let (a, b) = (a.into_bytes(), b.into_bytes());
-    std::array::from_fn(|i| a[i] ^ b[i] ^ 0x5a)
-}
 
 fn wrap(record: Rendezvous) -> PeerMessage {
     PeerMessage {
@@ -48,16 +49,17 @@ fn wrap(record: Rendezvous) -> PeerMessage {
     }
 }
 
-/// Достаёт запись слота 0 от ожидаемого пира; всё остальное — `None`.
-fn unwrap(data: &[u8], key: &XorKey, peer_id: Uuid) -> Option<PeerSession> {
-    let msg = codec::decode(data.to_vec(), key).ok()?;
+/// Достаёт запись слота 0 от ожидаемого пира (подпись пакета и записи проверены); всё
+/// остальное — `None`.
+fn unwrap(data: &[u8], keys: &mut RecvKeys, pair: &PairSecret, peer_id: Uuid) -> Option<PeerSession> {
+    let msg = codec::decode(data.to_vec(), keys)?;
     let Some(peer_message::Body::Lite(Lite { payload: Some(lite::Payload::Rendezvous(r)), .. })) = msg.body else {
         return None;
     };
-    if r.peer_id != peer_id.to_string() || r.slot != 0 {
+    if r.slot != 0 {
         return None;
     }
-    rendezvous::peer_session_from(&r).ok()
+    rendezvous::peer_session_from(&r, pair, peer_id).ok()
 }
 
 /// Случайный свободный порт из диапазона (кроме `exclude`).
@@ -99,44 +101,49 @@ impl ServerBootstrap {
 pub async fn serve_bootstrap(
     socket: UdpSocket,
     state: std::sync::Arc<ServerBootstrap>,
-    key: XorKey,
+    pair: PairSecret,
     client_id: Uuid,
     slot0: mpsc::Sender<PeerSession>,
 ) {
+    let (send, mut recv) = pair.bootstrap_keys();
     let mut buf = [0u8; 1500];
     let mut last_fed: Option<Uuid> = None;
     loop {
         let Ok((n, from)) = socket.recv_from(&mut buf).await else { continue };
-        let Some(session) = unwrap(&buf[..n], &key, client_id) else { continue };
+        let Some(session) = unwrap(&buf[..n], &mut recv, &pair, client_id) else { continue };
         if last_fed != Some(session.session_id) && slot0.try_send(session.clone()).is_ok() {
             log::debug!("знакомство: запись клиента {from}, сессия {}", session.session_id);
             last_fed = Some(session.session_id);
         }
         if let Some(record) = state.current() {
-            let _ = socket.send_to(&codec::encode(&wrap(record), &key), from).await;
+            let _ = socket.send_to(&codec::encode(&wrap(record), &send), from).await;
         }
     }
 }
 
-/// Клиент: сокет знакомства и адрес сервера.
+/// Клиент: сокет знакомства, адрес сервера и ключи знакомства.
 pub struct ClientBootstrap {
     pub socket: UdpSocket,
     pub server: SocketAddr,
-    pub key: XorKey,
+    pair: PairSecret,
+    send: SendKeys,
+    recv: Mutex<RecvKeys>,
 }
 
 impl ClientBootstrap {
-    pub async fn new(server: SocketAddr, key: XorKey) -> Result<Self> {
+    pub async fn new(server: SocketAddr, pair: PairSecret) -> Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", 0)).await.context("сокет знакомства")?;
-        Ok(Self { socket, server, key })
+        let (send, recv) = pair.bootstrap_keys();
+        Ok(Self { socket, server, pair, send, recv: Mutex::new(recv) })
     }
 
     /// Раз в секунду шлёт серверу нашу запись слота 0 (пока задачу не остановят).
     pub async fn announce(&self, record: Rendezvous) {
-        let packet = codec::encode(&wrap(record), &self.key);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             ticker.tick().await;
+            // Каждый раз заново: у каждого пакета свой счётчик в подписи.
+            let packet = codec::encode(&wrap(record.clone()), &self.send);
             let _ = self.socket.send_to(&packet, self.server).await;
         }
     }
@@ -147,7 +154,7 @@ impl ClientBootstrap {
         let mut last_fed: Option<Uuid> = None;
         loop {
             let Ok((n, _)) = self.socket.recv_from(&mut buf).await else { continue };
-            let Some(session) = unwrap(&buf[..n], &self.key, server_id) else { continue };
+            let Some(session) = unwrap(&buf[..n], &mut self.recv.lock().unwrap(), &self.pair, server_id) else { continue };
             if last_fed != Some(session.session_id) && slot0.try_send(session.clone()).is_ok() {
                 log::debug!("знакомство: сервер предлагает {} (сессия {})", session.addr, session.session_id);
                 last_fed = Some(session.session_id);
@@ -158,28 +165,34 @@ impl ClientBootstrap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn server_address_with_or_without_port() {
+        assert_eq!(super::parse_server("203.0.113.10"), Some("203.0.113.10:40000".parse().unwrap()));
+        assert_eq!(super::parse_server("203.0.113.10:41000"), Some("203.0.113.10:41000".parse().unwrap()));
+        assert_eq!(super::parse_server("vps"), None);
+    }
+
     use super::*;
 
     #[test]
-    fn bootstrap_key_is_symmetric_and_pair_specific() {
-        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        assert_eq!(bootstrap_key(a, b), bootstrap_key(b, a));
-        assert_ne!(bootstrap_key(a, b), bootstrap_key(a, c));
-    }
-
-    #[test]
-    fn only_slot_zero_records_of_the_expected_peer_are_accepted() {
+    fn only_signed_slot_zero_records_of_the_expected_peer_are_accepted() {
         let (me, peer) = (Uuid::new_v4(), Uuid::new_v4());
-        let key = bootstrap_key(me, peer);
+        let pair = PairSecret::new(me, peer);
+        let (send, mut recv) = PairSecret::new(peer, me).bootstrap_keys();
         let endpoint = [SocketAddr::from(([203, 0, 113, 10], 41234))];
-        let record = |id: Uuid, slot: u8| {
-            codec::encode(&wrap(rendezvous::our_record(id, slot, Uuid::new_v4(), &endpoint, codec::random_key(), 0)), &key)
+        let record = |pair: &PairSecret, id: Uuid, slot: u8| {
+            codec::encode(&wrap(rendezvous::our_record(pair, id, slot, Uuid::new_v4(), &endpoint, 0)), &send)
         };
-        let ok = unwrap(&record(peer, 0), &key, peer).expect("запись пира");
+        let ok = unwrap(&record(&pair, peer, 0), &mut recv, &pair, peer).expect("запись пира");
         assert_eq!(ok.addr, endpoint[0]);
-        assert!(unwrap(&record(me, 0), &key, peer).is_none(), "своя запись (эхо)");
-        assert!(unwrap(&record(peer, 3), &key, peer).is_none(), "не bootstrap-слот");
-        assert!(unwrap(&record(peer, 0), &codec::random_key(), peer).is_none(), "чужой вектор");
+        assert!(unwrap(&record(&pair, me, 0), &mut recv, &pair, peer).is_none(), "своя запись (эхо)");
+        assert!(unwrap(&record(&pair, peer, 3), &mut recv, &pair, peer).is_none(), "не bootstrap-слот");
+
+        let stranger = PairSecret::new(peer, Uuid::new_v4());
+        assert!(unwrap(&record(&stranger, peer, 0), &mut recv, &pair, peer).is_none(), "запись подписана чужим");
+        let (foreign_send, _) = stranger.bootstrap_keys();
+        let foreign = codec::encode(&wrap(rendezvous::our_record(&pair, peer, 0, Uuid::new_v4(), &endpoint, 0)), &foreign_send);
+        assert!(unwrap(&foreign, &mut recv, &pair, peer).is_none(), "пакет чужих ключей знакомства");
     }
 
     #[tokio::test]

@@ -159,11 +159,13 @@ impl Session {
 }
 
 /// Сессия порядка: сессия WireGuard (`receiver index` из заголовка) или корзина потока
-/// (`Ordered`, TUN-режим). Разные виды не смешиваются.
+/// (`Ordered`, TUN-режим) или корзина потока клиента за роутером (`WrappedData` с корзиной).
+/// Разные виды не смешиваются.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SessionKey {
     WireGuard(u32),
     Flow(u32),
+    Client(u8, u32),
 }
 
 impl std::fmt::LowerHex for SessionKey {
@@ -171,6 +173,7 @@ impl std::fmt::LowerHex for SessionKey {
         match self {
             SessionKey::WireGuard(index) => write!(f, "wg:{index:x}"),
             SessionKey::Flow(flow) => write!(f, "поток:{flow:x}"),
+            SessionKey::Client(client, flow) => write!(f, "клиент {client}, поток:{flow:x}"),
         }
     }
 }
@@ -264,7 +267,10 @@ impl Resequencer {
     /// `out` вызывающий переиспользует между пакетами: выделения памяти на пакет нет.
     pub fn push_into(&mut self, packet: Incoming, now: Instant, out: &mut Vec<Incoming>) {
         let key = match packet.order {
-            Some((flow, seq)) => Some((SessionKey::Flow(flow), seq)),
+            Some((flow, seq)) => match packet.wrapped {
+                Some(info) => Some((SessionKey::Client(info.client_id, flow), seq)),
+                None => Some((SessionKey::Flow(flow), seq)),
+            },
             None => parse_transport(&packet.payload).map(|(index, counter)| (SessionKey::WireGuard(index), counter)),
         };
         let Some((index, counter)) = key else {
@@ -632,6 +638,24 @@ mod tests {
         assert_eq!(seqs(&r.push(ordered(2, 0), now)), vec![(2, 0)]);
         assert_eq!(seqs(&r.push(ordered(2, 1), now)), vec![(2, 1)]);
         assert_eq!(seqs(&r.push(ordered(1, 1), now)), vec![(1, 1), (1, 2)]);
+    }
+
+    fn client_ordered(client_id: u8, flow: u32, seq: u64) -> Incoming {
+        let mut packet = ordered(flow, seq);
+        packet.wrapped = Some(crate::multilink::WrappedInfo { client_id, seq });
+        packet
+    }
+
+    #[test]
+    fn the_same_flow_of_different_clients_is_resequenced_separately() {
+        let mut r = Resequencer::new(WAIT);
+        let now = Instant::now();
+        assert_eq!(r.push(client_ordered(1, 5, 0), now).len(), 1);
+        assert!(r.push(client_ordered(1, 5, 2), now).is_empty(), "клиент 1 ждёт номер 1");
+        // У клиента 2 своя корзина 5 со своими номерами; у телефона без роутера — своя.
+        assert_eq!(r.push(client_ordered(2, 5, 0), now).len(), 1);
+        assert_eq!(r.push(ordered(5, 0), now).len(), 1);
+        assert_eq!(r.push(client_ordered(1, 5, 1), now).len(), 2);
     }
 
     #[test]

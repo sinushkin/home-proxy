@@ -6,8 +6,13 @@
 //! (порт по умолчанию 51821). Необязательные переменные окружения:
 //! `REORDER_WAIT_MS` (по умолчанию 8, 0 — не восстанавливать порядок пакетов),
 //! `DATA_HOLES` (0 — данные через все живые дыры, 1 — через одну).
+//!
+//! `TUN_ADDR=10.80.1.7/32` — режим без WireGuard, как у телефона: IP-пакеты из TUN по дырам как
+//! есть (TCP с номером в потоке), порт моста тогда не нужен (`TUN_NAME` — `hp1`, `TUN_MTU` — 1400).
+//! Маршруты в TUN настраиваются отдельно.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use hp_client::{Client, ClientConfig};
@@ -43,9 +48,52 @@ async fn main() -> Result<()> {
         data_holes: env_number("DATA_HOLES", 0u8)?,
     };
     log::info!("порядок пакетов: ожидание {} мс, дыр для данных: {}", config.reorder_wait_ms, config.data_holes);
+    if let Ok(tun_addr) = std::env::var("TUN_ADDR") {
+        return run_tun(&tun_addr, config).await;
+    }
     let client = Client::start(config).await?;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         log::info!("{}", client.status());
+    }
+}
+
+/// Режим TUN: набор дыр к серверу (роутеру или ПК) и мост TUN ↔ дыры.
+async fn run_tun(tun_addr: &str, config: ClientConfig) -> Result<()> {
+    use connection::multilink::{MultiLink, MultiLinkOptions, TARGET_LINKS};
+    let tun_config = hp_tun::TunConfig {
+        name: std::env::var("TUN_NAME").unwrap_or_else(|_| "hp1".into()),
+        address: Some(hp_tun::parse_cidr(tun_addr).context("TUN_ADDR: ожидается ip/префикс")?),
+        mtu: Some(env_number("TUN_MTU", 1400u16)?),
+        up: true,
+    };
+    let tun = hp_tun::Tun::create(&tun_config).context("создание TUN (нужны права root)")?;
+    log::info!("hp-client: TUN {} {tun_addr}, сервер {}", tun.name(), config.peer_id);
+    let options = MultiLinkOptions {
+        reorder_wait: std::time::Duration::from_millis(u64::from(config.reorder_wait_ms)),
+        data_holes: config.data_holes,
+        ..MultiLinkOptions::default()
+    };
+    let (link, incoming) = MultiLink::start_with(
+        "",
+        config.stun_addrs,
+        config.mqtt_addr,
+        config.mqtt_ca_pem,
+        config.my_id,
+        config.peer_id,
+        options,
+    )
+    .await?;
+    let link = Arc::new(link);
+    let bridge = hp_tun::bridge::Bridge::start(tun, link.clone(), incoming);
+    let mut last = None;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let now = (link.live_count(), bridge.stats().snapshot());
+        if Some(now) != last {
+            let (to, ordered, from, dropped) = now.1;
+            log::info!("дыры {}/{TARGET_LINKS}, к серверу {to} (TCP с номером {ordered}), от сервера {from}, потеряно {dropped}", now.0);
+            last = Some(now);
+        }
     }
 }

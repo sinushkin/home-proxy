@@ -30,7 +30,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::codec::{self, XorKey};
+use crate::auth::{peer_name, PairSecret, RecvKeys, SendKeys, AUTH_LEN};
+use crate::codec;
 use crate::pool::{Packet, PACKET_CAP};
 use crate::wire::{self, Fast};
 use crate::link_id::PeerLinkId;
@@ -77,8 +78,9 @@ pub enum LinkEvent {
     PeerRendezvous(Rendezvous),
     /// Пир прислал полезную нагрузку (`Data`) по дыре `slot` (буфер из банка).
     PeerData { slot: u8, payload: Packet },
-    /// Пир прислал обёрнутый пакет (`WrappedData`) по дыре `slot`.
-    PeerWrapped { slot: u8, seq: u64, client_id: u32, payload: Packet },
+    /// Пир прислал обёрнутый пакет (`WrappedData`) по дыре `slot`; `flow` — корзина TCP-потока
+    /// (TUN-режим, `seq` тогда — номер в ней).
+    PeerWrapped { slot: u8, seq: u64, client_id: u32, flow: Option<u32>, payload: Packet },
     /// Пир прислал IP-пакет с номером в потоке (`Ordered`, TUN-режим).
     PeerOrdered { slot: u8, flow: u32, seq: u64, payload: Packet },
 }
@@ -103,9 +105,9 @@ impl Default for PunchConfig {
     }
 }
 
-/// Идентичность одной дыры (слота): GUID сессий (наша и пира), GUID пиров,
-/// номер слота и XOR-векторы. Проставляется в каждое исходящее сообщение и
-/// проверяется во входящих.
+/// Идентичность одной дыры (слота): GUID сессий (наша и пира), GUID пиров, номер слота и
+/// секрет пары, из которого выводятся XOR-векторы и ключи подписи (`auth`). Наружу в `Init`
+/// уходят только имена пиров (первая группа GUID).
 #[derive(Clone, Debug)]
 pub struct PeerIdentity {
     pub session_id: Uuid,
@@ -113,11 +115,7 @@ pub struct PeerIdentity {
     pub my_peer_id: Uuid,
     pub peer_id: Uuid,
     pub slot: u8,
-    /// Наш вектор (мы его опубликовали): им пир кодирует пакеты к нам, им же
-    /// мы декодируем входящие.
-    pub my_key: XorKey,
-    /// Вектор пира (из его `Rendezvous`): им кодируем всё, что шлём пиру.
-    pub peer_key: XorKey,
+    pub pair: PairSecret,
 }
 
 impl PeerIdentity {
@@ -126,13 +124,18 @@ impl PeerIdentity {
         PeerLinkId::new(self.session_id, self.peer_session_id)
     }
 
-    /// Конверт фазы пробива: полный GUID-заголовок.
+    /// Ключи этой дыры: (отправка пиру, приём от пира).
+    pub fn keys(&self) -> (SendKeys, RecvKeys) {
+        self.pair.link_keys(self.session_id, self.peer_session_id)
+    }
+
+    /// Конверт фазы пробива: сессия и имена пиров (полные GUID не публикуются).
     fn init(&self, payload: init_message::Payload) -> PeerMessage {
         PeerMessage {
             body: Some(peer_message::Body::Init(InitMessage {
                 session_id: self.session_id.to_string(),
-                from_peer_id: self.my_peer_id.to_string(),
-                to_peer_id: self.peer_id.to_string(),
+                from_peer_id: peer_name(&self.my_peer_id),
+                to_peer_id: peer_name(&self.peer_id),
                 slot: self.slot as u32,
                 payload: Some(payload),
             })),
@@ -170,6 +173,8 @@ pub struct LinkSender {
     /// (у пира может быть несколько провайдеров/маршрутов, адрес отправителя меняется).
     endpoint: watch::Receiver<Option<SocketAddr>>,
     identity: PeerIdentity,
+    /// Вектор пира и подпись: общие с пробивом этой дыры (один счётчик на направление).
+    keys: Arc<SendKeys>,
     seq: AtomicU32,
     stats: Arc<LinkStats>,
 }
@@ -193,7 +198,7 @@ impl LinkSender {
     async fn send_lite(&self, payload: lite::Payload) {
         let Some(peer_addr) = self.peer_addr() else { return };
         let msg = self.identity.lite(payload);
-        let packet = codec::encode(&msg, &self.identity.peer_key);
+        let packet = codec::encode(&msg, &self.keys);
         if self.send_to_peer(&packet, peer_addr).await.is_ok() {
             self.stats.sent.fetch_add(1, Ordering::Relaxed);
         }
@@ -223,19 +228,19 @@ impl LinkSender {
     pub async fn send_data(&self, payload: &[u8]) {
         log::trace!("слот {}: отправлено {} байт данных", self.identity.slot, payload.len());
         let mut buf = [0u8; PACKET_CAP];
-        let Some(n) = wire::encode_data(u32::from(self.identity.slot), payload, &self.identity.peer_key, &mut buf) else {
+        let Some(n) = wire::encode_data(u32::from(self.identity.slot), payload, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
         };
         self.send_raw(&buf[..n]).await;
     }
 
-    /// Отправить обёрнутый пакет (роутер ↔ сервер) по этой дыре.
-    pub async fn send_wrapped(&self, seq: u64, client_id: u32, payload: &[u8]) {
+    /// Отправить обёрнутый пакет (роутер ↔ сервер) по этой дыре; `flow` — корзина TCP-потока.
+    pub async fn send_wrapped(&self, seq: u64, client_id: u32, flow: Option<u32>, payload: &[u8]) {
         log::trace!("слот {}: отправлен WrappedData seq={seq} ({} байт)", self.identity.slot, payload.len());
         let mut buf = [0u8; PACKET_CAP];
         let slot = u32::from(self.identity.slot);
-        let Some(n) = wire::encode_wrapped(slot, seq, payload, client_id, &self.identity.peer_key, &mut buf) else {
+        let Some(n) = wire::encode_wrapped(slot, seq, payload, client_id, flow, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
         };
@@ -246,7 +251,7 @@ impl LinkSender {
     pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8]) {
         let mut buf = [0u8; PACKET_CAP];
         let slot = u32::from(self.identity.slot);
-        let Some(n) = wire::encode_ordered(slot, flow, seq, payload, &self.identity.peer_key, &mut buf) else {
+        let Some(n) = wire::encode_ordered(slot, flow, seq, payload, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
         };
@@ -363,12 +368,15 @@ pub async fn establish(
 
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let stats = Arc::new(LinkStats::default());
+    let (send_keys, recv_keys) = identity.keys();
+    let send_keys = Arc::new(send_keys);
     // Обе фоновые задачи держим под охраной: если `establish` отменят по
     // таймауту окна пробива, они остановятся вместе с ним, а не будут стучаться
     // и читать сокет дальше.
     let receiver = AbortOnDrop(tokio::spawn(receive_loop(
         socket.clone(),
         identity.clone(),
+        (send_keys.clone(), recv_keys),
         found_tx,
         last_seen.clone(),
         stats.clone(),
@@ -379,6 +387,7 @@ pub async fn establish(
     let destinations = sweep_order(&peer_addrs, my_port, config.margin);
     let punch_interval = config.punch_interval;
     let sweep_identity = identity.clone();
+    let sweep_keys = send_keys.clone();
     let sweeper = AbortOnDrop(tokio::spawn(async move {
         if destinations.is_empty() {
             return;
@@ -388,7 +397,7 @@ pub async fn establish(
                 let msg = sweep_identity.init(init_message::Payload::Punch(Punch {
                     target_port: u32::from(dest.port()),
                 }));
-                let packet = codec::encode(&msg, &sweep_identity.peer_key);
+                let packet = codec::encode(&msg, &sweep_keys);
                 let _ = sweep_socket.send_to(&packet, dest).await;
                 tokio::time::sleep(punch_interval).await;
             }
@@ -415,6 +424,7 @@ pub async fn establish(
         socket,
         endpoint,
         identity: identity.clone(),
+        keys: send_keys,
         seq: AtomicU32::new(0),
         stats,
     });
@@ -431,7 +441,7 @@ pub async fn establish(
     })
 }
 
-/// Любой пакет, прошедший XOR-вектор и protobuf (и слот / GUID пира), доказывает, что
+/// Любой пакет с верной подписью (и слотом / именем пира) доказывает, что
 /// пир достижим с адреса `from`: считаем этот адрес текущим эндпоинтом, даже если он
 /// отличается от того, куда мы стучались или откуда пришёл прежний пакет.
 fn note_packet(
@@ -458,27 +468,33 @@ fn note_packet(
 async fn receive_loop(
     socket: Arc<UdpSocket>,
     identity: PeerIdentity,
+    (send_keys, mut recv_keys): (Arc<SendKeys>, RecvKeys),
     endpoint: watch::Sender<Option<SocketAddr>>,
     last_seen: Arc<Mutex<Instant>>,
     stats: Arc<LinkStats>,
     events: mpsc::Sender<LinkEvent>,
 ) {
-    let expected_from = identity.peer_id.to_string();
+    let expected_from = peer_name(&identity.peer_id);
     let mut buf = [0u8; 1500];
     loop {
         let (n, from) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(_) => continue,
         };
-        // Маску снимаем на месте. Пакет данных разбираем без выделения памяти (`wire`),
-        // остальное — prost'ом. Битый/чужой protobuf (скан, мусор) — просто пропускаем.
-        codec::mask(&mut buf[..n], &identity.my_key);
-        if let Some(fast) = wire::parse(&buf[..n]) {
+        // Маску снимаем на месте и проверяем подпись: чужой, подделанный или повторённый пакет
+        // (скан, мусор, атака) отбрасываем, не глядя внутрь, — и эндпоинт по нему не меняется.
+        // Пакет данных разбираем без выделения памяти (`wire`), остальное — prost'ом.
+        codec::mask(&mut buf[..n], &recv_keys.xor);
+        let Some(len) = recv_keys.opener.open(&buf[..n]) else {
+            continue;
+        };
+        let message = &buf[AUTH_LEN..AUTH_LEN + len];
+        if let Some(fast) = wire::parse(message) {
             let (lite_slot, event) = match fast {
                 Fast::Data { slot, payload } => (slot, Packet::copy_from(payload).map(|payload| LinkEvent::PeerData { slot: identity.slot, payload })),
-                Fast::Wrapped { slot, seq, payload, client_id } => (
+                Fast::Wrapped { slot, seq, payload, client_id, flow } => (
                     slot,
-                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerWrapped { slot: identity.slot, seq, client_id, payload }),
+                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerWrapped { slot: identity.slot, seq, client_id, flow, payload }),
                 ),
                 Fast::Ordered { slot, flow, seq, payload } => (
                     slot,
@@ -494,13 +510,13 @@ async fn receive_loop(
             }
             continue;
         }
-        let Ok(msg) = codec::decode_unmasked(&buf[..n]) else {
+        let Ok(msg) = codec::decode_unmasked(message) else {
             continue;
         };
         match msg.body {
             Some(peer_message::Body::Init(init)) => {
-                // Пробив: проверяем полный GUID. Заодно отсеивает пакет,
-                // вернувшийся к нам (hairpin): его from_peer_id — наш.
+                // Пробив: подпись уже проверена; имя пира — для ясности (пакет, вернувшийся к
+                // нам по hairpin, и так не пройдёт: подписан ключом другого направления).
                 if init.from_peer_id != expected_from {
                     continue;
                 }
@@ -520,12 +536,12 @@ async fn receive_loop(
                         target_port: p.target_port,
                     }));
                     let _ = socket
-                        .send_to(&codec::encode(&ack, &identity.peer_key), from)
+                        .send_to(&codec::encode(&ack, &send_keys), from)
                         .await;
                 }
             }
             Some(peer_message::Body::Lite(lite)) => {
-                // После установки: достаточно нашего слота (и вектора, см. выше). Адрес
+                // После установки: достаточно нашего слота (подпись проверена выше). Адрес
                 // отправителя не проверяем: он становится текущим эндпоинтом пира.
                 if lite.slot != u32::from(identity.slot) {
                     continue;
@@ -577,7 +593,7 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
         }
         Some(lite::Payload::Wrapped(w)) => {
             if let Some(payload) = Packet::copy_from(&w.payload) {
-                let _ = events.send(LinkEvent::PeerWrapped { slot, seq: w.seq, client_id: w.client_id, payload }).await;
+                let _ = events.send(LinkEvent::PeerWrapped { slot, seq: w.seq, client_id: w.client_id, flow: w.flow, payload }).await;
             }
         }
         Some(lite::Payload::Ordered(o)) => {
@@ -613,23 +629,22 @@ mod tests {
         mpsc::channel(1).0
     }
 
-    fn identity(
-        session_id: Uuid,
-        peer_session_id: Uuid,
-        me: Uuid,
-        peer: Uuid,
-        my_key: XorKey,
-        peer_key: XorKey,
-    ) -> PeerIdentity {
-        PeerIdentity {
-            session_id,
-            peer_session_id,
-            my_peer_id: me,
-            peer_id: peer,
-            slot: 0,
-            my_key,
-            peer_key,
+    fn identity(session_id: Uuid, peer_session_id: Uuid, me: Uuid, peer: Uuid) -> PeerIdentity {
+        PeerIdentity { session_id, peer_session_id, my_peer_id: me, peer_id: peer, slot: 0, pair: PairSecret::new(me, peer) }
+    }
+
+    /// Ключи, которыми настоящий пир шлёт владельцу `ident` (счётчик со случайного места, чтобы
+    /// не пересечься со счётчиком живой дыры пира в окне против повтора).
+    fn keys_to(ident: &PeerIdentity) -> SendKeys {
+        SendKeys {
+            xor: ident.pair.xor_key(ident.session_id),
+            sealer: crate::auth::Sealer::with_random_start(&ident.pair.link_key(ident.peer_session_id, ident.session_id)),
         }
+    }
+
+    /// Ключи самозванца: без секрета пары.
+    fn foreign_keys() -> SendKeys {
+        SendKeys { xor: codec::random_key(), sealer: crate::auth::Sealer::new(&codec::random_key().repeat(2).try_into().unwrap()) }
     }
 
     /// Гоняет keep-alive по дыре, пока хэндл жив (в проде это делает менеджер).
@@ -655,14 +670,13 @@ mod tests {
 
         let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
         let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a_key, b_key) = (codec::random_key(), codec::random_key());
 
         let (link_a, link_b) = tokio::join!(
             establish(
                 a_socket,
                 a_port,
                 vec![SocketAddr::new(peer_ip, b_port)],
-                identity(a_sess, b_sess, a_id, b_id, a_key, b_key),
+                identity(a_sess, b_sess, a_id, b_id),
                 test_config(),
                 null_events()
             ),
@@ -670,7 +684,7 @@ mod tests {
                 b_socket,
                 b_port,
                 vec![SocketAddr::new(peer_ip, a_port)],
-                identity(b_sess, a_sess, b_id, a_id, b_key, a_key),
+                identity(b_sess, a_sess, b_id, a_id),
                 test_config(),
                 null_events()
             ),
@@ -713,7 +727,7 @@ mod tests {
         let listener = UdpSocket::bind((ip, 0)).await.unwrap();
         let target = listener.local_addr().unwrap();
 
-        let ident = identity(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), codec::random_key(), codec::random_key());
+        let ident = identity(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let attempt = establish(socket, my_port, vec![target], ident, test_config(), null_events());
         assert!(tokio::time::timeout(Duration::from_millis(150), attempt).await.is_err(), "пира нет, пробив не должен завершиться");
 
@@ -739,10 +753,9 @@ mod tests {
 
         let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
         let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a_key, b_key) = (codec::random_key(), codec::random_key());
         let (link_a, link_b) = tokio::join!(
-            establish(a_socket, a_port, vec![dead, SocketAddr::new(peer_ip, b_port)], identity(a_sess, b_sess, a_id, b_id, a_key, b_key), test_config(), null_events()),
-            establish(b_socket, b_port, vec![SocketAddr::new(peer_ip, a_port)], identity(b_sess, a_sess, b_id, a_id, b_key, a_key), test_config(), null_events()),
+            establish(a_socket, a_port, vec![dead, SocketAddr::new(peer_ip, b_port)], identity(a_sess, b_sess, a_id, b_id), test_config(), null_events()),
+            establish(b_socket, b_port, vec![SocketAddr::new(peer_ip, a_port)], identity(b_sess, a_sess, b_id, a_id), test_config(), null_events()),
         );
 
         assert_eq!(link_a.unwrap().peer_addr, SocketAddr::new(peer_ip, b_port));
@@ -761,7 +774,6 @@ mod tests {
 
         let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
         let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a_key, b_key) = (codec::random_key(), codec::random_key());
         let (b_events_tx, mut b_events) = mpsc::channel(8);
 
         let (link_a, link_b) = tokio::join!(
@@ -769,7 +781,7 @@ mod tests {
                 a_socket,
                 a_port,
                 vec![SocketAddr::new(peer_ip, b_port)],
-                identity(a_sess, b_sess, a_id, b_id, a_key, b_key),
+                identity(a_sess, b_sess, a_id, b_id),
                 test_config(),
                 null_events()
             ),
@@ -777,7 +789,7 @@ mod tests {
                 b_socket,
                 b_port,
                 vec![SocketAddr::new(peer_ip, a_port)],
-                identity(b_sess, a_sess, b_id, a_id, b_key, a_key),
+                identity(b_sess, a_sess, b_id, a_id),
                 test_config(),
                 b_events_tx
             ),
@@ -812,19 +824,18 @@ mod tests {
 
         let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
         let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a_key, b_key) = (codec::random_key(), codec::random_key());
         let (b_events_tx, mut b_events) = mpsc::channel(8);
 
         let (link_a, link_b) = tokio::join!(
-            establish(a_socket, a_port, vec![SocketAddr::new(peer_ip, b_port)], identity(a_sess, b_sess, a_id, b_id, a_key, b_key), test_config(), null_events()),
-            establish(b_socket, b_port, vec![SocketAddr::new(peer_ip, a_port)], identity(b_sess, a_sess, b_id, a_id, b_key, a_key), test_config(), b_events_tx),
+            establish(a_socket, a_port, vec![SocketAddr::new(peer_ip, b_port)], identity(a_sess, b_sess, a_id, b_id), test_config(), null_events()),
+            establish(b_socket, b_port, vec![SocketAddr::new(peer_ip, a_port)], identity(b_sess, a_sess, b_id, a_id), test_config(), b_events_tx),
         );
         let link_a = link_a.unwrap();
         let _link_b = link_b.unwrap();
 
         link_a
             .sender
-            .send_wrapped(42, 5, b"wg-packet")
+            .send_wrapped(42, 5, Some(3), b"wg-packet")
             .await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), b_events.recv())
@@ -832,10 +843,11 @@ mod tests {
             .expect("событие с обёрнутым пакетом не пришло")
             .unwrap();
         match event {
-            LinkEvent::PeerWrapped { slot, seq, client_id, payload } => {
+            LinkEvent::PeerWrapped { slot, seq, client_id, flow, payload } => {
                 assert_eq!(slot, 0);
                 assert_eq!(seq, 42);
                 assert_eq!(client_id, 5);
+                assert_eq!(flow, Some(3));
                 assert_eq!(payload, b"wg-packet");
             }
             other => panic!("ожидали PeerWrapped, пришло {other:?}"),
@@ -853,14 +865,13 @@ mod tests {
 
         let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
         let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a_key, b_key) = (codec::random_key(), codec::random_key());
 
         let (link_a, link_b) = tokio::join!(
             establish(
                 a_socket,
                 a_port,
                 vec![SocketAddr::new(peer_ip, b_port)],
-                identity(a_sess, b_sess, a_id, b_id, a_key, b_key),
+                identity(a_sess, b_sess, a_id, b_id),
                 test_config(),
                 null_events()
             ),
@@ -868,7 +879,7 @@ mod tests {
                 b_socket,
                 b_port,
                 vec![SocketAddr::new(peer_ip, a_port)],
-                identity(b_sess, a_sess, b_id, a_id, b_key, a_key),
+                identity(b_sess, a_sess, b_id, a_id),
                 test_config(),
                 null_events()
             ),
@@ -911,11 +922,9 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             my_id,
-            Uuid::new_v4(),
-            codec::random_key(),
-            codec::random_key(),
+            Uuid::new_v4()
         );
-        let under_test_key = ident.my_key;
+        let under_test_keys = keys_to(&ident);
 
         let establishing = tokio::spawn(establish(
             under_test,
@@ -930,14 +939,14 @@ mod tests {
             let msg = PeerMessage {
                 body: Some(peer_message::Body::Init(InitMessage {
                     session_id: Uuid::new_v4().to_string(),
-                    from_peer_id: from_peer_id.to_string(),
-                    to_peer_id: my_id.to_string(),
+                    from_peer_id: peer_name(&from_peer_id),
+                    to_peer_id: peer_name(&my_id),
                     slot: 0,
                     payload: Some(init_message::Payload::Punch(Punch { target_port: 0 })),
                 })),
             };
             rogue
-                .send_to(&codec::encode(&msg, &under_test_key), under_test_addr)
+                .send_to(&codec::encode(&msg, &under_test_keys), under_test_addr)
                 .await
                 .unwrap();
         }
@@ -950,7 +959,7 @@ mod tests {
         );
     }
 
-    /// Пакет от «правильного» пира, но закодированный не нашим вектором,
+    /// Пакет от «правильного» пира, но без секрета пары (чужие вектор и подпись),
     /// не принимается.
     #[tokio::test]
     async fn ignores_packets_encoded_with_a_foreign_key() {
@@ -965,9 +974,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             my_id,
-            peer_id,
-            codec::random_key(),
-            codec::random_key(),
+            peer_id
         );
 
         let establishing = tokio::spawn(establish(
@@ -982,13 +989,13 @@ mod tests {
         let msg = PeerMessage {
             body: Some(peer_message::Body::Init(InitMessage {
                 session_id: Uuid::new_v4().to_string(),
-                from_peer_id: peer_id.to_string(),
-                to_peer_id: my_id.to_string(),
+                from_peer_id: peer_name(&peer_id),
+                to_peer_id: peer_name(&my_id),
                 slot: 0,
                 payload: Some(init_message::Payload::Punch(Punch { target_port: 0 })),
             })),
         };
-        peer.send_to(&codec::encode(&msg, &codec::random_key()), under_test_addr)
+        peer.send_to(&codec::encode(&msg, &foreign_keys()), under_test_addr)
             .await
             .unwrap();
 
@@ -996,7 +1003,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(200), establishing)
                 .await
                 .is_err(),
-            "establish() принял пакет, закодированный чужим вектором"
+            "establish() принял пакет без подписи пары"
         );
     }
 
@@ -1006,7 +1013,8 @@ mod tests {
         _link_b: PeerLink,
         a_events: mpsc::Receiver<LinkEvent>,
         a_addr: SocketAddr,
-        a_key: XorKey,
+        /// Как настоящий пир `b` подписывает пакеты к `a`.
+        to_a: SendKeys,
         b_id: Uuid,
         b_addr: SocketAddr,
     }
@@ -1019,14 +1027,14 @@ mod tests {
         let b_addr = b_socket.local_addr().unwrap();
         let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
         let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a_key, b_key) = (codec::random_key(), codec::random_key());
         let (a_events_tx, a_events) = mpsc::channel(16);
+        let to_a = keys_to(&identity(a_sess, b_sess, a_id, b_id));
         let (link_a, link_b) = tokio::join!(
             establish(
                 a_socket,
                 a_addr.port(),
                 vec![b_addr],
-                identity(a_sess, b_sess, a_id, b_id, a_key, b_key),
+                identity(a_sess, b_sess, a_id, b_id),
                 test_config(),
                 a_events_tx
             ),
@@ -1034,25 +1042,25 @@ mod tests {
                 b_socket,
                 b_addr.port(),
                 vec![a_addr],
-                identity(b_sess, a_sess, b_id, a_id, b_key, a_key),
+                identity(b_sess, a_sess, b_id, a_id),
                 test_config(),
                 null_events()
             ),
         );
-        Pair { link_a: link_a.unwrap(), _link_b: link_b.unwrap(), a_events, a_addr, a_key, b_id, b_addr }
+        Pair { link_a: link_a.unwrap(), _link_b: link_b.unwrap(), a_events, a_addr, to_a, b_id, b_addr }
     }
 
-    fn lite_packet(slot: u32, payload: lite::Payload, key: &XorKey) -> Vec<u8> {
+    fn lite_packet(slot: u32, payload: lite::Payload, key: &SendKeys) -> Vec<u8> {
         let msg = PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(payload) })) };
         codec::encode(&msg, key)
     }
 
-    fn punch_packet(from: Uuid, to: Uuid, key: &XorKey) -> Vec<u8> {
+    fn punch_packet(from: Uuid, to: Uuid, key: &SendKeys) -> Vec<u8> {
         let msg = PeerMessage {
             body: Some(peer_message::Body::Init(InitMessage {
                 session_id: Uuid::new_v4().to_string(),
-                from_peer_id: from.to_string(),
-                to_peer_id: to.to_string(),
+                from_peer_id: peer_name(&from),
+                to_peer_id: peer_name(&to),
                 slot: 0,
                 payload: Some(init_message::Payload::Punch(Punch { target_port: 0 })),
             })),
@@ -1075,7 +1083,7 @@ mod tests {
         assert_eq!(p.link_a.sender.peer_addr(), Some(p.b_addr));
         let moved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"roam".to_vec() }), &p.a_key);
+        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"roam".to_vec() }), &p.to_a);
         moved.send_to(&data, p.a_addr).await.unwrap();
 
         match next_event(&mut p.a_events).await {
@@ -1098,7 +1106,7 @@ mod tests {
         let mut p = linked_pair().await;
         let other_ip = UdpSocket::bind("127.0.0.2:0").await.unwrap();
 
-        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"other ip".to_vec() }), &p.a_key);
+        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"other ip".to_vec() }), &p.to_a);
         other_ip.send_to(&data, p.a_addr).await.unwrap();
 
         match next_event(&mut p.a_events).await {
@@ -1108,16 +1116,20 @@ mod tests {
         assert_eq!(p.link_a.sender.peer_addr(), Some(other_ip.local_addr().unwrap()));
     }
 
-    /// Чужой слот или чужой вектор эндпоинт не двигают.
+    /// Чужой слот, чужой вектор или поддельная подпись эндпоинт не двигают.
     #[tokio::test]
     async fn wrong_slot_or_key_does_not_move_the_endpoint() {
         let p = linked_pair().await;
         let rogue = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let wrong_slot = lite_packet(5, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &p.a_key);
-        let wrong_key = lite_packet(0, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &codec::random_key());
+        let wrong_slot = lite_packet(5, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &p.to_a);
+        let wrong_key = lite_packet(0, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &foreign_keys());
+        // Вектор верный (его можно подобрать по трафику), подпись — нет.
+        let right_vector = SendKeys { xor: p.to_a.xor, sealer: crate::auth::Sealer::new(&[1u8; 32]) };
+        let forged = lite_packet(0, lite::Payload::KeepAlive(KeepAlive { seq: 0 }), &right_vector);
         rogue.send_to(&wrong_slot, p.a_addr).await.unwrap();
         rogue.send_to(&wrong_key, p.a_addr).await.unwrap();
+        rogue.send_to(&forged, p.a_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(p.link_a.sender.peer_addr(), Some(p.b_addr));
@@ -1131,11 +1143,11 @@ mod tests {
         let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        first.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.a_key), p.a_addr).await.unwrap();
-        second.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.a_key), p.a_addr).await.unwrap();
+        first.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.to_a), p.a_addr).await.unwrap();
+        second.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.to_a), p.a_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"from first".to_vec() }), &p.a_key);
+        let data = lite_packet(0, lite::Payload::Data(Data { payload: b"from first".to_vec() }), &p.to_a);
         first.send_to(&data, p.a_addr).await.unwrap();
         match next_event(&mut p.a_events).await {
             LinkEvent::PeerData { payload, .. } => assert_eq!(payload, b"from first"),
@@ -1149,7 +1161,7 @@ mod tests {
         let p = linked_pair().await;
         let source = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        source.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.a_key), p.a_addr).await.unwrap();
+        source.send_to(&punch_packet(p.b_id, Uuid::new_v4(), &p.to_a), p.a_addr).await.unwrap();
 
         let mut buf = [0u8; 1500];
         let (n, from) = tokio::time::timeout(Duration::from_secs(2), source.recv_from(&mut buf))
@@ -1169,10 +1181,9 @@ mod tests {
         let under_test_addr = under_test.local_addr().unwrap();
         let peer = UdpSocket::bind((ip, 0)).await.unwrap();
         let ident = identity(
-            Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(),
-            codec::random_key(), codec::random_key(),
+            Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()
         );
-        let key = ident.my_key;
+        let key = keys_to(&ident);
         let establishing = tokio::spawn(establish(
             under_test,
             peer.local_addr().unwrap().port(),
@@ -1204,10 +1215,9 @@ mod tests {
         let (server_addr, client_addr) = (server.local_addr().unwrap(), client.local_addr().unwrap());
         let (s_id, c_id) = (Uuid::new_v4(), Uuid::new_v4());
         let (s_sess, c_sess) = (Uuid::new_v4(), Uuid::new_v4());
-        let (s_key, c_key) = (codec::random_key(), codec::random_key());
         let (s_link, c_link) = tokio::join!(
-            establish(server, server_addr.port(), Vec::new(), identity(s_sess, c_sess, s_id, c_id, s_key, c_key), test_config(), null_events()),
-            establish(client, client_addr.port(), vec![server_addr], identity(c_sess, s_sess, c_id, s_id, c_key, s_key), test_config(), null_events()),
+            establish(server, server_addr.port(), Vec::new(), identity(s_sess, c_sess, s_id, c_id), test_config(), null_events()),
+            establish(client, client_addr.port(), vec![server_addr], identity(c_sess, s_sess, c_id, s_id), test_config(), null_events()),
         );
         let (s_link, c_link) = (s_link.unwrap(), c_link.unwrap());
         assert_eq!(s_link.peer_addr, client_addr);

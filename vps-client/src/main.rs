@@ -30,16 +30,6 @@ fn env_number<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
 }
 
 /// `ip` или `ip:порт`; без порта — порт знакомства по умолчанию.
-fn parse_server(value: &str) -> Result<SocketAddr> {
-    match value.parse::<SocketAddr>() {
-        Ok(addr) => Ok(addr),
-        Err(_) => Ok(SocketAddr::new(
-            value.parse().context("адрес сервера: ожидается ip или ip:порт")?,
-            connection::vps::DEFAULT_BOOTSTRAP_PORT,
-        )),
-    }
-}
-
 /// Однопоточный tokio по умолчанию: на одноядерном роутере многопоточный тратит процессор на
 /// пробуждения потоков (`futex` на каждый пакет). `RUNTIME=multi` — многопоточный.
 fn main() -> Result<()> {
@@ -58,7 +48,7 @@ async fn run() -> Result<()> {
         args.len() == 3 || args.len() == 4,
         "использование: vps-client <ip_сервера[:порт_знакомства]> <мой_guid> <guid_сервера> [порт моста]"
     );
-    let server = parse_server(&args[0])?;
+    let server = connection::vps::parse_server(&args[0]).context("адрес сервера: ожидается ip или ip:порт")?;
     let my_id: Uuid = args[1].parse().context("мой GUID")?;
     let server_id: Uuid = args[2].parse().context("GUID сервера")?;
     let local_port: u16 = match args.get(3) {
@@ -69,6 +59,7 @@ async fn run() -> Result<()> {
         reorder_wait: Duration::from_millis(env_number("REORDER_WAIT_MS", DEFAULT_REORDER_WAIT.as_millis() as u64)?),
         data_holes: env_number("DATA_HOLES", 0u8)?,
         local_port_base: 0,
+        ..MultiLinkOptions::default()
     };
 
     if let Ok(tun_addr) = std::env::var("TUN_ADDR") {
@@ -100,19 +91,11 @@ async fn run() -> Result<()> {
     }
 }
 
-/// `ip/префикс`.
-fn parse_cidr(value: &str) -> Result<(std::net::Ipv4Addr, u8)> {
-    let (ip, prefix) = value.split_once('/').context("ожидается ip/префикс")?;
-    let prefix: u8 = prefix.parse().context("префикс")?;
-    anyhow::ensure!(prefix <= 32, "префикс больше 32");
-    Ok((ip.parse().context("ip")?, prefix))
-}
-
 /// Режим TUN: IP-пакеты по дырам как есть (без WireGuard).
 async fn run_tun(tun_addr: &str, server: SocketAddr, my_id: Uuid, server_id: Uuid, options: MultiLinkOptions) -> Result<()> {
     let config = hp_tun::TunConfig {
         name: std::env::var("TUN_NAME").unwrap_or_else(|_| "hp0".into()),
-        address: Some(parse_cidr(tun_addr).context("TUN_ADDR")?),
+        address: Some(hp_tun::parse_cidr(tun_addr).context("TUN_ADDR: ожидается ip/префикс")?),
         mtu: Some(env_number("TUN_MTU", 1400u16)?),
         up: true,
     };
@@ -131,24 +114,5 @@ async fn run_tun(tun_addr: &str, server: SocketAddr, my_id: Uuid, server_id: Uui
             log::info!("дыры {}/{TARGET_LINKS}, к серверу {to} (TCP с номером {ordered}), от сервера {from}, потеряно {dropped}", now.0);
             last = Some(now);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cidr_parses() {
-        assert_eq!(parse_cidr("10.80.0.2/24").unwrap(), ("10.80.0.2".parse().unwrap(), 24));
-        assert!(parse_cidr("10.80.0.2").is_err());
-        assert!(parse_cidr("10.80.0.2/33").is_err());
-    }
-
-    #[test]
-    fn server_address_with_or_without_port() {
-        assert_eq!(parse_server("203.0.113.10").unwrap(), "203.0.113.10:40000".parse().unwrap());
-        assert_eq!(parse_server("203.0.113.10:41000").unwrap(), "203.0.113.10:41000".parse().unwrap());
-        assert!(parse_server("vps").is_err());
     }
 }

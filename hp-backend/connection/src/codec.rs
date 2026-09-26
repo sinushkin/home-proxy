@@ -1,6 +1,7 @@
 use prost::Message as _;
 use uuid::Uuid;
 
+use crate::auth::{RecvKeys, SendKeys, AUTH_LEN, SIGNED_PREFIX};
 use crate::proto::PeerMessage;
 use crate::xor::xor_in_place;
 pub use crate::xor::{KEY_LEN, XorKey};
@@ -11,28 +12,29 @@ pub fn random_key() -> XorKey {
     Uuid::new_v4().into_bytes()
 }
 
-/// Сколько первых байт пакета маскируем. Этого хватает, чтобы на проводе не было
-/// узнаваемого protobuf (теги, длины, заголовок `Init`/`Lite`, начало нагрузки); дальше
-/// в `Data` идёт шифротекст WireGuard, и XOR по нему — лишняя работа.
-pub const MASKED_PREFIX: usize = 64;
+/// Сколько первых байт пакета маскируем: подпись и те же `SIGNED_PREFIX` (128) байт protobuf,
+/// что она покрывает, — заголовок `Init`/`Lite` и заголовки вложенного IP-пакета. Дальше идёт
+/// нагрузка (обычно TLS), XOR по ней — лишняя работа.
+pub const MASKED_PREFIX: usize = AUTH_LEN + SIGNED_PREFIX;
 
-/// Временный симметричный «шифр» для UDP-канала между пирами — XOR первых
-/// `MASKED_PREFIX` байт повторяющимся 16-байтным вектором. Достаточно, чтобы на проводе
-/// не было чистого protobuf и у каждой дыры была своя «подпись»; потом заменить на
-/// настоящий. К `Rendezvous` не применяется: он ходит по MQTT (и внутри `Lite`
-/// по дыре, где кодируется как всё остальное).
-pub fn encode(message: &PeerMessage, key: &XorKey) -> Vec<u8> {
-    let mut buf = message.encode_to_vec();
-    mask(&mut buf, key);
+/// Пакет на проводе: подпись (`auth`: метка и счётчик) ‖ protobuf, первые `MASKED_PREFIX` байт
+/// (подпись и начало protobuf) замаскированы XOR 16-байтным вектором — чтобы на проводе не было узнаваемого protobuf и у
+/// каждой дыры был свой вид. Маскировка — не защита; подлинность даёт подпись. К `Rendezvous`
+/// в MQTT не применяется (там своя подпись, см. `rendezvous`).
+pub fn encode(message: &PeerMessage, keys: &SendKeys) -> Vec<u8> {
+    let mut buf = keys.sealer.seal_vec(message.encode_to_vec());
+    mask(&mut buf, &keys.xor);
     buf
 }
 
-pub fn decode(mut data: Vec<u8>, key: &XorKey) -> Result<PeerMessage, prost::DecodeError> {
-    mask(&mut data, key);
-    PeerMessage::decode(data.as_slice())
+/// Снимает маску, проверяет подпись и разбирает; `None` — не наш или подделанный пакет.
+pub fn decode(mut data: Vec<u8>, keys: &mut RecvKeys) -> Option<PeerMessage> {
+    mask(&mut data, &keys.xor);
+    keys.opener.open(&data)?;
+    PeerMessage::decode(&data[AUTH_LEN..]).ok()
 }
 
-/// Разбор уже снятого с маски буфера (без копии).
+/// Разбор уже снятого с маски и проверенного буфера (без копии).
 pub fn decode_unmasked(data: &[u8]) -> Result<PeerMessage, prost::DecodeError> {
     PeerMessage::decode(data)
 }
@@ -46,28 +48,31 @@ pub fn mask(data: &mut [u8], key: &XorKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{Opener, RecvKeys, SendKeys, Sealer};
     use crate::proto::{init_message, lite, peer_message, Data, InitMessage, Lite, Punch};
 
     fn sample() -> PeerMessage {
         PeerMessage {
             body: Some(peer_message::Body::Init(InitMessage {
                 session_id: "session-guid".to_string(),
-                from_peer_id: "from-guid".to_string(),
-                to_peer_id: "to-guid".to_string(),
+                from_peer_id: "from".to_string(),
+                to_peer_id: "to".to_string(),
                 slot: 0,
                 payload: Some(init_message::Payload::Punch(Punch { target_port: 12_345 })),
             })),
         }
     }
 
+    fn keys(xor: XorKey) -> (SendKeys, RecvKeys) {
+        let auth = [5u8; 32];
+        (SendKeys { xor, sealer: Sealer::new(&auth) }, RecvKeys { xor, opener: Opener::new(&auth) })
+    }
+
     #[test]
     fn round_trip() {
-        let key = random_key();
+        let (send, mut recv) = keys(random_key());
         let message = sample();
-
-        let decoded = decode(encode(&message, &key), &key).unwrap();
-
-        assert_eq!(message, decoded);
+        assert_eq!(decode(encode(&message, &send), &mut recv), Some(message));
     }
 
     fn big_data() -> PeerMessage {
@@ -80,49 +85,37 @@ mod tests {
     }
 
     #[test]
-    fn only_the_prefix_is_xored_with_the_cycled_key() {
+    fn the_signature_leads_and_only_the_prefix_is_xored_with_the_cycled_key() {
         let key: XorKey = std::array::from_fn(|i| i as u8 + 1);
+        let (send, _) = keys(key);
         let message = big_data();
         let plain = message.encode_to_vec();
 
-        let encoded = encode(&message, &key);
+        let encoded = encode(&message, &send);
 
-        assert_eq!(encoded.len(), plain.len());
-        for (i, (enc, pln)) in encoded.iter().zip(&plain).enumerate() {
-            let expected = if i < MASKED_PREFIX { key[i % KEY_LEN] } else { 0 };
-            assert_eq!(enc ^ pln, expected, "байт {i}");
-        }
-    }
-
-    #[test]
-    fn short_messages_are_masked_whole() {
-        let key: XorKey = std::array::from_fn(|i| i as u8 + 1);
-        let message = sample();
-        let plain = message.encode_to_vec();
-        assert!(plain.len() > KEY_LEN && plain.len() < MASKED_PREFIX, "короче префикса, длиннее вектора");
-
-        let encoded = encode(&message, &key);
-
-        for (i, (enc, pln)) in encoded.iter().zip(&plain).enumerate() {
-            assert_eq!(enc ^ pln, key[i % KEY_LEN], "байт {i}");
+        assert_eq!(encoded.len(), AUTH_LEN + plain.len());
+        for (i, (enc, pln)) in encoded[AUTH_LEN..].iter().zip(&plain).enumerate() {
+            let at = AUTH_LEN + i;
+            let expected = if at < MASKED_PREFIX { key[at % KEY_LEN] } else { 0 };
+            assert_eq!(enc ^ pln, expected, "байт {at}");
         }
     }
 
     #[test]
     fn big_data_round_trip() {
-        let key = random_key();
+        let (send, mut recv) = keys(random_key());
         let message = big_data();
-        assert_eq!(decode(encode(&message, &key), &key).unwrap(), message);
+        assert_eq!(decode(encode(&message, &send), &mut recv), Some(message));
     }
 
     #[test]
-    fn wrong_key_does_not_yield_the_message() {
-        let (key, other) = (random_key(), random_key());
-        let message = sample();
-
-        let decoded = decode(encode(&message, &key), &other).ok();
-
-        assert_ne!(decoded, Some(message));
+    fn wrong_vector_or_signature_does_not_yield_the_message() {
+        let (send, _) = keys(random_key());
+        let (_, mut other_vector) = keys(random_key());
+        assert_eq!(decode(encode(&sample(), &send), &mut other_vector), None, "чужой вектор");
+        let (_, mut recv) = keys(send.xor);
+        let foreign = SendKeys { xor: send.xor, sealer: Sealer::new(&[6u8; 32]) };
+        assert_eq!(decode(encode(&sample(), &foreign), &mut recv), None, "чужая подпись");
     }
 
     #[test]

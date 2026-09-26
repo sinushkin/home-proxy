@@ -203,7 +203,7 @@ pub async fn serve(discovery: Discovery, common: Common) -> Result<()> {
         if common.data_holes == 0 { "все".to_string() } else { common.data_holes.to_string() }
     );
 
-    let options = MultiLinkOptions { reorder_wait: common.reorder_wait, data_holes: common.data_holes, local_port_base: 0 };
+    let options = MultiLinkOptions { reorder_wait: common.reorder_wait, data_holes: common.data_holes, local_port_base: 0, ..MultiLinkOptions::default() };
     let (link, mut incoming) = MultiLink::start_discovery("", discovery, common.my_id, common.peer_id, options).await?;
     let link = Arc::new(link);
     let bridge = Bridge::new(common.wg_addr, ToPeer(link.clone()), common.client_timeout);

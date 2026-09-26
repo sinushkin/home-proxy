@@ -7,9 +7,11 @@
 //!
 //! Слотовая модель. Каждая дыра — это отдельный «слот» (0..N-1): свой сокет,
 //! свой STUN-эндпоинт, свой `session_id`. Каждый слот публикуется на топик
-//! `home-proxy/rendezvous/{my_peer_id}/{slot}`, а слушаем мы все слоты пира
-//! по wildcard `home-proxy/rendezvous/{peer_id}/+`. Слот k у нас пробивается
-//! только к слоту k пира.
+//! `home-proxy/rendezvous/{моё имя}/{slot}`, а слушаем мы все слоты пира
+//! по wildcard `home-proxy/rendezvous/{имя пира}/+`. Слот k у нас пробивается
+//! только к слоту k пира. Имя — первая группа GUID (`auth::peer_name`): полный GUID —
+//! секрет пары, на брокер он не попадает. Запись подписана ключом из секрета пары: чужую
+//! (подложенную на брокер под нашим именем) пир не примет.
 //!
 //! Протокол — MQTT 5: у публикации выставлен `message_expiry_interval`, так
 //! что брокер сам удаляет протухшую регистрацию (в MQTT 3.1.1 TTL нет, и
@@ -29,7 +31,7 @@ use rumqttc::{TlsConfiguration, Transport};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::codec::XorKey;
+use crate::auth::{peer_name, PairSecret};
 use crate::label::Label;
 use crate::proto::{Endpoint, Rendezvous};
 
@@ -71,8 +73,6 @@ pub struct PeerSession {
     pub slot: u8,
     pub session_id: Uuid,
     pub addr: SocketAddr,
-    /// Вектор, которым пир просит кодировать всё, что мы шлём ему по этой дыре.
-    pub key: XorKey,
     /// Другие внешние адреса того же сокета (их видели другие STUN-серверы).
     pub extra: Vec<SocketAddr>,
 }
@@ -92,15 +92,16 @@ pub struct Registrar {
     label: Label,
     client: AsyncClient,
     my_peer_id: Uuid,
+    pair: PairSecret,
     _poll_task: AbortOnDrop,
 }
 
 fn slot_topic(peer_id: Uuid, slot: u8) -> String {
-    format!("home-proxy/rendezvous/{peer_id}/{slot}")
+    format!("home-proxy/rendezvous/{}/{slot}", peer_name(&peer_id))
 }
 
 fn peer_wildcard(peer_id: Uuid) -> String {
-    format!("home-proxy/rendezvous/{peer_id}/+")
+    format!("home-proxy/rendezvous/{}/+", peer_name(&peer_id))
 }
 
 fn unix_ms_now() -> u64 {
@@ -128,6 +129,8 @@ pub async fn connect(
     peer_id: Uuid,
 ) -> Result<(Registrar, mpsc::Receiver<PeerSession>)> {
     let mqtt_options = mqtt_options(mqtt_addr, mqtt_ca_pem, my_peer_id, peer_id)?;
+    let pair = PairSecret::new(my_peer_id, peer_id);
+    let poll_pair = pair.clone();
 
     let (client, mut event_loop) = AsyncClient::new(mqtt_options, MQTT_REQUEST_CHANNEL_CAPACITY);
     client
@@ -180,7 +183,7 @@ pub async fn connect(
                 Event::Incoming(Packet::Publish(publish)) => publish,
                 _ => continue,
             };
-            let session = match decode_peer_session(publish.payload.as_ref(), peer_id) {
+            let session = match decode_peer_session(publish.payload.as_ref(), peer_id, &poll_pair) {
                 Ok(Some(session)) => session,
                 Ok(None) => continue,
                 Err(e) => {
@@ -202,6 +205,7 @@ pub async fn connect(
         label,
         client,
         my_peer_id,
+        pair,
         _poll_task: AbortOnDrop(poll_task),
     };
     Ok((registrar, rx))
@@ -210,7 +214,7 @@ pub async fn connect(
 /// Параметры подключения к брокеру: TLS с единственным доверенным корнем
 /// (`mqtt_ca_pem`, адрес брокера проверяется по SAN сертификата) и
 /// идентичность, по которой ACL брокера пускает нас только к нужным топикам:
-/// `client_id` — наш GUID (можно писать только в свои слоты), `username` — GUID
+/// `client_id` — наше имя (можно писать только в свои слоты), `username` — имя
 /// искомого пира (можно читать только его слоты). Пароль брокер не проверяет.
 fn mqtt_options(
     mqtt_addr: SocketAddr,
@@ -223,12 +227,12 @@ fn mqtt_options(
         "CA-сертификат брокера не похож на PEM"
     );
     let mut options = MqttOptions::new(
-        my_peer_id.to_string(),
+        peer_name(&my_peer_id),
         mqtt_addr.ip().to_string(),
         mqtt_addr.port(),
     );
     options.set_keep_alive(MQTT_KEEP_ALIVE);
-    options.set_credentials(peer_id.to_string(), "");
+    options.set_credentials(peer_name(&peer_id), "");
     options.set_transport(Transport::tls_with_config(TlsConfiguration::Simple {
         ca: mqtt_ca_pem,
         alpn: None,
@@ -237,37 +241,49 @@ fn mqtt_options(
     Ok(options)
 }
 
-/// Запись `Rendezvous` о нашем слоте. `endpoints` — внешние адреса сокета, какими
+/// Подписанная запись `Rendezvous` о нашем слоте. `endpoints` — внешние адреса сокета, какими
 /// его увидели STUN-серверы: первый основной, остальные уходят как дополнительные.
 pub fn our_record(
+    pair: &PairSecret,
     my_peer_id: Uuid,
     slot: u8,
     session_id: Uuid,
     endpoints: &[SocketAddr],
-    key: XorKey,
     registered_at_unix_ms: u64,
 ) -> Rendezvous {
     let primary = endpoints.first().copied().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
-    Rendezvous {
+    let mut record = Rendezvous {
         public_ip: primary.ip().to_string(),
         public_port: u32::from(primary.port()),
-        peer_id: my_peer_id.to_string(),
+        peer_id: peer_name(&my_peer_id),
         registered_at_unix_ms,
         session_id: session_id.to_string(),
         slot: u32::from(slot),
-        key: key.to_vec(),
         extra_endpoints: endpoints
             .iter()
             .skip(1)
             .filter(|a| **a != primary)
             .map(|a| Endpoint { ip: a.ip().to_string(), port: u32::from(a.port()) })
             .collect(),
-    }
+        signature: Vec::new(),
+    };
+    record.signature = pair.sign_rendezvous(&record.encode_to_vec()).to_vec();
+    record
 }
 
-/// Преобразует запись `Rendezvous` в `PeerSession`. Используется и для записей
-/// из MQTT, и для тех, что пришли напрямую по дыре (виртуал-брокер).
-pub fn peer_session_from(r: &Rendezvous) -> Result<PeerSession> {
+/// Подпись записи верна (считается по байтам записи с пустой подписью).
+fn signature_is_valid(r: &Rendezvous, pair: &PairSecret) -> bool {
+    let mut unsigned = r.clone();
+    let signature = std::mem::take(&mut unsigned.signature);
+    pair.verify_rendezvous(&unsigned.encode_to_vec(), &signature)
+}
+
+/// Преобразует запись `Rendezvous` пира `peer_id` в `PeerSession`, проверив имя и подпись.
+/// Используется и для записей из MQTT, и для тех, что пришли напрямую по дыре (виртуал-брокер),
+/// и на порту знакомства VPS-режима.
+pub fn peer_session_from(r: &Rendezvous, pair: &PairSecret, peer_id: Uuid) -> Result<PeerSession> {
+    anyhow::ensure!(r.peer_id == peer_name(&peer_id), "запись другого пира ({})", r.peer_id);
+    anyhow::ensure!(signature_is_valid(r, pair), "подпись записи неверна");
     Ok(PeerSession {
         slot: u8::try_from(r.slot).context("slot вне диапазона u8")?,
         session_id: r.session_id.parse().context("некорректный session_id")?,
@@ -275,11 +291,6 @@ pub fn peer_session_from(r: &Rendezvous) -> Result<PeerSession> {
             r.public_ip.parse().context("некорректный public_ip")?,
             r.public_port as u16,
         ),
-        key: r
-            .key
-            .as_slice()
-            .try_into()
-            .context("key должен быть ровно 16 байт")?,
         extra: r
             .extra_endpoints
             .iter()
@@ -293,27 +304,21 @@ pub fn peer_session_from(r: &Rendezvous) -> Result<PeerSession> {
 
 /// Разбирает payload записи пира из MQTT. `Ok(None)` — запись не про этого
 /// пира (лишний топик), её просто пропускаем.
-fn decode_peer_session(payload: &[u8], peer_id: Uuid) -> Result<Option<PeerSession>> {
+fn decode_peer_session(payload: &[u8], peer_id: Uuid, pair: &PairSecret) -> Result<Option<PeerSession>> {
     let r = Rendezvous::decode(payload).context("не удалось разобрать Rendezvous")?;
-    if r.peer_id != peer_id.to_string() {
+    if r.peer_id != peer_name(&peer_id) {
         return Ok(None);
     }
-    Ok(Some(peer_session_from(&r)?))
+    Ok(Some(peer_session_from(&r, pair, peer_id)?))
 }
 
 impl Registrar {
-    /// Публикует (или обновляет) регистрацию нашего слота: адрес, `session_id`,
-    /// XOR-вектор и TTL. Retained — чтобы пир, подписавшийся позже, тоже увидел.
-    pub async fn publish_slot(
-        &self,
-        slot: u8,
-        session_id: Uuid,
-        endpoints: &[SocketAddr],
-        key: XorKey,
-    ) -> Result<()> {
+    /// Публикует (или обновляет) подписанную регистрацию нашего слота: адрес, `session_id` и
+    /// TTL. Retained — чтобы пир, подписавшийся позже, тоже увидел.
+    pub async fn publish_slot(&self, slot: u8, session_id: Uuid, endpoints: &[SocketAddr]) -> Result<()> {
         anyhow::ensure!(!endpoints.is_empty(), "нет ни одного внешнего адреса для публикации");
         let payload =
-            our_record(self.my_peer_id, slot, session_id, endpoints, key, unix_ms_now()).encode_to_vec();
+            our_record(&self.pair, self.my_peer_id, slot, session_id, endpoints, unix_ms_now()).encode_to_vec();
 
         let properties = PublishProperties {
             message_expiry_interval: Some(REGISTRATION_TTL.as_secs() as u32),
@@ -346,65 +351,52 @@ impl Registrar {
 mod tests {
     use super::*;
 
-    #[test]
-    fn peer_session_decodes_from_own_payload() {
-        let session_id = Uuid::new_v4();
-        let peer_id = Uuid::new_v4();
-        let payload = Rendezvous {
-            public_ip: "203.0.113.7".to_string(),
-            public_port: 40000,
-            peer_id: peer_id.to_string(),
-            registered_at_unix_ms: 0,
-            session_id: session_id.to_string(),
-            slot: 3,
-            key: vec![7; 16],
-            extra_endpoints: vec![],
-        }
-        .encode_to_vec();
-
-        let got = decode_peer_session(&payload, peer_id).unwrap().unwrap();
-        assert_eq!(
-            got,
-            PeerSession {
-                slot: 3,
-                session_id,
-                addr: "203.0.113.7:40000".parse().unwrap(),
-                key: [7; 16],
-                extra: vec![],
-            }
-        );
-    }
-
-    #[test]
-    fn key_of_wrong_length_is_rejected() {
-        let peer_id = Uuid::new_v4();
-        for len in [0, 15, 17] {
-            let payload = Rendezvous {
-                public_ip: "203.0.113.7".to_string(),
-                public_port: 40000,
-                peer_id: peer_id.to_string(),
-                registered_at_unix_ms: 0,
-                session_id: Uuid::new_v4().to_string(),
-                slot: 0,
-                key: vec![1; len],
-                extra_endpoints: vec![],
-            }
-            .encode_to_vec();
-
-            assert!(decode_peer_session(&payload, peer_id).is_err(), "длина {len}");
-        }
-    }
-
-    #[test]
-    fn mqtt_identity_matches_broker_acl() {
+    fn ids() -> (Uuid, Uuid, PairSecret) {
         let (me, peer) = (Uuid::new_v4(), Uuid::new_v4());
+        (me, peer, PairSecret::new(me, peer))
+    }
+
+    #[test]
+    fn signed_record_decodes_for_the_pair_and_carries_only_the_name() {
+        let (me, peer, pair) = ids();
+        let session_id = Uuid::new_v4();
+        let record = our_record(&pair, peer, 3, session_id, &["203.0.113.7:40000".parse().unwrap()], 0);
+        assert_eq!(record.peer_id, peer_name(&peer));
+        assert_eq!(record.peer_id.len(), 8);
+
+        let got = decode_peer_session(&record.encode_to_vec(), peer, &PairSecret::new(peer, me)).unwrap().unwrap();
+        assert_eq!(got, PeerSession { slot: 3, session_id, addr: "203.0.113.7:40000".parse().unwrap(), extra: vec![] });
+    }
+
+    #[test]
+    fn forged_or_altered_records_are_rejected() {
+        let (_, peer, pair) = ids();
+        let record = our_record(&pair, peer, 0, Uuid::new_v4(), &["203.0.113.7:40000".parse().unwrap()], 0);
+
+        let mut moved = record.clone();
+        moved.public_port = 40001;
+        assert!(peer_session_from(&moved, &pair, peer).is_err(), "адрес подменён");
+
+        let stranger = PairSecret::new(peer, Uuid::new_v4());
+        let forged = our_record(&stranger, peer, 0, Uuid::new_v4(), &["198.51.100.1:1".parse().unwrap()], 0);
+        assert!(peer_session_from(&forged, &pair, peer).is_err(), "подписано не секретом пары");
+
+        let mut unsigned = record;
+        unsigned.signature.clear();
+        assert!(peer_session_from(&unsigned, &pair, peer).is_err(), "без подписи");
+    }
+
+    #[test]
+    fn mqtt_identity_uses_names_matching_broker_acl() {
+        let (me, peer, _) = ids();
         let ca = b"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".to_vec();
 
         let options = mqtt_options("203.0.113.9:8883".parse().unwrap(), ca, me, peer).unwrap();
 
-        assert_eq!(options.client_id(), me.to_string());
-        assert_eq!(options.credentials(), Some((peer.to_string(), String::new())));
+        assert_eq!(options.client_id(), peer_name(&me));
+        assert_eq!(options.credentials(), Some((peer_name(&peer), String::new())));
         assert!(matches!(options.transport(), Transport::Tls(_)));
+        assert_eq!(slot_topic(me, 4), format!("home-proxy/rendezvous/{}/4", peer_name(&me)));
     }
 
     #[test]
@@ -415,15 +407,16 @@ mod tests {
 
     #[test]
     fn extra_endpoints_round_trip_and_become_candidates() {
+        let (_, peer, pair) = ids();
         let endpoints: Vec<SocketAddr> = vec![
             "203.0.113.7:40000".parse().unwrap(),
             "198.51.100.2:41000".parse().unwrap(),
             "203.0.113.7:40000".parse().unwrap(), // повтор основного отбрасывается
         ];
-        let record = our_record(Uuid::new_v4(), 3, Uuid::new_v4(), &endpoints, [9; 16], 0);
+        let record = our_record(&pair, peer, 3, Uuid::new_v4(), &endpoints, 0);
         assert_eq!(record.extra_endpoints.len(), 1);
 
-        let session = peer_session_from(&record).unwrap();
+        let session = peer_session_from(&record, &pair, peer).unwrap();
         assert_eq!(session.addr, endpoints[0]);
         assert_eq!(session.extra, vec![endpoints[1]]);
         assert_eq!(session.candidates(), vec![endpoints[0], endpoints[1]]);
@@ -431,30 +424,27 @@ mod tests {
 
     #[test]
     fn broken_extra_endpoints_are_skipped() {
-        let mut record = our_record(Uuid::new_v4(), 0, Uuid::new_v4(), &["203.0.113.7:1".parse().unwrap()], [0; 16], 0);
+        let (_, peer, pair) = ids();
+        let mut record = our_record(&pair, peer, 0, Uuid::new_v4(), &["203.0.113.7:1".parse().unwrap()], 0);
         record.extra_endpoints = vec![
             Endpoint { ip: "не-адрес".into(), port: 5 },
             Endpoint { ip: "198.51.100.2".into(), port: 0 },
             Endpoint { ip: "198.51.100.2".into(), port: 70000 },
             Endpoint { ip: "198.51.100.2".into(), port: 6 },
         ];
-        assert_eq!(peer_session_from(&record).unwrap().extra, vec!["198.51.100.2:6".parse().unwrap()]);
+        record.signature = pair.sign_rendezvous(&{
+            let mut r = record.clone();
+            r.signature.clear();
+            r.encode_to_vec()
+        }).to_vec();
+        assert_eq!(peer_session_from(&record, &pair, peer).unwrap().extra, vec!["198.51.100.2:6".parse().unwrap()]);
     }
 
     #[test]
     fn peer_session_from_other_peer_is_ignored() {
-        let payload = Rendezvous {
-            public_ip: "203.0.113.7".to_string(),
-            public_port: 40000,
-            peer_id: Uuid::new_v4().to_string(),
-            registered_at_unix_ms: 0,
-            session_id: Uuid::new_v4().to_string(),
-            slot: 0,
-            key: vec![0; 16],
-            extra_endpoints: vec![],
-        }
-        .encode_to_vec();
-
-        assert!(decode_peer_session(&payload, Uuid::new_v4()).unwrap().is_none());
+        let (_, peer, pair) = ids();
+        let other = Uuid::new_v4();
+        let payload = our_record(&pair, other, 0, Uuid::new_v4(), &["203.0.113.7:1".parse().unwrap()], 0).encode_to_vec();
+        assert!(decode_peer_session(&payload, peer, &pair).unwrap().is_none());
     }
 }

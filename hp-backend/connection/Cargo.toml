@@ -11,6 +11,9 @@ rumqttc = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
+chacha20poly1305 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

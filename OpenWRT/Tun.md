@@ -21,11 +21,11 @@ LAN-клиент -> роутер: hp0 (10.80.0.2, TUN vps-client) -> 10 дыр =
 2. NAT для подсети туннеля наружу и пересылка:
    ```bash
    sysctl -w net.ipv4.ip_forward=1
-   iptables -t nat -A POSTROUTING -s 10.80.0.0/24 -o <внешний интерфейс> -j MASQUERADE
+   iptables -t nat -A POSTROUTING -s 10.80.0.0/16 -o <внешний интерфейс> -j MASQUERADE
    ```
 3. `vps-server` с `vps.env` (как в `Wireguard.md`) плюс строка режима TUN:
    ```
-   VPS_TUN_ADDR=10.80.0.1/24
+   VPS_TUN_ADDR=10.80.0.1/16
    ```
    Запуск от root (нужен `CAP_NET_ADMIN`): при старте поднимается интерфейс `hp0`
    (`VPS_TUN_NAME`, MTU 1400 — `VPS_TUN_MTU`).

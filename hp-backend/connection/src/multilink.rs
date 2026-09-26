@@ -28,7 +28,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::codec::{self, XorKey};
+use crate::auth::PairSecret;
 use crate::pool::Packet;
 use crate::label::Label;
 use crate::link_id::PeerLinkId;
@@ -369,11 +369,15 @@ pub struct MultiLinkOptions {
     /// Первый локальный UDP-порт слотов: слот `k` занимает `base + k`. 0 — порты выбирает ОС.
     /// Нужен, когда брандмауэр пропускает входящий UDP только в известном диапазоне.
     pub local_port_base: u16,
+    /// Восстанавливать ли порядок у пакетов клиентов (`WrappedData` с корзиной потока). Конечный
+    /// получатель (VPS) — да; роутер, который только перекладывает пакеты телефонов, — нет:
+    /// порядок вернёт тот, кому пакет адресован.
+    pub reorder_clients: bool,
 }
 
 impl Default for MultiLinkOptions {
     fn default() -> Self {
-        Self { reorder_wait: DEFAULT_REORDER_WAIT, data_holes: 0, local_port_base: 0 }
+        Self { reorder_wait: DEFAULT_REORDER_WAIT, data_holes: 0, local_port_base: 0, reorder_clients: true }
     }
 }
 
@@ -439,6 +443,8 @@ impl MultiLink {
     ) -> Result<(Self, mpsc::Receiver<Incoming>)> {
         let label = Label::new(label);
         let registry = Arc::new(Mutex::new(LinkRegistry::default()));
+        // Из двух полных GUID — секрет пары: из него все ключи и подписи (`auth`).
+        let pair = PairSecret::new(my_peer_id, peer_id);
         let (slot0_announce, mode, mqtt_rx, punch) = match &discovery {
             Discovery::StunMqtt { stun_addrs, mqtt_addr, mqtt_ca_pem } => {
                 let (registrar, peer_rx) =
@@ -455,7 +461,7 @@ impl MultiLink {
             ),
             Discovery::VpsClient { server } => (
                 Announce::VpsClient(Arc::new(
-                    vps::ClientBootstrap::new(*server, vps::bootstrap_key(my_peer_id, peer_id)).await?,
+                    vps::ClientBootstrap::new(*server, pair.clone()).await?,
                 )),
                 SlotMode::VpsClient,
                 None,
@@ -495,6 +501,7 @@ impl MultiLink {
                 mode: mode.clone(),
                 my_peer_id,
                 peer_id,
+                pair: pair.clone(),
                 announce,
                 registry: registry.clone(),
                 punch: punch.clone(),
@@ -515,7 +522,7 @@ impl MultiLink {
                 tokio::spawn(vps::serve_bootstrap(
                     socket,
                     boot.clone(),
-                    vps::bootstrap_key(my_peer_id, peer_id),
+                    pair.clone(),
                     peer_id,
                     slot_txs[BOOTSTRAP_SLOT as usize].clone(),
                 ));
@@ -538,9 +545,9 @@ impl MultiLink {
             events_rx,
             registry.clone(),
             redrop_txs,
-            slot_txs,
+            SlotFeed { slot_txs, pair, peer_id },
             incoming_tx,
-            options.reorder_wait,
+            options,
         ));
 
         let multilink = Self {
@@ -594,8 +601,22 @@ impl MultiLink {
     pub async fn send_wrapped(&self, client_id: u8, payload: &[u8]) -> Result<(u8, u64)> {
         let link = self.choose_link(payload.len())?;
         let seq = self.wrap_seq.lock().unwrap().next(client_id);
-        link.sender.send_wrapped(seq, u32::from(client_id), payload).await;
+        link.sender.send_wrapped(seq, u32::from(client_id), None, payload).await;
         Ok((link.slot, seq))
+    }
+
+    /// Отправляет пакет клиента `client_id` (`WrappedData`). `order` — корзина TCP-потока и номер в
+    /// ней, выставленные исходным отправителем (TUN-режим): их не меняем, порядок вернёт конечный
+    /// получатель. Без `order` пакет идёт без порядка (номер — свой счётчик клиента). Возвращает
+    /// номер дыры.
+    pub async fn send_client(&self, client_id: u8, order: Option<(u32, u64)>, payload: &[u8]) -> Result<u8> {
+        let link = self.choose_link(payload.len())?;
+        let (flow, seq) = match order {
+            Some((flow, seq)) => (Some(flow), seq),
+            None => (None, self.wrap_seq.lock().unwrap().next(client_id)),
+        };
+        link.sender.send_wrapped(seq, u32::from(client_id), flow, payload).await;
+        Ok(link.slot)
     }
 
     /// Отправляет IP-пакет с номером в потоке (`Ordered`, TUN-режим): получатель вернёт порядок
@@ -688,6 +709,14 @@ async fn stats_loop(registry: Arc<Mutex<LinkRegistry>>) {
     }
 }
 
+/// Куда отдавать записи `Rendezvous` пира, пришедшие по дыре (виртуал-брокер), и чем их
+/// проверять.
+struct SlotFeed {
+    slot_txs: Vec<mpsc::Sender<PeerSession>>,
+    pair: PairSecret,
+    peer_id: Uuid,
+}
+
 /// Разбирает события с дыр: статистику пира, `DeleteLink`, `Rendezvous` пира. Данные пира
 /// проходят через буфер порядка (`reorder`), если `reorder_wait` не ноль.
 async fn control_loop(
@@ -695,10 +724,11 @@ async fn control_loop(
     mut events: mpsc::Receiver<LinkEvent>,
     registry: Arc<Mutex<LinkRegistry>>,
     redrop_txs: Vec<mpsc::Sender<()>>,
-    slot_txs: Vec<mpsc::Sender<PeerSession>>,
+    feed: SlotFeed,
     incoming: mpsc::Sender<Incoming>,
-    reorder_wait: Duration,
+    options: MultiLinkOptions,
 ) {
+    let MultiLinkOptions { reorder_wait, reorder_clients, .. } = options;
     let mut reorder = (!reorder_wait.is_zero()).then(|| Resequencer::adaptive(reorder_wait));
     let mut ready: Vec<Incoming> = Vec::with_capacity(64);
     let mut stats_tick = tokio::time::interval(REORDER_STATS_INTERVAL);
@@ -755,20 +785,25 @@ async fn control_loop(
             LinkEvent::PeerData { slot, payload } => {
                 deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: None }, &mut ready).await;
             }
-            LinkEvent::PeerWrapped { slot, seq, client_id, payload } => {
+            LinkEvent::PeerWrapped { slot, seq, client_id, flow, payload } => {
                 let Ok(client_id) = u8::try_from(client_id) else {
                     log::warn!("{label}слот {slot}: WrappedData с client_id {client_id} вне 0..=255");
                     continue;
                 };
-                let packet = Incoming { slot, payload, wrapped: Some(WrappedInfo { client_id, seq }), order: None };
-                deliver(&incoming, &mut reorder, packet, &mut ready).await;
+                let order = flow.map(|flow| (flow, seq));
+                let packet = Incoming { slot, payload, wrapped: Some(WrappedInfo { client_id, seq }), order };
+                if reorder_clients {
+                    deliver(&incoming, &mut reorder, packet, &mut ready).await;
+                } else {
+                    let _ = incoming.send(packet).await;
+                }
             }
             LinkEvent::PeerOrdered { slot, flow, seq, payload } => {
                 deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: Some((flow, seq)) }, &mut ready).await;
             }
             LinkEvent::PeerRendezvous(r) => {
-                match rendezvous::peer_session_from(&r) {
-                    Ok(session) => feed_slot(&slot_txs, session).await,
+                match rendezvous::peer_session_from(&r, &feed.pair, feed.peer_id) {
+                    Ok(session) => feed_slot(&feed.slot_txs, session).await,
                     Err(e) => log::warn!("некорректный Rendezvous по дыре: {e:#}"),
                 }
             }
@@ -825,6 +860,7 @@ struct SlotCtx {
     mode: SlotMode,
     my_peer_id: Uuid,
     peer_id: Uuid,
+    pair: PairSecret,
     announce: Announce,
     registry: Arc<Mutex<LinkRegistry>>,
     punch: PunchConfig,
@@ -840,9 +876,9 @@ async fn slot_worker(mut ctx: SlotCtx) {
     let label = ctx.label.clone();
     let mut last_linked_peer_session: Option<Uuid> = None;
     loop {
+        // Каждая новая регистрация слота — новая сессия, а с ней новые вектор и ключи подписи
+        // (выводятся из секрета пары и пары сессий): у каждой дыры свои.
         let my_session = Uuid::new_v4();
-        // Каждая новая регистрация слота — новый вектор: у каждой дыры свой.
-        let my_key = codec::random_key();
         ctx.state.set(ctx.slot, SlotPhase::Starting);
 
         // VPS-режимы: на каждую регистрацию слот занимает новый порт (плохую дыру
@@ -881,11 +917,11 @@ async fn slot_worker(mut ctx: SlotCtx) {
         // не залинкуемся.
         let announce = match announce_slot(
             &ctx.announce,
+            &ctx.pair,
             ctx.my_peer_id,
             ctx.slot,
             my_session,
             &my_endpoints,
-            my_key,
         )
         .await
         {
@@ -909,8 +945,7 @@ async fn slot_worker(mut ctx: SlotCtx) {
             my_peer_id: ctx.my_peer_id,
             peer_id: ctx.peer_id,
             slot: ctx.slot,
-            my_key,
-            peer_key: peer.key,
+            pair: ctx.pair.clone(),
         };
         let my_endpoint = my_endpoints[0];
         let candidates = match &ctx.mode {
@@ -999,42 +1034,36 @@ async fn slot_worker(mut ctx: SlotCtx) {
     }
 }
 
-/// Строит запись `Rendezvous` о нашем слоте (одинаковую для MQTT и для отправки
+/// Строит подписанную запись `Rendezvous` о нашем слоте (одинаковую для MQTT и для отправки
 /// по дыре). `registered_at_unix_ms` над дырой не используется.
-fn our_rendezvous(
-    my_peer_id: Uuid,
-    slot: u8,
-    session: Uuid,
-    endpoints: &[SocketAddr],
-    key: XorKey,
-) -> Rendezvous {
-    rendezvous::our_record(my_peer_id, slot, session, endpoints, key, 0)
+fn our_rendezvous(pair: &PairSecret, my_peer_id: Uuid, slot: u8, session: Uuid, endpoints: &[SocketAddr]) -> Rendezvous {
+    rendezvous::our_record(pair, my_peer_id, slot, session, endpoints, 0)
 }
 
 /// Анонс слота; возвращает `AbortOnDrop` фоновой задачи анонса, которую держим
 /// до линковки (дроп её останавливает).
 async fn announce_slot(
     announce: &Announce,
+    pair: &PairSecret,
     my_peer_id: Uuid,
     slot: u8,
     session: Uuid,
     endpoints: &[SocketAddr],
-    key: XorKey,
 ) -> Result<AbortOnDrop> {
     match announce {
         Announce::Mqtt(registrar) => {
             registrar
-                .publish_slot(slot, session, endpoints, key)
+                .publish_slot(slot, session, endpoints)
                 .await
                 .context("публикация в MQTT")?;
-            Ok(spawn_mqtt_republish(registrar.clone(), slot, session, endpoints.to_vec(), key))
+            Ok(spawn_mqtt_republish(registrar.clone(), slot, session, endpoints.to_vec()))
         }
         Announce::VirtualBroker(registry) => {
-            let rendezvous = our_rendezvous(my_peer_id, slot, session, endpoints, key);
+            let rendezvous = our_rendezvous(pair, my_peer_id, slot, session, endpoints);
             Ok(spawn_hole_announce(registry.clone(), rendezvous))
         }
         Announce::VpsServer(boot) => {
-            boot.set(Some(our_rendezvous(my_peer_id, slot, session, endpoints, key)));
+            boot.set(Some(our_rendezvous(pair, my_peer_id, slot, session, endpoints)));
             let guard = ClearOnDrop(boot.clone());
             Ok(AbortOnDrop(tokio::spawn(async move {
                 let _guard = guard;
@@ -1042,7 +1071,7 @@ async fn announce_slot(
             })))
         }
         Announce::VpsClient(boot) => {
-            let (boot, record) = (boot.clone(), our_rendezvous(my_peer_id, slot, session, endpoints, key));
+            let (boot, record) = (boot.clone(), our_rendezvous(pair, my_peer_id, slot, session, endpoints));
             Ok(AbortOnDrop(tokio::spawn(async move { boot.announce(record).await })))
         }
     }
@@ -1054,14 +1083,13 @@ fn spawn_mqtt_republish(
     slot: u8,
     session_id: Uuid,
     endpoints: Vec<SocketAddr>,
-    key: XorKey,
 ) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(REPUBLISH_INTERVAL);
         ticker.tick().await; // первый тик сразу — публикацию уже сделали снаружи
         loop {
             ticker.tick().await;
-            if registrar.publish_slot(slot, session_id, &endpoints, key).await.is_err() {
+            if registrar.publish_slot(slot, session_id, &endpoints).await.is_err() {
                 return;
             }
         }
@@ -1291,9 +1319,9 @@ mod tests {
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
             Vec::new(),
-            Vec::new(),
+            SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
             incoming_tx,
-            wait,
+            MultiLinkOptions { reorder_wait: wait, ..MultiLinkOptions::default() },
         ));
 
         for counter in [0u64, 2, 1, 3] {
@@ -1324,9 +1352,9 @@ mod tests {
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
             Vec::new(),
-            Vec::new(),
+            SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
             incoming_tx,
-            Duration::ZERO,
+            MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
         ));
         for counter in [0u64, 2, 1] {
             events_tx.send(wg_event(counter)).await.unwrap();
@@ -1336,6 +1364,44 @@ mod tests {
             got.push(counter_of(&tokio::time::timeout(Duration::from_millis(100), incoming_rx.recv()).await.unwrap().unwrap()));
         }
         assert_eq!(got, vec![0, 2, 1]);
+    }
+
+    fn ordered_event(flow: u32, seq: u64, client_id: Option<u32>) -> LinkEvent {
+        let payload = Packet::copy_from(&[0x45u8; 40]).unwrap();
+        match client_id {
+            Some(client_id) => LinkEvent::PeerWrapped { slot: 0, seq, client_id, flow: Some(flow), payload },
+            None => LinkEvent::PeerOrdered { slot: 0, flow, seq, payload },
+        }
+    }
+
+    /// Роутер (`reorder_clients = false`): пакеты клиентов идут насквозь как пришли, с корзиной и
+    /// номером отправителя, а свой поток (`Ordered`) по-прежнему упорядочивается.
+    #[tokio::test]
+    async fn client_packets_pass_through_when_reorder_clients_is_off() {
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        tokio::spawn(control_loop(
+            Label::new(""),
+            events_rx,
+            Arc::new(Mutex::new(LinkRegistry::default())),
+            Vec::new(),
+            SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
+            incoming_tx,
+            MultiLinkOptions { reorder_wait: Duration::from_millis(500), reorder_clients: false, ..MultiLinkOptions::default() },
+        ));
+        events_tx.send(ordered_event(3, 0, None)).await.unwrap();
+        events_tx.send(ordered_event(3, 2, None)).await.unwrap();
+        events_tx.send(ordered_event(3, 2, Some(7))).await.unwrap();
+        events_tx.send(ordered_event(3, 0, Some(7))).await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let p = tokio::time::timeout(Duration::from_millis(100), incoming_rx.recv()).await.unwrap().unwrap();
+            got.push((p.wrapped.map(|w| w.client_id), p.order));
+        }
+        assert_eq!(got, vec![(None, Some((3, 0))), (Some(7), Some((3, 2))), (Some(7), Some((3, 0)))]);
+        // Свой пакет 2 придержан (ждали номер 1) и выходит по таймауту — после пакетов клиента.
+        let held = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv()).await.unwrap().unwrap();
+        assert_eq!((held.wrapped, held.order), (None, Some((3, 2))));
     }
 
     #[test]
