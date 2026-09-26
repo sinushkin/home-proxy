@@ -10,7 +10,9 @@
 //!   VPS_PORTS — диапазон портов слотов `начало-конец` (40001-49999);
 //!   MY_ID, PEER_ID, WG_ADDR, CLIENT_TIMEOUT_SECS, REORDER_WAIT_MS, DATA_HOLES,
 //!   RUST_LOG, LOG_FILE — как у `hp-server`;
-//!   RUNTIME=multi — многопоточный tokio (по умолчанию однопоточный).
+//!   RUNTIME=multi — многопоточный tokio (по умолчанию однопоточный);
+//!   VPS_TUN_ADDR=10.80.0.1/24 — режим TUN без WireGuard: IP-пакеты клиента идут в TUN как есть
+//!   (ещё VPS_TUN_NAME — `hp0`, VPS_TUN_MTU — 1400); NAT подсети наружу настраивается отдельно.
 //! Брандмауэр должен пропускать входящий UDP на порт знакомства и весь `VPS_PORTS`.
 
 use std::net::IpAddr;
@@ -74,7 +76,44 @@ fn main() -> Result<()> {
     } else {
         tokio::runtime::Builder::new_current_thread().enable_all().build()?
     };
-    runtime.block_on(hp_server::serve(discovery, common))
+    match settings.get("VPS_TUN_ADDR") {
+        Some(tun_addr) => runtime.block_on(serve_tun(&settings, &tun_addr, discovery, common)),
+        None => runtime.block_on(hp_server::serve(discovery, common)),
+    }
+}
+
+fn parse_cidr(value: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (ip, prefix) = value.split_once('/').context("VPS_TUN_ADDR: ожидается ip/префикс")?;
+    let prefix: u8 = prefix.parse().context("VPS_TUN_ADDR: префикс")?;
+    anyhow::ensure!(prefix <= 32, "VPS_TUN_ADDR: префикс больше 32");
+    Ok((ip.parse().context("VPS_TUN_ADDR: ip")?, prefix))
+}
+
+/// Режим TUN: IP-пакеты клиента по дырам как есть, без WireGuard.
+async fn serve_tun(settings: &Settings, tun_addr: &str, discovery: Discovery, common: hp_server::Common) -> Result<()> {
+    use connection::multilink::{MultiLink, MultiLinkOptions, TARGET_LINKS};
+    let config = hp_tun::TunConfig {
+        name: settings.get("VPS_TUN_NAME").unwrap_or_else(|| "hp0".into()),
+        address: Some(parse_cidr(tun_addr)?),
+        mtu: Some(settings.get("VPS_TUN_MTU").map(|v| v.parse()).transpose().context("VPS_TUN_MTU")?.unwrap_or(1400)),
+        up: true,
+    };
+    let tun = hp_tun::Tun::create(&config).context("создание TUN (нужны права root)")?;
+    log::info!("vps-server: режим TUN, {} {tun_addr}, клиент {}", tun.name(), common.peer_id);
+    let options = MultiLinkOptions { reorder_wait: common.reorder_wait, data_holes: common.data_holes, local_port_base: 0 };
+    let (link, incoming) = MultiLink::start_discovery("", discovery, common.my_id, common.peer_id, options).await?;
+    let link = std::sync::Arc::new(link);
+    let bridge = hp_tun::bridge::Bridge::start(tun, link.clone(), incoming);
+    let mut last = None;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let now = (link.live_count(), bridge.stats().snapshot());
+        if Some(now) != last {
+            let (to, ordered, from, dropped) = now.1;
+            log::info!("дыры {}/{TARGET_LINKS}, к клиенту {to} (TCP с номером {ordered}), от клиента {from}, потеряно {dropped}", now.0);
+            last = Some(now);
+        }
+    }
 }
 
 #[cfg(test)]

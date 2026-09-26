@@ -143,7 +143,7 @@ mod tests {
     }
 
     fn incoming(slot: u8, payload: &[u8]) -> Incoming {
-        Incoming { slot, payload: crate::pool::Packet::copy_from(payload).unwrap(), wrapped: None }
+        Incoming { slot, payload: crate::pool::Packet::copy_from(payload).unwrap(), wrapped: None, order: None }
     }
 
     fn wrapped(client_id: u8, payload: &[u8]) -> Incoming {
@@ -151,6 +151,7 @@ mod tests {
             slot: 0,
             payload: crate::pool::Packet::copy_from(payload).unwrap(),
             wrapped: Some(WrappedInfo { client_id, seq: 0 }),
+            order: None,
         }
     }
 

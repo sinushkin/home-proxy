@@ -24,3 +24,7 @@ cargo build --release -p vps-server           # target/release/vps-server
 ```
 
 Сервер обслуживает одного клиента (`PEER_ID`).
+
+Режим TUN без WireGuard: `VPS_TUN_ADDR=10.80.0.1/24` (ещё `VPS_TUN_NAME`, `VPS_TUN_MTU`) — IP-пакеты
+клиента идут в интерфейс `hp0` как есть; NAT подсети наружу настраивается отдельно. См.
+`../OpenWRT/Tun.md`.

@@ -249,4 +249,5 @@ dropbear нет sftp. `ldd` на роутере (это символическа
 | на роутере `Not found`/`can't execute` | не тот интерпретатор: бинарник под другой ABI (mips vs mipsel, hard/soft float) |
 
 WireGuard на роутере поверх `vps-client` (весь трафик LAN через VPS с белым IP), настройка по шагам
-и замер скорости — [`Wireguard.md`](Wireguard.md).
+и замер скорости — [`Wireguard.md`](Wireguard.md). То же без WireGuard, через TUN (вдвое быстрее на
+слабом роутере) — [`Tun.md`](Tun.md).

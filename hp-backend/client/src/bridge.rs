@@ -178,7 +178,7 @@ mod tests {
     }
 
     fn from_router(payload: &[u8]) -> Incoming {
-        Incoming { slot: 2, payload: connection::pool::Packet::copy_from(payload).unwrap(), wrapped: None }
+        Incoming { slot: 2, payload: connection::pool::Packet::copy_from(payload).unwrap(), wrapped: None, order: None }
     }
 
     #[tokio::test]

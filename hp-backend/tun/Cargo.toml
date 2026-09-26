@@ -8,3 +8,8 @@ license.workspace = true
 tokio = { workspace = true }
 libc = { workspace = true }
 anyhow = { workspace = true }
+log = { workspace = true }
+connection = { path = "../connection" }
+
+[dev-dependencies]
+uuid = { workspace = true }

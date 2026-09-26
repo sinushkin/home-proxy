@@ -158,6 +158,23 @@ impl Session {
     }
 }
 
+/// Сессия порядка: сессия WireGuard (`receiver index` из заголовка) или корзина потока
+/// (`Ordered`, TUN-режим). Разные виды не смешиваются.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SessionKey {
+    WireGuard(u32),
+    Flow(u32),
+}
+
+impl std::fmt::LowerHex for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionKey::WireGuard(index) => write!(f, "wg:{index:x}"),
+            SessionKey::Flow(flow) => write!(f, "поток:{flow:x}"),
+        }
+    }
+}
+
 pub struct Resequencer {
     wait: Duration,
     adaptive: bool,
@@ -166,7 +183,7 @@ pub struct Resequencer {
     lateness_sorted: Vec<Duration>,
     lateness_pos: usize,
     since_recalc: usize,
-    sessions: HashMap<u32, Session>,
+    sessions: HashMap<SessionKey, Session>,
     stats: ReorderStats,
 }
 
@@ -246,7 +263,11 @@ impl Resequencer {
     /// Принимает пакет и дописывает в `out` те, что можно отдавать дальше сейчас (по порядку).
     /// `out` вызывающий переиспользует между пакетами: выделения памяти на пакет нет.
     pub fn push_into(&mut self, packet: Incoming, now: Instant, out: &mut Vec<Incoming>) {
-        let Some((index, counter)) = parse_transport(&packet.payload) else {
+        let key = match packet.order {
+            Some((flow, seq)) => Some((SessionKey::Flow(flow), seq)),
+            None => parse_transport(&packet.payload).map(|(index, counter)| (SessionKey::WireGuard(index), counter)),
+        };
+        let Some((index, counter)) = key else {
             self.stats.passthrough += 1;
             out.push(packet);
             return;
@@ -407,7 +428,7 @@ mod tests {
         payload[0] = 4;
         payload[4..8].copy_from_slice(&index.to_le_bytes());
         payload[8..16].copy_from_slice(&counter.to_le_bytes());
-        Incoming { slot: (counter % 10) as u8, payload: crate::pool::Packet::copy_from(&payload).unwrap(), wrapped: None }
+        Incoming { slot: (counter % 10) as u8, payload: crate::pool::Packet::copy_from(&payload).unwrap(), wrapped: None, order: None }
     }
 
     fn counters(packets: &[Incoming]) -> Vec<u64> {
@@ -480,7 +501,7 @@ mod tests {
         let mut handshake = wg(1, 0);
         handshake.payload[0] = 1;
         assert_eq!(r.push(handshake, Instant::now()).len(), 1);
-        let short = Incoming { slot: 0, payload: crate::pool::Packet::copy_from(&[4, 0, 0, 0]).unwrap(), wrapped: None };
+        let short = Incoming { slot: 0, payload: crate::pool::Packet::copy_from(&[4, 0, 0, 0]).unwrap(), wrapped: None, order: None };
         assert_eq!(r.push(short, Instant::now()).len(), 1);
         assert_eq!(r.stats().passthrough, 2);
     }
@@ -589,5 +610,49 @@ mod tests {
         let mut r = Resequencer::new(Duration::from_millis(8));
         feed_lateness(&mut r, Instant::now(), Duration::from_millis(16), 200);
         assert_eq!(r.wait(), Duration::from_millis(8));
+    }
+
+    fn ordered(flow: u32, seq: u64) -> Incoming {
+        let mut payload = vec![0x45u8; 40]; // IPv4-подобный пакет: не заголовок WireGuard
+        payload[39] = seq as u8;
+        Incoming { slot: 0, payload: crate::pool::Packet::copy_from(&payload).unwrap(), wrapped: None, order: Some((flow, seq)) }
+    }
+
+    fn seqs(packets: &[Incoming]) -> Vec<(u32, u64)> {
+        packets.iter().map(|p| p.order.unwrap()).collect()
+    }
+
+    #[test]
+    fn ordered_packets_are_resequenced_per_flow() {
+        let mut r = Resequencer::new(WAIT);
+        let now = Instant::now();
+        assert_eq!(seqs(&r.push(ordered(1, 0), now)), vec![(1, 0)]);
+        assert!(r.push(ordered(1, 2), now).is_empty(), "поток 1 ждёт номер 1");
+        // Другой поток не ждёт пробела потока 1.
+        assert_eq!(seqs(&r.push(ordered(2, 0), now)), vec![(2, 0)]);
+        assert_eq!(seqs(&r.push(ordered(2, 1), now)), vec![(2, 1)]);
+        assert_eq!(seqs(&r.push(ordered(1, 1), now)), vec![(1, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn unnumbered_ip_packets_pass_immediately_even_while_a_flow_waits() {
+        let mut r = Resequencer::new(WAIT);
+        let now = Instant::now();
+        r.push(ordered(3, 0), now);
+        assert!(r.push(ordered(3, 2), now).is_empty());
+        let udp = Incoming { slot: 0, payload: crate::pool::Packet::copy_from(&[0x45u8; 40]).unwrap(), wrapped: None, order: None };
+        assert_eq!(r.push(udp, now).len(), 1, "UDP/ICMP без номера отдаются сразу");
+        assert_eq!(r.stats().passthrough, 1);
+    }
+
+    #[test]
+    fn flow_and_wireguard_sessions_do_not_mix() {
+        let mut r = Resequencer::new(WAIT);
+        let now = Instant::now();
+        // Номер потока 7 и индекс сессии WireGuard 7 — разные сессии.
+        r.push(wg(7, 0), now);
+        r.push(ordered(7, 0), now);
+        assert!(r.push(wg(7, 2), now).is_empty());
+        assert_eq!(seqs(&r.push(ordered(7, 1), now)), vec![(7, 1)], "поток 7 не ждёт пробела сессии WireGuard 7");
     }
 }

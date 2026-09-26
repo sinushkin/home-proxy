@@ -11,8 +11,13 @@
 //! - [`Tun::from_fd`] — Android (и Linux): дескриптор от `VpnService.Builder.establish()`.
 //! - [`Tun::recv`] / [`Tun::send`] — один IP-пакет за вызов (без префикса `IFF_NO_PI`).
 //! - [`packet`] — разбор заголовков IP (протокол, адреса, порты, хэш соединения).
+//! - [`bridge`] — мост TUN ↔ дыры (`MultiLink`): TCP с номером в потоке (`Ordered`, получатель
+//!   восстанавливает порядок), остальное (UDP, ICMP…) — сразу.
 
 pub mod packet;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod bridge;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp;

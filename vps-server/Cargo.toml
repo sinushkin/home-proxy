@@ -10,3 +10,4 @@ log = { workspace = true }
 anyhow = { workspace = true }
 connection = { path = "../hp-backend/connection" }
 hp-server = { path = "../hp-server" }
+hp-tun = { path = "../hp-backend/tun" }

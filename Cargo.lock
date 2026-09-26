@@ -404,8 +404,11 @@ name = "hp-tun"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "connection",
  "libc",
+ "log",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1174,6 +1177,7 @@ dependencies = [
  "connection",
  "hp-client",
  "hp-logging",
+ "hp-tun",
  "log",
  "tokio",
  "uuid",
@@ -1186,6 +1190,7 @@ dependencies = [
  "anyhow",
  "connection",
  "hp-server",
+ "hp-tun",
  "log",
  "tokio",
 ]

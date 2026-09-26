@@ -219,7 +219,9 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   без STUN, MQTT и пробива (`connection::vps`). `vps-server` — мост `hp-server` с
   `Discovery::VpsServer` (`VPS_PUBLIC_IP`, `VPS_BOOTSTRAP_PORT`, `VPS_PORTS`), `vps-client` — мост
   `hp_client::bridge` с `Discovery::VpsClient`. Android их не использует; `vps-client` собирается
-  под OpenWrt.
+  под OpenWrt. Режим TUN без WireGuard (`TUN_ADDR` / `VPS_TUN_ADDR`): мост `hp_tun::bridge`, TCP
+  идёт `Ordered` (номер в корзине потока, порядок восстанавливает `reorder`), прочее — `Data`
+  сразу. `OpenWRT/Tun.md`.
 - `control/` — только описание (`README.md`): протокол управления (тот же protobuf, без XOR, TCP в
   «демилитаризованной зоне»: loopback или доверенная LAN), трей на Slint, показ QR с пакетом
   сопряжения и его сканирование в Android. Кода пока нет; `hp-server`/`router` от него не зависят.

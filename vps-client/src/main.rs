@@ -5,7 +5,8 @@
 //! Аргументы: `<ip_сервера[:порт_знакомства]> <мой_guid> <guid_сервера> [порт моста]`
 //! (порт знакомства по умолчанию 40000, моста — 51821). Окружение: `REORDER_WAIT_MS`
 //! (начальное ожидание буфера порядка, 8; 0 — выключить), `DATA_HOLES` (0 — данные через
-//! все живые дыры), `RUNTIME=multi` (многопоточный tokio; по умолчанию однопоточный), `RUST_LOG`,
+//! все живые дыры), `TUN_ADDR=10.80.0.2/24` — режим TUN без WireGuard (IP-пакеты по дырам как есть;
+//! ещё `TUN_NAME` — `hp0`, `TUN_MTU` — 1400), `RUNTIME=multi` (многопоточный tokio; по умолчанию однопоточный), `RUST_LOG`,
 //! `LOG_TARGET=syslog` (OpenWrt).
 
 use std::net::SocketAddr;
@@ -70,6 +71,10 @@ async fn run() -> Result<()> {
         local_port_base: 0,
     };
 
+    if let Ok(tun_addr) = std::env::var("TUN_ADDR") {
+        return run_tun(&tun_addr, server, my_id, server_id, options).await;
+    }
+
     // Порт моста занимаем первым: ошибку «адрес занят» лучше получить до сети.
     let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], local_port)))
         .await
@@ -95,9 +100,50 @@ async fn run() -> Result<()> {
     }
 }
 
+/// `ip/префикс`.
+fn parse_cidr(value: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (ip, prefix) = value.split_once('/').context("ожидается ip/префикс")?;
+    let prefix: u8 = prefix.parse().context("префикс")?;
+    anyhow::ensure!(prefix <= 32, "префикс больше 32");
+    Ok((ip.parse().context("ip")?, prefix))
+}
+
+/// Режим TUN: IP-пакеты по дырам как есть (без WireGuard).
+async fn run_tun(tun_addr: &str, server: SocketAddr, my_id: Uuid, server_id: Uuid, options: MultiLinkOptions) -> Result<()> {
+    let config = hp_tun::TunConfig {
+        name: std::env::var("TUN_NAME").unwrap_or_else(|_| "hp0".into()),
+        address: Some(parse_cidr(tun_addr).context("TUN_ADDR")?),
+        mtu: Some(env_number("TUN_MTU", 1400u16)?),
+        up: true,
+    };
+    let tun = hp_tun::Tun::create(&config).context("создание TUN (нужны права root)")?;
+    log::info!("vps-client: сервер {server}, TUN {} {tun_addr}", tun.name());
+    let (link, incoming) =
+        MultiLink::start_discovery("", Discovery::VpsClient { server }, my_id, server_id, options).await?;
+    let link = Arc::new(link);
+    let bridge = hp_tun::bridge::Bridge::start(tun, link.clone(), incoming);
+    let mut last = None;
+    loop {
+        tokio::time::sleep(STATUS_INTERVAL).await;
+        let now = (link.live_count(), bridge.stats().snapshot());
+        if Some(now) != last {
+            let (to, ordered, from, dropped) = now.1;
+            log::info!("дыры {}/{TARGET_LINKS}, к серверу {to} (TCP с номером {ordered}), от сервера {from}, потеряно {dropped}", now.0);
+            last = Some(now);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cidr_parses() {
+        assert_eq!(parse_cidr("10.80.0.2/24").unwrap(), ("10.80.0.2".parse().unwrap(), 24));
+        assert!(parse_cidr("10.80.0.2").is_err());
+        assert!(parse_cidr("10.80.0.2/33").is_err());
+    }
 
     #[test]
     fn server_address_with_or_without_port() {

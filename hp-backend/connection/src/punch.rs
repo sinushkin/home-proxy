@@ -79,6 +79,8 @@ pub enum LinkEvent {
     PeerData { slot: u8, payload: Packet },
     /// Пир прислал обёрнутый пакет (`WrappedData`) по дыре `slot`.
     PeerWrapped { slot: u8, seq: u64, client_id: u32, payload: Packet },
+    /// Пир прислал IP-пакет с номером в потоке (`Ordered`, TUN-режим).
+    PeerOrdered { slot: u8, flow: u32, seq: u64, payload: Packet },
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +163,9 @@ impl Drop for AbortOnDrop {
 /// Общая keep-alive-таска держит по одному такому на каждую живую дыру.
 pub struct LinkSender {
     socket: Arc<UdpSocket>,
+    /// Адрес, к которому сокет подключён (`connect`, режим `vps-client`): туда шлём `send` без
+    /// адреса — ядро берёт закешированный маршрут вместо поиска на каждый `sendto`.
+    connected: Option<SocketAddr>,
     /// Текущий эндпоинт пира: его обновляет `receive_loop` по каждому валидному пакету
     /// (у пира может быть несколько провайдеров/маршрутов, адрес отправителя меняется).
     endpoint: watch::Receiver<Option<SocketAddr>>,
@@ -189,8 +194,16 @@ impl LinkSender {
         let Some(peer_addr) = self.peer_addr() else { return };
         let msg = self.identity.lite(payload);
         let packet = codec::encode(&msg, &self.identity.peer_key);
-        if self.socket.send_to(&packet, peer_addr).await.is_ok() {
+        if self.send_to_peer(&packet, peer_addr).await.is_ok() {
             self.stats.sent.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn send_to_peer(&self, packet: &[u8], peer_addr: SocketAddr) -> std::io::Result<usize> {
+        if self.connected == Some(peer_addr) {
+            self.socket.send(packet).await
+        } else {
+            self.socket.send_to(packet, peer_addr).await
         }
     }
 
@@ -229,9 +242,20 @@ impl LinkSender {
         self.send_raw(&buf[..n]).await;
     }
 
+    /// Отправить IP-пакет с номером в потоке (`Ordered`, TUN-режим) по этой дыре.
+    pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8]) {
+        let mut buf = [0u8; PACKET_CAP];
+        let slot = u32::from(self.identity.slot);
+        let Some(n) = wire::encode_ordered(slot, flow, seq, payload, &self.identity.peer_key, &mut buf) else {
+            log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
+            return;
+        };
+        self.send_raw(&buf[..n]).await;
+    }
+
     async fn send_raw(&self, packet: &[u8]) {
         let Some(peer_addr) = self.peer_addr() else { return };
-        if self.socket.send_to(packet, peer_addr).await.is_ok() {
+        if self.send_to_peer(packet, peer_addr).await.is_ok() {
             self.stats.sent.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -387,6 +411,7 @@ pub async fn establish(
 
     let link_id = identity.link_id();
     let sender = Arc::new(LinkSender {
+        connected: socket.peer_addr().ok(),
         socket,
         endpoint,
         identity: identity.clone(),
@@ -454,6 +479,10 @@ async fn receive_loop(
                 Fast::Wrapped { slot, seq, payload, client_id } => (
                     slot,
                     Packet::copy_from(payload).map(|payload| LinkEvent::PeerWrapped { slot: identity.slot, seq, client_id, payload }),
+                ),
+                Fast::Ordered { slot, flow, seq, payload } => (
+                    slot,
+                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerOrdered { slot: identity.slot, flow, seq, payload }),
                 ),
             };
             if lite_slot != u32::from(identity.slot) {
@@ -549,6 +578,11 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
         Some(lite::Payload::Wrapped(w)) => {
             if let Some(payload) = Packet::copy_from(&w.payload) {
                 let _ = events.send(LinkEvent::PeerWrapped { slot, seq: w.seq, client_id: w.client_id, payload }).await;
+            }
+        }
+        Some(lite::Payload::Ordered(o)) => {
+            if let Some(payload) = Packet::copy_from(&o.payload) {
+                let _ = events.send(LinkEvent::PeerOrdered { slot, flow: o.flow, seq: o.seq, payload }).await;
             }
         }
         // last_seen/received уже обновлены выше.

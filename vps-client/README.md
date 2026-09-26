@@ -13,4 +13,7 @@ vps-client <ip_сервера[:порт_знакомства]> <мой_guid> <gu
 (начальное ожидание буфера порядка, 8; 0 — выключить), `DATA_HOLES` (0 — данные через все
 живые дыры), `RUST_LOG`, `LOG_TARGET=syslog` (на OpenWrt логи читаются `logread`).
 
+Режим TUN без WireGuard: `TUN_ADDR=10.80.0.2/24` (ещё `TUN_NAME`, `TUN_MTU`) — клиент сам поднимает
+интерфейс и возит IP-пакеты по дырам (нужен root и `/dev/net/tun`), см. `../OpenWRT/Tun.md`.
+
 Сборка под OpenWrt (mipsel) — `../OpenWRT/README.md`, `OpenWRT/build.sh`.

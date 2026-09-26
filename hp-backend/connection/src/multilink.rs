@@ -88,6 +88,8 @@ pub struct Incoming {
     /// Нагрузка в буфере из банка (`pool`): буфер вернётся в банк, когда пакет отправят дальше.
     pub payload: Packet,
     pub wrapped: Option<WrappedInfo>,
+    /// Номер в потоке (`Ordered`, TUN-режим): корзина и номер; по нему восстанавливается порядок.
+    pub order: Option<(u32, u64)>,
 }
 
 /// Порядковые номера обёрнутых пакетов: свой счётчик на каждого клиента.
@@ -596,6 +598,14 @@ impl MultiLink {
         Ok((link.slot, seq))
     }
 
+    /// Отправляет IP-пакет с номером в потоке (`Ordered`, TUN-режим): получатель вернёт порядок
+    /// внутри корзины `flow`. Возвращает номер дыры.
+    pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8]) -> Result<u8> {
+        let link = self.choose_link(payload.len())?;
+        link.sender.send_ordered(flow, seq, payload).await;
+        Ok(link.slot)
+    }
+
     pub fn live_count(&self) -> usize {
         self.registry.lock().unwrap().live_count()
     }
@@ -743,15 +753,18 @@ async fn control_loop(
                 request_redrop(&redrop_txs, slot);
             }
             LinkEvent::PeerData { slot, payload } => {
-                deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None }, &mut ready).await;
+                deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: None }, &mut ready).await;
             }
             LinkEvent::PeerWrapped { slot, seq, client_id, payload } => {
                 let Ok(client_id) = u8::try_from(client_id) else {
                     log::warn!("{label}слот {slot}: WrappedData с client_id {client_id} вне 0..=255");
                     continue;
                 };
-                let packet = Incoming { slot, payload, wrapped: Some(WrappedInfo { client_id, seq }) };
+                let packet = Incoming { slot, payload, wrapped: Some(WrappedInfo { client_id, seq }), order: None };
                 deliver(&incoming, &mut reorder, packet, &mut ready).await;
+            }
+            LinkEvent::PeerOrdered { slot, flow, seq, payload } => {
+                deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: Some((flow, seq)) }, &mut ready).await;
             }
             LinkEvent::PeerRendezvous(r) => {
                 match rendezvous::peer_session_from(&r) {
@@ -923,6 +936,11 @@ async fn slot_worker(mut ctx: SlotCtx) {
             }
             SlotMode::VpsClient => {
                 log::info!("{label}слот {}: идём на порт сервера {}", ctx.slot, peer.addr);
+                // Сокет слота говорит только с этим портом сервера: подключаем, чтобы ядро не
+                // искало маршрут на каждый пакет (заодно чужие адреса отсекаются в ядре).
+                if let Err(e) = ctx.socket.connect(peer.addr).await {
+                    log::warn!("{label}слот {}: connect к {}: {e}", ctx.slot, peer.addr);
+                }
                 vec![peer.addr]
             }
         };
@@ -1387,6 +1405,19 @@ mod tests {
         server.send_data(b"pong").await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), client_rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.payload, b"pong");
+
+        // TUN-режим: пакеты с номером в потоке выходят у получателя по порядку.
+        for seq in 0..20u64 {
+            let mut packet = vec![0x45u8; 60];
+            packet[59] = seq as u8;
+            server.send_ordered(5, seq, &packet).await.unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < 20 {
+            let p = tokio::time::timeout(Duration::from_secs(2), client_rx.recv()).await.unwrap().unwrap();
+            got.push(p.order.unwrap());
+        }
+        assert_eq!(got, (0..20u64).map(|s| (5u32, s)).collect::<Vec<_>>());
 
         let old = client.live_links().into_iter().find(|l| l.0 == 3).unwrap().1.unwrap();
         server.move_slot(3).await;

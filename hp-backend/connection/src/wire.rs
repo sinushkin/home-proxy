@@ -1,4 +1,4 @@
-//! Быстрый путь кодека для пакетов данных (`Lite` с `Data` или `WrappedData`): сборка сразу в
+//! Быстрый путь кодека для пакетов данных (`Lite` с `Data`, `WrappedData` или `Ordered`): сборка сразу в
 //! буфер вызывающего и разбор без выделения памяти. Формат — тот же protobuf, что даёт prost
 //! (проверяется тестами байт-в-байт); всё остальное (`Init`, keep-alive, статистика, оферы)
 //! по-прежнему кодируется prost'ом. Маскировка — как в `codec` (XOR первых
@@ -15,12 +15,17 @@ const DATA_PAYLOAD: u8 = 1 << 3 | 2;
 const WRAPPED_SEQ: u8 = 1 << 3;
 const WRAPPED_PAYLOAD: u8 = 2 << 3 | 2;
 const WRAPPED_CLIENT: u8 = 3 << 3;
+const LITE_ORDERED: u8 = 8 << 3 | 2;
+const ORDERED_FLOW: u8 = 1 << 3;
+const ORDERED_SEQ: u8 = 2 << 3;
+const ORDERED_PAYLOAD: u8 = 3 << 3 | 2;
 
 /// Разобранный пакет данных (ссылки внутрь буфера приёма).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Fast<'a> {
     Data { slot: u32, payload: &'a [u8] },
     Wrapped { slot: u32, seq: u64, payload: &'a [u8], client_id: u32 },
+    Ordered { slot: u32, flow: u32, seq: u64, payload: &'a [u8] },
 }
 
 fn varint_len(mut v: u64) -> usize {
@@ -127,6 +132,27 @@ pub fn encode_wrapped(slot: u32, seq: u64, payload: &[u8], client_id: u32, key: 
     })
 }
 
+/// `Lite { slot, ordered: Ordered { flow, seq, payload } }` в `out`, замаскированный.
+pub fn encode_ordered(slot: u32, flow: u32, seq: u64, payload: &[u8], key: &XorKey, out: &mut [u8]) -> Option<usize> {
+    let inner_len = varint_field_len(u64::from(flow)) + varint_field_len(seq) + bytes_field_len(payload.len());
+    write_lite(out, key, slot, LITE_ORDERED, inner_len, |w| {
+        if flow != 0 {
+            w.byte(ORDERED_FLOW)?;
+            w.varint(u64::from(flow))?;
+        }
+        if seq != 0 {
+            w.byte(ORDERED_SEQ)?;
+            w.varint(seq)?;
+        }
+        if !payload.is_empty() {
+            w.byte(ORDERED_PAYLOAD)?;
+            w.varint(payload.len() as u64)?;
+            w.bytes(payload)?;
+        }
+        Some(())
+    })
+}
+
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -180,7 +206,7 @@ pub fn parse(buf: &[u8]) -> Option<Fast<'_>> {
     while !r.done() {
         match r.byte()? {
             LITE_SLOT if slot.is_none() => slot = Some(r.varint()? as u32),
-            tag @ (LITE_DATA | LITE_WRAPPED) if body.is_none() => body = Some((tag, r.bytes()?)),
+            tag @ (LITE_DATA | LITE_WRAPPED | LITE_ORDERED) if body.is_none() => body = Some((tag, r.bytes()?)),
             _ => return None,
         }
     }
@@ -196,6 +222,18 @@ pub fn parse(buf: &[u8]) -> Option<Fast<'_>> {
             }
         }
         return Some(Fast::Data { slot, payload: payload.unwrap_or(&[]) });
+    }
+    if tag == LITE_ORDERED {
+        let (mut flow, mut seq, mut payload) = (None, None, None);
+        while !r.done() {
+            match r.byte()? {
+                ORDERED_FLOW if flow.is_none() => flow = Some(r.varint()? as u32),
+                ORDERED_SEQ if seq.is_none() => seq = Some(r.varint()?),
+                ORDERED_PAYLOAD if payload.is_none() => payload = Some(r.bytes()?),
+                _ => return None,
+            }
+        }
+        return Some(Fast::Ordered { slot, flow: flow.unwrap_or(0), seq: seq.unwrap_or(0), payload: payload.unwrap_or(&[]) });
     }
     let (mut seq, mut payload, mut client_id) = (None, None, None);
     while !r.done() {
@@ -217,7 +255,7 @@ pub fn parse(buf: &[u8]) -> Option<Fast<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{lite, peer_message, Data, KeepAlive, Lite, PeerMessage, WrappedData};
+    use crate::proto::{lite, peer_message, Data, KeepAlive, Lite, Ordered, PeerMessage, WrappedData};
     use prost::Message as _;
 
     fn data_msg(slot: u32, payload: Vec<u8>) -> PeerMessage {
@@ -261,6 +299,28 @@ mod tests {
                 let expected = codec::encode(&wrapped_msg(4, seq, payload.clone(), client_id), &key);
                 let n = encode_wrapped(4, seq, &payload, client_id, &key, &mut out).unwrap();
                 assert_eq!(&out[..n], &expected[..], "seq {seq}, client {client_id}, len {len}");
+            }
+        }
+    }
+
+    fn ordered_msg(slot: u32, flow: u32, seq: u64, payload: Vec<u8>) -> PeerMessage {
+        PeerMessage {
+            body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(lite::Payload::Ordered(Ordered { flow, seq, payload })) })),
+        }
+    }
+
+    #[test]
+    fn ordered_is_byte_for_byte_what_prost_produces_and_parses_back() {
+        let key = codec::random_key();
+        let mut out = [0u8; 1500];
+        for (flow, seq) in [(0u32, 0u64), (1, 1), (15, 127), (7, 128), (3, u64::from(u32::MAX) + 9)] {
+            for len in lens() {
+                let payload: Vec<u8> = (0..len).map(|i| (i * 5) as u8).collect();
+                let expected = codec::encode(&ordered_msg(6, flow, seq, payload.clone()), &key);
+                let n = encode_ordered(6, flow, seq, &payload, &key, &mut out).unwrap();
+                assert_eq!(&out[..n], &expected[..], "flow {flow}, seq {seq}, len {len}");
+                let plain = ordered_msg(6, flow, seq, payload.clone()).encode_to_vec();
+                assert_eq!(parse(&plain), Some(Fast::Ordered { slot: 6, flow, seq, payload: &payload }));
             }
         }
     }

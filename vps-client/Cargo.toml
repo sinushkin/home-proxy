@@ -12,3 +12,4 @@ anyhow = { workspace = true }
 connection = { path = "../hp-backend/connection" }
 hp-client = { path = "../hp-backend/client" }
 hp-logging = { path = "../hp-backend/logging" }
+hp-tun = { path = "../hp-backend/tun" }
