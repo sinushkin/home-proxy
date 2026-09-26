@@ -66,10 +66,9 @@ const HOLE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
 /// Не судим о качестве дыры по выборке меньше этого числа пакетов.
 const MIN_STATS_SAMPLE: u64 = 5;
 
-/// Максимальный размер полезной нагрузки одного `send_data`/`send_wrapped`: с
+/// Максимальный размер полезной нагрузки одного `send_data`/`send_client`: с
 /// запасом (протокольные заголовки ~30 байт) влезает в приёмный буфер (1500
-/// байт). Пакет WireGuard на 32 байта длиннее вложенного, так что MTU
-/// WireGuard за роутером — не больше 1368.
+/// байт с подписью). Это IP-пакет целиком: MTU TUN — не больше 1400.
 pub const MAX_DATA_LEN: usize = 1400;
 
 /// Что известно об обёрнутом пакете (`WrappedData`).
@@ -352,7 +351,7 @@ impl Drop for ClearOnDrop {
 }
 
 /// Запущенный менеджер.
-/// Сколько ждём недостающий пакет WireGuard, прежде чем отдать накопленное дальше.
+/// Сколько ждём недостающий TCP-пакет, прежде чем отдать накопленное дальше.
 pub const DEFAULT_REORDER_WAIT: Duration = Duration::from_millis(8);
 
 /// Настройки `MultiLink`.
@@ -593,16 +592,6 @@ impl MultiLink {
         let link = self.choose_link(payload.len())?;
         link.sender.send_data(payload).await;
         Ok(link.slot)
-    }
-
-    /// Оборачивает `payload` в `WrappedData` для клиента `client_id` (с его
-    /// порядковым номером) и отправляет по одной из живых дыр. Возвращает номер
-    /// дыры и присвоенный `seq`.
-    pub async fn send_wrapped(&self, client_id: u8, payload: &[u8]) -> Result<(u8, u64)> {
-        let link = self.choose_link(payload.len())?;
-        let seq = self.wrap_seq.lock().unwrap().next(client_id);
-        link.sender.send_wrapped(seq, u32::from(client_id), None, payload).await;
-        Ok((link.slot, seq))
     }
 
     /// Отправляет пакет клиента `client_id` (`WrappedData`). `order` — корзина TCP-потока и номер в
@@ -1295,22 +1284,19 @@ mod tests {
         assert!(d >= KEEPALIVE_MIN && d < KEEPALIVE_MAX);
     }
 
-    fn wg_event(counter: u64) -> LinkEvent {
-        let mut payload = vec![0u8; 48];
-        payload[0] = 4;
-        payload[4..8].copy_from_slice(&7u32.to_le_bytes());
-        payload[8..16].copy_from_slice(&counter.to_le_bytes());
-        LinkEvent::PeerData { slot: (counter % 10) as u8, payload: Packet::copy_from(&payload).unwrap() }
+    /// TCP-пакет корзины 7 с номером `counter`.
+    fn tcp_event(counter: u64) -> LinkEvent {
+        LinkEvent::PeerOrdered { slot: (counter % 10) as u8, flow: 7, seq: counter, payload: Packet::copy_from(&[0x45u8; 48]).unwrap() }
     }
 
     fn counter_of(packet: &Incoming) -> u64 {
-        crate::reorder::parse_transport(&packet.payload).unwrap().1
+        packet.order.unwrap().1
     }
 
-    /// Пакеты WireGuard, пришедшие по разным дырам не по порядку, выходят к приложению
+    /// TCP-пакеты, пришедшие по разным дырам не по порядку, выходят к приложению
     /// по порядку; пропавший пакет ждём `reorder_wait`, потом отдаём остальное.
     #[tokio::test]
-    async fn control_loop_restores_wireguard_order_and_skips_a_missing_packet() {
+    async fn control_loop_restores_tcp_order_and_skips_a_missing_packet() {
         let (events_tx, events_rx) = mpsc::channel(16);
         let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
         let wait = Duration::from_millis(60);
@@ -1325,7 +1311,7 @@ mod tests {
         ));
 
         for counter in [0u64, 2, 1, 3] {
-            events_tx.send(wg_event(counter)).await.unwrap();
+            events_tx.send(tcp_event(counter)).await.unwrap();
         }
         let mut got = Vec::new();
         for _ in 0..4 {
@@ -1334,8 +1320,8 @@ mod tests {
         assert_eq!(got, vec![0, 1, 2, 3], "порядок восстановлен без ожидания таймаута");
 
         // 4 пропал: 5 и 6 придерживаются и выходят только после ожидания
-        events_tx.send(wg_event(5)).await.unwrap();
-        events_tx.send(wg_event(6)).await.unwrap();
+        events_tx.send(tcp_event(5)).await.unwrap();
+        events_tx.send(tcp_event(6)).await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(20), incoming_rx.recv()).await.is_err());
         let first = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv()).await.unwrap().unwrap();
         let second = tokio::time::timeout(Duration::from_millis(50), incoming_rx.recv()).await.unwrap().unwrap();
@@ -1357,7 +1343,7 @@ mod tests {
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
         ));
         for counter in [0u64, 2, 1] {
-            events_tx.send(wg_event(counter)).await.unwrap();
+            events_tx.send(tcp_event(counter)).await.unwrap();
         }
         let mut got = Vec::new();
         for _ in 0..3 {

@@ -1,36 +1,39 @@
-# wsl — home-proxy в лёгком образе WSL2
+# wsl — home-proxy на Windows в лёгком образе WSL2
 
-Вместо нативной службы Windows (`../windows/`) вся Linux-часть работает внутри WSL2:
-WireGuard с NAT и `server` (дыры → WireGuard). Образ на базе Alpine, около 7 МБ в архиве.
+Домашний ПК на Windows (схема без роутера OpenWrt): `hp-server` работает внутри WSL2. Он сам
+поднимает интерфейс TUN `hp0`, принимает IP-пакеты телефона по дырам и пишет их в TUN; дальше
+пакеты выходят через NAT WSL и Windows — тем же путём, что и остальной трафик ПК (в том числе
+через ваш домашний VPN). Образ на базе Alpine, несколько мегабайт в архиве.
 
 ```
-телефон -> 10 дыр ==== интернет ==== WSL2 (Alpine): server -> 127.0.0.1:51820 -> wghp (10.77.0.1)
-                                                    -> iptables MASQUERADE -> eth0 -> Windows -> интернет
+телефон -> 10 дыр ==== интернет ==== WSL2 (Alpine): hp-server -> hp0 (10.80.0.1/16)
+                                         -> iptables MASQUERADE -> eth0 -> Windows -> интернет
 ```
 
-Всё то, что на Windows приходилось обходить (`PostUp` не выполняется, нет NAT-модуля,
-брандмауэр, служба под SYSTEM), здесь работает как на Linux: `wg-quick` с `PostUp`,
-`iptables`, `wg set`.
+Раньше вместо TUN здесь был WireGuard (`wg-quick`), а до WSL — нативная служба Windows с
+WireGuard и NAT через ICS; от обоих отказались: WireGuard лишний раз шифрует уже
+зашифрованный HTTPS, а на Windows без WSL нет ни TUN, ни нормального NAT.
 
 ## Что в образе
 
-- Alpine 3.20: `wireguard-tools`, `iptables` (nf_tables), `iproute2`.
-- `/usr/local/bin/homeproxy-server` — `server`, статический musl-бинарник (3,3 МБ).
+- Alpine 3.20: `iptables` (nf_tables), `iproute2`.
+- `/usr/local/bin/homeproxy-server` — `hp-server`, статический musl-бинарник.
 - `/etc/wsl.conf`: `[boot] command` запускает `homeproxy-start` при старте дистрибутива,
   `[interop] enabled=false` и `appendWindowsPath=false` (из дистрибутива нельзя запускать
   программы Windows и они не попадают в `PATH`).
-- `/usr/local/bin/homeproxy-start`: поднимает `wg-quick up wghp` и запускает `server` в цикле
-  (перезапуск через 5 с при падении). Логи — `/var/log/homeproxy.log`.
-  `/usr/local/bin/homeproxy-stop` останавливает службу и туннель, не останавливая WSL.
+- `/usr/local/bin/homeproxy-start`: включает пересылку, ставит `MASQUERADE` для подсети
+  туннеля (из `TUN_ADDR`, по умолчанию `10.80.0.0/16`) на интерфейс маршрута по умолчанию и
+  запускает `hp-server` в цикле (перезапуск через 5 с при падении). Логи —
+  `/var/log/homeproxy.log`. `/usr/local/bin/homeproxy-stop` останавливает службу, не
+  останавливая WSL.
 - systemd не нужен.
 
-Настройки лежат в `/etc/homeproxy/` (образ приходит с пустым каталогом; без файлов
+Настройки лежат в `/etc/homeproxy/` (образ приходит с пустым каталогом; без `server.env`
 `homeproxy-start` только пишет об этом в лог):
 
 | Файл | Что |
 |---|---|
-| `server.env` | как `hp-server/.env`: `STUN_ADDR`, `MQTT_ADDR`, `MQTT_CA=ca.crt`, `MY_ID`, `PEER_ID` |
-| `wghp.conf` | конфиг WireGuard с `PostUp`/`PostDown` (их делает `wireguard/gen.sh`) |
+| `server.env` | как `hp-server/.env.example`: `STUN_ADDR`, `MQTT_ADDR`, `MQTT_CA=ca.crt`, `MY_ID`, `PEER_ID`, при желании `TUN_ADDR` |
 | `ca.crt` | CA-сертификат брокера (путь из `MQTT_CA` считается от каталога `server.env`) |
 
 ## 1. Что нужно
@@ -49,20 +52,15 @@ WireGuard с NAT и `server` (дыры → WireGuard). Образ на базе 
 wsl/build.sh          # результат: wsl/out/homeproxy-wsl.tar.gz
 ```
 
-Внутри `docker build` собирает `server` в `rust:alpine` (`musl`, статически) и кладёт его в
+Внутри `docker build` собирает `hp-server` в `rust:alpine` (`musl`, статически) и кладёт его в
 чистый Alpine. Каталог `wsl/out/` в git не попадает. Перенесите архив на Windows.
 
 ## 3. Подготовить настройки
 
-Ключи, GUID'ы и `wghp.conf` делает `wireguard/gen.sh`. В WSL2 внешний интерфейс — `eth0`, а
-`gen.sh` по умолчанию берёт интерфейс своей машины, поэтому укажите его явно:
-
-```bash
-WG_OUT_IFACE=eth0 wireguard/gen.sh          # или WG_OUT_DIR=out/wsl WG_OUT_IFACE=eth0 ./gen.sh
-```
-
-`server.env` создайте по образцу `hp-server/.env.example`, `MQTT_CA=ca.crt`, `MY_ID = PC_ID`,
-`PEER_ID = PHONE_ID` из `guids.env`. Файлы должны быть с окончаниями строк LF.
+`server.env` — по образцу `hp-server/.env.example`: `MQTT_CA=ca.crt`, `MY_ID` — GUID ПК,
+`PEER_ID` — GUID телефона (оба генерируются заранее, например `uuidgen`; телефону нужны те же два
+GUID наоборот). В приложении на телефоне адрес в туннеле — любой из подсети `TUN_ADDR`, кроме
+адреса самого ПК, например `10.80.1.1`. Файлы должны быть с окончаниями строк LF.
 
 ## 4. Импортировать и запустить
 
@@ -77,26 +75,27 @@ wsl -d homeproxy -u root --exec true            # первый запуск, ч�
 `\\wsl.localhost\homeproxy\etc\homeproxy\`):
 
 ```powershell
-Copy-Item .\server.env, .\wghp.conf, .\ca.crt \\wsl.localhost\homeproxy\etc\homeproxy\
+Copy-Item .\server.env, .\ca.crt \\wsl.localhost\homeproxy\etc\homeproxy\
 wsl --terminate homeproxy
-wsl -d homeproxy -u root --exec true            # boot command поднимает туннель и server
+wsl -d homeproxy -u root --exec true            # boot command ставит NAT и запускает hp-server
 ```
 
 Проверка:
 
 ```powershell
-wsl -d homeproxy -u root --exec wg show wghp
+wsl -d homeproxy -u root --exec ip addr show hp0
 wsl -d homeproxy -u root --exec tail -n 30 /var/log/homeproxy.log
 ```
 
-В логе `server` должны появиться строки `рандеву (MQTT): подключено`, дальше — `дыра открыта`.
+В логе должны появиться строки `NAT 10.80.0.0/16 -> eth0`, `рандеву (MQTT): подключено`,
+дальше — `дыра открыта`.
 
 ## 5. Держать WSL запущенным
 
 WSL2 останавливает дистрибутив, как только закрывается последняя сессия `wsl.exe`, **даже
-если внутри работает `server`**: фоновые процессы из `boot command` его не удерживают (проверено:
-после завершения `ssh`-команды с `wsl.exe` через секунды `server` пропал, а все дыры пира
-потерялись). Поэтому нужна постоянная сессия. Простейший способ — фоновый процесс:
+если внутри работает `hp-server`**: фоновые процессы из `boot command` его не удерживают
+(проверено: после завершения `ssh`-команды с `wsl.exe` через секунды служба пропала, а все дыры
+пира потерялись). Поэтому нужна постоянная сессия. Простейший способ — фоновый процесс:
 
 ```powershell
 wsl -d homeproxy -u root --exec sleep infinity          # держит дистрибутив запущенным
@@ -117,11 +116,12 @@ schtasks /Create /SC ONLOGON /TN homeproxy-wsl /TR "wsl.exe -d homeproxy -u root
   networkingMode=mirrored
   ```
   Тогда WSL2 делит сетевые интерфейсы с Windows (тот же адрес, общий loopback), пробив
-  надёжнее, а порты можно открывать напрямую. Имя внешнего интерфейса в `wghp.conf` (`PostUp`)
-  проверьте командой `ip route` внутри дистрибутива.
+  надёжнее. `homeproxy-start` берёт внешний интерфейс из маршрута по умолчанию.
+- **VPN на Windows.** Если весь трафик ПК идёт через VPN, STUN должен видеть тот же адрес, с
+  которого идут дыры: [`../windows/stun-bypass.ps1`](../windows/README.md).
 - **Localhost forwarding.** Порт, слушающий `127.0.0.1` внутри WSL2, доступен из Windows как
   `127.0.0.1` (в NAT-режиме работает `localhostForwarding`, в `mirrored` loopback общий). Это
-  нужно для будущего `control` (трей на Windows обращается к `server` в WSL2 по TCP).
+  нужно для будущего `control` (трей на Windows обращается к `hp-server` в WSL2 по TCP).
 
 ## 7. Обновление и удаление
 
@@ -132,23 +132,20 @@ schtasks /Create /SC ONLOGON /TN homeproxy-wsl /TR "wsl.exe -d homeproxy -u root
 
 ## Если вы ставите Ubuntu вместо образа
 
-То же можно сделать руками: `apt install wireguard-tools iptables`, положить
-`homeproxy-server` (статический бинарник из образа или своя сборка) и запускать по
-`[boot] command` в `/etc/wsl.conf` (или через systemd: `[boot] systemd=true`). Файлы
-`homeproxy-start` и `wsl.conf` из `wsl/rootfs/` подойдут как есть.
+То же можно сделать руками: `apt install iptables iproute2`, положить `homeproxy-server`
+(статический бинарник из образа или своя сборка) и запускать по `[boot] command` в
+`/etc/wsl.conf` (или через systemd: `[boot] systemd=true`). Файлы `homeproxy-start` и
+`wsl.conf` из `wsl/rootfs/` подойдут как есть (`ipcalc` в Ubuntu другой — подсеть проще
+вписать в скрипт руками).
 
 ## Что проверено
 
-- Образ собирается: 7 МБ в архиве, `server` 3,3 МБ. В привилегированном контейнере с одноразовой
-  парой ключей и GUID `homeproxy-start` поднимает `wghp`, ставит `MASQUERADE`, `server`
-  подключается к MQTT.
-- **В настоящем WSL2** (тестовая ВМ Windows 10 22H2 под KVM, WSL 2.7.14, ядро 6.18.33.2):
-  `wsl --import` проходит, `[boot] command` при старте дистрибутива поднимает `wghp` (ядерный
-  WireGuard в ядре WSL есть), правило `MASQUERADE` ставится, `server` подключается к MQTT,
-  из дистрибутива есть выход в интернет (`ping 8.8.8.8`).
-- Пробив: `peer` на VPS без NAT открыл 10 из 10 дыр к `server` в WSL2 (NAT Windows/WSL, NAT
-  libvirt, NAT роутера) и держал их около двух минут без потерь, сообщение от пира создало
-  «прямого» клиента в `server`. Условие: дистрибутив удерживается сессией `wsl.exe`.
+- **В настоящем WSL2** (тестовая ВМ Windows 10 22H2 под KVM, WSL 2.7.14, ядро 6.18.33.2), ещё
+  в варианте с WireGuard: `wsl --import` проходит, `[boot] command` при старте дистрибутива
+  срабатывает, NAT ставится, служба подключается к MQTT, из дистрибутива есть выход в интернет.
+- Пробив: `peer` на VPS без NAT открыл 10 из 10 дыр к службе в WSL2 (NAT Windows/WSL, NAT
+  libvirt, NAT роутера) и держал их около двух минут без потерь. Условие: дистрибутив
+  удерживается сессией `wsl.exe`.
 
-**Не проверено:** телефон и рукопожатие WireGuard через дыры из WSL2, задача планировщика
+**Не проверено:** вариант с TUN в настоящем WSL2 и телефон через него, задача планировщика
 (`ONLOGON`), режим `mirrored` (нужна Windows 11).

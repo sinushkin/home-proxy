@@ -6,8 +6,6 @@
 //! `VpnService`) подключается позже, `attach_tun`, когда живёт хотя бы одна дыра, и отключается
 //! `detach_tun`, не трогая дыр. Пока TUN не подключён, пришедшее от пира отбрасывается.
 
-pub mod bridge;
-
 pub use connection::multilink::DEFAULT_REORDER_WAIT;
 pub use connection::stun::parse_servers as parse_stun_servers;
 

@@ -114,9 +114,11 @@ flowchart LR
     pc -.->|"адрес"| rdv
 ```
 
-**Состояние:** телефон уже работает без WireGuard, а `hp-server` на ПК пока принимает только
-WireGuard — его перевод на TUN (как у `vps-server`) в работе. Прежняя инструкция с WireGuard —
-[`wireguard/`](wireguard/README.md), Windows — [`windows/`](windows/README.md).
+`hp-server` — тот же TUN-сервер, что и на VPS: пакеты телефона пишутся в интерфейс `hp0`, в
+интернет выходят через NAT на ПК. Настройка — [`hp-server/`](hp-server/README.md), на Windows —
+[`wsl/`](wsl/README.md) и обход VPN для STUN [`windows/`](windows/README.md). **Состояние:** код
+общий с проверенной схемой через VPS, но телефон → ПК с TUN вживую ещё не проверялся (раньше
+эта схема работала на WireGuard).
 
 ## Как работают дыры
 
@@ -165,8 +167,7 @@ WireGuard — его перевод на TUN (как у `vps-server`) в раб�
 | `android-vpn/` | приложение для Android (Kotlin): свой VPN на TUN |
 | `OpenWRT/` | сборка под роутеры, настройка TUN и ускорение (`Tun.md`) |
 | `control/` | (описание) пульт управления: трей на Slint, сопряжение по QR с Android |
-| `wsl/`, `windows/` | домашний ПК на Windows: образ Alpine для WSL2, установка службы |
-| `wireguard/` | прежняя схема с WireGuard на ПК (уходит) |
+| `wsl/`, `windows/` | домашний ПК на Windows: образ Alpine для WSL2, обход VPN для STUN |
 | `cert/`, `mosquitto/`, `coturn/` | TLS, MQTT-брокер и STUN для рандеву-сервера |
 | `iPhone/` | заметки про iOS |
 
@@ -176,8 +177,8 @@ WireGuard — его перевод на TUN (как у `vps-server`) в раб�
 
 ## TODO
 
-- `hp-server` на ПК — TUN вместо WireGuard; убрать WireGuard из `vps-server`/`vps-client`.
-- `hp-router`: служба procd, README и пример настроек.
+- Проверить вживую схему телефон → ПК (`hp-server` на TUN, в том числе в WSL2).
+- `hp-router`: служба procd (сейчас запуск руками из `/tmp`).
 - Обход VPN для STUN на Linux: определять, идёт ли трафик домашнего ПК через VPN, и
   добавлять правило, чтобы STUN шёл напрямую. На Windows это уже есть
   ([`windows/stun-bypass.ps1`](windows/README.md)); без обхода STUN увидит адрес VPN, а не

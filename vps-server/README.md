@@ -1,11 +1,15 @@
 # `vps-server` — сервер с белым IP
 
 Обычная схема «клиент — сервер» поверх библиотеки `hp-backend` (не P2P): ни STUN, ни MQTT, ни
-пробива. Клиент ([`../vps-client`](../vps-client/README.md)) приходит на порт знакомства, сервер
-раздаёт ему случайные порты слотов из диапазона и сам переносит дыру на другой порт при
-просадках. Мост «дыры → WireGuard» и настройки — те же, что у [`hp-server`](../hp-server/README.md)
-(крейт переиспользует `hp_server::{bridge, settings, Common, serve}`). Как устроен обмен —
-`../hp-backend/connection/README.md`, «VPS-режим».
+пробива. Клиент (роутер [`../hp-router`](../hp-router/README.md) или хост с
+[`../vps-client`](../vps-client/README.md)) приходит на порт знакомства, сервер раздаёт ему
+случайные порты слотов из диапазона и сам переносит дыру на другой порт при просадках. Как
+устроен обмен — `../hp-backend/connection/README.md`, «VPS-режим».
+
+IP-пакеты клиента идут в интерфейс TUN (`hp0`) как есть, в интернет — через NAT подсети туннеля
+на VPS. Код сервера общий с [`hp-server`](../hp-server/README.md) (`hp_server::serve`), разница
+только в способе встречи. Раньше здесь был мост к WireGuard; от него отказались — на роутере
+WireGuard давал 10–12 Мбит/с против 21 без него (`../Performance.md`).
 
 | Переменная | Смысл |
 |---|---|
@@ -13,24 +17,28 @@
 | `VPS_BOOTSTRAP_PORT` | порт знакомства, по умолчанию 40000 |
 | `VPS_PORTS` | диапазон портов слотов `начало-конец`, по умолчанию `40001-49999` (порт знакомства вне его) |
 | `MY_ID`, `PEER_ID` | GUID сервера и GUID клиента |
-| `WG_ADDR`, `CLIENT_TIMEOUT_SECS`, `REORDER_WAIT_MS`, `DATA_HOLES`, `RUST_LOG`, `LOG_FILE` | как у `hp-server` |
+| `TUN_ADDR` | адрес сервера в туннеле и подсеть клиентов, по умолчанию `10.80.0.1/16` |
+| `TUN_NAME`, `TUN_MTU`, `REORDER_WAIT_MS`, `DATA_HOLES`, `RUST_LOG`, `LOG_FILE` | как у `hp-server` |
+| `RUNTIME=multi` | многопоточный tokio (по умолчанию однопоточный) |
 
 Брандмауэр должен пропускать входящий UDP на порт знакомства и весь `VPS_PORTS`: порты слотов
-случайные.
+случайные. NAT подсети туннеля наружу:
 
 ```bash
-cargo build --release -p vps-server           # target/release/vps-server
-./target/release/vps-server --config vps.env  # без --config: vps.env рядом с бинарником
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -s 10.80.0.0/16 -o <внешний интерфейс> -j MASQUERADE
+```
+
+```bash
+cargo build --release -p vps-server                # target/release/vps-server
+sudo ./target/release/vps-server --config vps.env  # без --config: vps.env рядом с бинарником
 ```
 
 Сервер обслуживает одного клиента (`PEER_ID`).
 
-Режим TUN без WireGuard: `VPS_TUN_ADDR=10.80.0.1/16` (ещё `VPS_TUN_NAME`, `VPS_TUN_MTU`) — IP-пакеты
-клиента идут в интерфейс `hp0` как есть; NAT подсети наружу настраивается отдельно. См.
-`../OpenWRT/Tun.md`.
-
 Телефоны за роутером: роутер перекладывает их пакеты как `WrappedData` с `client_id` (номера TCP
 ставит сам телефон). Сервер восстанавливает порядок по (клиент, корзина потока), пишет пакеты в
 тот же TUN и запоминает адрес источника → клиент; ответ на этот адрес уходит роутеру для того же
-клиента, со своими номерами. Поэтому префикс `VPS_TUN_ADDR` (и NAT) должен покрывать адреса
-телефонов: роутер — `10.80.0.2`, телефоны — `10.80.1.<n>`.
+клиента, со своими номерами. Поэтому префикс `TUN_ADDR` (и NAT) должен покрывать адреса
+телефонов: роутер — `10.80.0.2`, телефоны — `10.80.1.<n>`. Настройка целиком —
+`../OpenWRT/Tun.md`.

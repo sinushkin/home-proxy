@@ -1,19 +1,25 @@
 #!/bin/sh
-# Запускается WSL при старте дистрибутива ([boot] в /etc/wsl.conf): поднимает WireGuard
-# с NAT и следит за службой server (перезапуск при падении). Настройки — /etc/homeproxy.
+# Запускается WSL при старте дистрибутива ([boot] в /etc/wsl.conf): включает пересылку и NAT
+# подсети туннеля и следит за службой (перезапуск при падении). Интерфейс TUN (hp0) поднимает
+# сама служба. Настройки — /etc/homeproxy/server.env.
 CONF=/etc/homeproxy
 LOG=/var/log/homeproxy.log
 
-[ -f "$CONF/server.env" ] && [ -f "$CONF/wghp.conf" ] || {
-    echo "home-proxy: нет $CONF/server.env и $CONF/wghp.conf, служба не запущена" >> "$LOG"
+[ -f "$CONF/server.env" ] || {
+    echo "home-proxy: нет $CONF/server.env, служба не запущена" >> "$LOG"
     exit 0
 }
 
+# Подсеть туннеля: TUN_ADDR из server.env (по умолчанию 10.80.0.1/16) -> сеть для NAT.
+TUN_ADDR=$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?TUN_ADDR[[:space:]]*=[[:space:]]*//p' "$CONF/server.env" | tr -d "\"'" | tail -n 1)
+SUBNET=$(ipcalc -n -p "${TUN_ADDR:-10.80.0.1/16}" 2>/dev/null | awk -F= '/NETWORK/{n=$2} /PREFIX/{p=$2} END{if(n&&p) print n"/"p}')
+SUBNET=${SUBNET:-10.80.0.0/16}
+OUT=$(ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+
 sysctl -qw net.ipv4.ip_forward=1
-mkdir -p /etc/wireguard
-install -m 600 "$CONF/wghp.conf" /etc/wireguard/wghp.conf
-wg-quick down wghp >/dev/null 2>&1
-wg-quick up wghp >> "$LOG" 2>&1 || echo "home-proxy: wg-quick up не удался (см. выше)" >> "$LOG"
+iptables -t nat -C POSTROUTING -s "$SUBNET" -o "${OUT:-eth0}" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING -s "$SUBNET" -o "${OUT:-eth0}" -j MASQUERADE
+echo "home-proxy: NAT $SUBNET -> ${OUT:-eth0}" >> "$LOG"
 
 (
     while true; do

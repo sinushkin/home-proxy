@@ -1,5 +1,4 @@
 #!/bin/sh
-# Останавливает службу и туннель внутри дистрибутива (без остановки WSL).
+# Останавливает службу внутри дистрибутива (без остановки WSL); hp0 исчезает вместе с ней.
 pkill -f 'homeproxy-start' 2>/dev/null
 pkill -x homeproxy-server 2>/dev/null
-wg-quick down wghp 2>/dev/null

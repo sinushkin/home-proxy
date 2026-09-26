@@ -10,8 +10,8 @@
 //! Пробив шлёт `PeerMessage::Init` с полным GUID-заголовком (`receive_loop`
 //! принимает `Init` только с ожидаемым `from_peer_id` — заодно отсекает
 //! hairpin-эхо). После установки дыры идут `PeerMessage::Lite` (только slot).
-//! Адрес отправителя не проверяется: любой пакет с нашим слотом, прошедший XOR-вектор
-//! и protobuf, делает свой адрес текущим эндпоинтом пира (как роуминг в WireGuard),
+//! Адрес отправителя не проверяется: любой пакет с нашим слотом и верной подписью (`auth`)
+//! делает свой адрес текущим эндпоинтом пира (роуминг: у пира может смениться адрес),
 //! а `LinkSender` шлёт всегда на текущий эндпоинт. `PunchAck` уходит туда, откуда
 //! пришёл `Punch`.
 //!
@@ -222,8 +222,7 @@ impl LinkSender {
             .await;
     }
 
-    /// Отправить полезную нагрузку (в перспективе — WireGuard) по этой дыре.
-    /// Отправить полезную нагрузку (WireGuard) по этой дыре. Пакет собирается в буфере на
+    /// Отправить полезную нагрузку (IP-пакет без номера) по этой дыре. Пакет собирается в буфере на
     /// стеке (`wire`), без выделения памяти.
     pub async fn send_data(&self, payload: &[u8]) {
         log::trace!("слот {}: отправлено {} байт данных", self.identity.slot, payload.len());
@@ -835,7 +834,7 @@ mod tests {
 
         link_a
             .sender
-            .send_wrapped(42, 5, Some(3), b"wg-packet")
+            .send_wrapped(42, 5, Some(3), b"ip-packet")
             .await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), b_events.recv())
@@ -848,7 +847,7 @@ mod tests {
                 assert_eq!(seq, 42);
                 assert_eq!(client_id, 5);
                 assert_eq!(flow, Some(3));
-                assert_eq!(payload, b"wg-packet");
+                assert_eq!(payload, b"ip-packet");
             }
             other => panic!("ожидали PeerWrapped, пришло {other:?}"),
         }

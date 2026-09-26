@@ -3,7 +3,7 @@
 //! Kotlin-сторона — `ru.homeproxy.HomeProxy` (`android-vpn/app/src/main/java`).
 //! Одновременно работает не больше одного клиента: `nativeStart` поднимает
 //! свой tokio-рантайм и дыры, `nativeAttachTun` отдаёт клиенту дескриптор TUN от
-//! `VpnService` (IP-пакеты по дырам без WireGuard), `nativeDetachTun` его закрывает,
+//! `VpnService` (IP-пакеты по дырам как есть), `nativeDetachTun` его закрывает,
 //! `nativeStop` останавливает рантайм вместе со всеми задачами.
 //! Ошибки в Kotlin возвращаются строкой (null — успех), паники ловятся и не
 //! роняют процесс.

@@ -7,8 +7,8 @@ Xiaomi 4C / mt76x8), какие у этого особенности и как �
 
 ```bash
 TOOLCHAIN_DIR=~/owrt/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl ./OpenWRT/build.sh
-# результат: target/openwrt/mipsel-unknown-linux-musl/release/{peer,router} (~1.7 МБ каждый);
-# сервер (`server`) — обычный x86_64-бинарник для VPS, под роутер его не собирают
+# результат: target/openwrt/mipsel-unknown-linux-musl/release/{hp-router,peer,vps-client} (~2 МБ каждый);
+# серверы (`vps-server`, `hp-server`) — обычные x86_64-бинарники, под роутер их не собирают
 ```
 
 ## Что нужно
@@ -205,7 +205,7 @@ big-endian ath79 интерпретатор будет `ld-musl-mips-sf.so.1`; �
 
 ```bash
 ssh jump1 'mkdir -p /tmp/hp'
-scp -O target/openwrt/mipsel-unknown-linux-musl/release/{peer,router} cert/out/ca.crt jump1:/tmp/hp/
+scp -O target/openwrt/mipsel-unknown-linux-musl/release/{hp-router,peer} cert/out/ca.crt jump1:/tmp/hp/
 ```
 
 `jump1` в `~/.ssh/config` идёт через `ProxyJump`; `scp -O` нужен, потому что у
@@ -213,16 +213,15 @@ dropbear нет sftp. `ldd` на роутере (это символическа
 находит все зависимости:
 
 ```text
-# ldd /tmp/hp/router          (peer — то же самое)
+# ldd /tmp/hp/hp-router       (peer — то же самое)
 	/lib/ld-musl-mipsel-sf.so.1 (0x77d94000)
 	libgcc_s.so.1 => /lib/libgcc_s.so.1 (0x77bb2000)
 	libc.so => /lib/ld-musl-mipsel-sf.so.1 (0x77d94000)
 ```
 
-Оба бинарника запускаются на MT7628 (`peer` печатает usage, `router` — свою
+Оба бинарника запускаются на MT7628 (`peer` печатает usage, `hp-router` — свою
 ошибку конфигурации при пустом окружении), контрольные суммы на роутере
-совпадают с локальными. Сквозной запуск с телефоном на роутере ещё не
-проверялся.
+совпадают с локальными. Сквозной запуск с телефоном через роутер — `Tun.md`.
 
 ## Что проверено, а что нет
 
@@ -248,6 +247,6 @@ dropbear нет sftp. `ldd` на роутере (это символическа
 | `cannot find crt1.o` при линковке | не заданы `LINKER` и `link-self-contained=no` |
 | на роутере `Not found`/`can't execute` | не тот интерпретатор: бинарник под другой ABI (mips vs mipsel, hard/soft float) |
 
-WireGuard на роутере поверх `vps-client` (весь трафик LAN через VPS с белым IP), настройка по шагам
-и замер скорости — [`Wireguard.md`](Wireguard.md). То же без WireGuard, через TUN (вдвое быстрее на
-слабом роутере) — [`Tun.md`](Tun.md).
+Роутер как шлюз дома к VPS с белым IP и пир для телефонов (`hp-router`, TUN), настройка по шагам
+и замеры — [`Tun.md`](Tun.md). Раньше здесь же был WireGuard поверх `vps-client`: на этом роутере
+он давал 10–12 Мбит/с, через TUN без него — вдвое больше.

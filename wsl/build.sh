@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Собирает образ дистрибутива для WSL2 (Alpine + WireGuard + server) в wsl/out/homeproxy-wsl.tar.gz.
+# Собирает образ дистрибутива для WSL2 (Alpine + hp-server на TUN) в wsl/out/homeproxy-wsl.tar.gz.
 # Нужен docker. Импорт на Windows: wsl/install.ps1 (wsl --import).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

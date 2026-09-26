@@ -96,10 +96,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let payload = text.as_bytes();
                     if wrap {
-                        match multilink.send_wrapped(client_id, payload).await {
-                            Ok((slot, seq)) => log::info!(
-                                "отправлено по дыре [#{slot}] (обёрнуто, клиент {client_id}, seq={seq}): {text}"
-                            ),
+                        match multilink.send_client(client_id, None, payload).await {
+                            Ok(slot) => log::info!("отправлено по дыре [#{slot}] (обёрнуто, клиент {client_id}): {text}"),
                             Err(e) => log::warn!("не отправлено: {e:#}"),
                         }
                     } else {

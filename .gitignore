@@ -20,9 +20,11 @@ android-vpn/app/src/main/assets/ca.crt
 *.iml
 android-vpn/.kotlin/
 
-# WireGuard: ключи и конфиги (секретные)
+# Настройки с полными GUID (секрет пары)
+*.env
+!*.env.example
+# Прежняя схема с WireGuard: локальные ключи, если остались
 wireguard/out/
-android-vpn/app/src/main/assets/wg.conf
 
 # Образ WSL2 (сборка wsl/build.sh)
 wsl/out/

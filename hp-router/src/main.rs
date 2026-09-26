@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use connection::multilink::{Discovery, Incoming, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
-use connection::relay::DirectionStats;
 use hp_server::settings::Settings;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -159,7 +158,21 @@ fn main() -> Result<()> {
     runtime.block_on(run(config))
 }
 
-/// Счётчики пересылки телефонов (32 бита: на MIPS32 64-битных атомиков нет).
+/// Счётчики одного направления пересылки (32 бита: на MIPS32 64-битных атомиков нет).
+#[derive(Default)]
+struct DirectionStats {
+    forwarded: std::sync::atomic::AtomicU32,
+    dropped: std::sync::atomic::AtomicU32,
+}
+
+impl DirectionStats {
+    fn snapshot(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.forwarded.load(Relaxed), self.dropped.load(Relaxed))
+    }
+}
+
+/// Счётчики пересылки телефонов.
 #[derive(Default)]
 struct RelayStats {
     to_vps: DirectionStats,

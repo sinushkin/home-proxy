@@ -6,7 +6,6 @@ pub mod multilink;
 pub mod pool;
 pub mod port_utils;
 pub mod punch;
-pub mod relay;
 pub mod reorder;
 pub mod rendezvous;
 pub mod stun;

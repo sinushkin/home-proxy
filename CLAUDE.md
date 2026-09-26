@@ -45,8 +45,8 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   плейсхолдеры: `203.0.113.10` (`profit`), `203.0.113.20` (`ruhor`),
   `198.51.100.7` (домашний WAN). Реальные адреса лежат только в SSH-алиасах
   (`~/.ssh/config`) и в игнорируемых файлах.
-- Локальные секреты живут в `.gitignore`-путях: `hp-backend/peer/.env`, `hp-server/.env`, `router/.env`,
-  `cert/out/`, `wireguard/out/`, `android-vpn/local.properties`,
+- Локальные секреты живут в `.gitignore`-путях: `hp-backend/peer/.env`, `hp-server/.env`, `hp-router/router.env`,
+  `cert/out/`, `wsl/out/`, `android-vpn/local.properties`,
   `android-vpn/app/src/main/{assets,jniLibs}/`. Перед `git add` смотреть
   `git status`, не использовать `git add -A` вслепую.
 - Коммиты — с публичной личностью, глобальный git config не менять:
@@ -71,7 +71,8 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
 
 - `hp-backend/` — библиотечные крейты и `peer` (CLI для живых проверок), входят в Cargo
   workspace, корень которого — `Cargo.toml` в корне репозитория (там же `Cargo.lock`,
-  `target/`). Исполняемые службы `hp-server/` и `router/` лежат уровнем выше, но
+  `target/`). Исполняемые службы `hp-server/`, `hp-router/`, `vps-server/`, `vps-client/`
+  лежат уровнем выше, но
   собираются тем же workspace. Все
   версии зависимостей закреплены один раз в `[workspace.dependencies]`,
   крейты-участники подключают их через `{ workspace = true }` — никогда не
@@ -162,23 +163,21 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       ядра (базовое SSE2/NEON — 16 байт, AVX2 — 32, AVX-512 — 64), ядро
       выбирается в рантайме по `is_x86_feature_detected!`. Тесты сверяют
       каждое ядро с побайтовым эталоном на длинах 0..=300.
-    - `src/relay.rs` — релей роутера: `forward()` перекладывает `Incoming` из
-      одного `MultiLink` в другой через `Outbound` (`PlainOut` — обычная
-      `Data`, `WrappedOut` — `WrappedData` с `client_id`), `route_by_client()`
-      раскладывает пакеты сервера по телефонам; счётчики `DirectionStats`
-      (32-битные: на MIPS нет 64-битных атомиков).
     - `src/label.rs` — `Label`: метка набора дыр в логах (`[phone] `,
       `[server] `; пустая ничего не печатает).
-    - `src/reorder.rs` — буфер порядка пакетов WireGuard на приёме (по `receiver index` и
-      счётчику из открытого заголовка), адаптивное ожидание 3–30 мс по p99 отставания.
+    - `src/reorder.rs` — буфер порядка TCP-пакетов на приёме (по корзине потока и номеру от
+      отправителя: `Ordered`, `WrappedData` с корзиной — ключ ещё и по клиенту), адаптивное
+      ожидание 3–30 мс по p99 отставания. Пакеты без номера идут сразу. (Раньше разбирал
+      счётчик из заголовка WireGuard.)
     - `src/vps.rs` — VPS-режим (белый IP сервера): порт знакомства вместо MQTT, случайные
       порты слотов из диапазона, пассивный пробив на сервере; `MultiLink::start_discovery`
       с `Discovery::{StunMqtt, VpsServer, VpsClient}`, `MultiLink::move_slot`.
-    - `src/lib.rs` — подключает модули (`codec`, `label`, `link_id`,
-      `multilink`, `port_utils`, `punch`, `relay`, `reorder`, `rendezvous`, `stun`, `vps`,
-      `xor`, `proto`).
-  - `client/` — крейт `hp-client`: клиент телефона (`MultiLink` + локальный UDP-
-    мост `Bridge` «WireGuard <-> дыры»), ядро Android-библиотеки, проверяется на хосте.
+    - `src/lib.rs` — подключает модули (`auth`, `codec`, `label`, `link_id`,
+      `multilink`, `pool`, `port_utils`, `punch`, `reorder`, `rendezvous`, `stun`, `vps`,
+      `wire`, `xor`, `proto`).
+  - `client/` — крейт `hp-client`: клиент телефона (`MultiLink` + мост TUN ↔ дыры,
+    `attach_tun`/`detach_tun`), ядро Android-библиотеки, проверяется на хосте. Раньше тут был
+    UDP-мост для WireGuard на `127.0.0.1`.
   - `android-lib/` — крейт `homeproxy-android`: JNI-обёртка над `hp-client`
     (`libhomeproxy.so`, `Java_ru_homeproxy_HomeProxy_*`); собирается под NDK
     скриптом `android-vpn/build-native.sh`.
@@ -188,7 +187,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     Проверка на машине — `hp-tun-check`. `hp-backend/tun/README.md`.
   - `logging/` — крейт `hp-logging`: общая инициализация логов (`env_logger`
     без regex, `LOG_TARGET=syslog` — в syslog для OpenWrt (только Unix), `LOG_FILE=путь` —
-    дописывать в файл: у службы Windows нет консоли; `init_with(get)` берёт настройки
+    дописывать в файл; `init_with(get)` берёт настройки
     не из окружения, а из переданной функции).
   - `peer/` — бинарный крейт, CLI-обвязка: поднимает `MultiLink`, шлёт по
     Enter набранную строку пиру (`отправлено по дыре [#N]: ...`) и печатает
@@ -203,57 +202,47 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     брокера) — оба GUID'а операторы знают заранее (например,
     `uuidgen`), сам бинарник их не генерирует. Примеры команд — в
     `hp-backend/peer/README.md`.
-- `router/` — бинарный крейт, релей телефоны ↔ сервер: набор из 10 дыр к
-  серверу и по набору к каждому телефону (`PHONE_<n>_*`, n = `client_id`,
-  u8). От телефона принимает `Data`, оборачивает в
-  `WrappedData { client_id }` и шлёт серверу; от сервера по `client_id`
-  находит телефон, разворачивает и шлёт ему `Data`. Настройки —
-  переменные окружения (`run.sh` + `.env`), описание и проверка —
-  `router/README.md`.
-- `hp-server/` — крейт (библиотека + бинарник `hp-server`), мост клиенты → WireGuard (как
-  `server-rs`): для каждого клиента свой локальный UDP-сокет
-  `127.0.0.1:0` к `WG_ADDR`, неактивные клиенты удаляются. Клиент — либо
-  `client_id` за роутером (`WrappedData`, ответ обёрнутый с тем же
-  `client_id`), либо телефон напрямую (обычная `Data`, «прямой» клиент,
-  ответ тоже обычной `Data`). Собирается и под Windows: `src/settings.rs` — файл
-  настроек `server.env` (`KEY=VALUE`, `--config`, по умолчанию `server.env` рядом с
-  бинарником; переменная окружения главнее файла; относительные пути — от каталога
-  файла), `src/winsvc.rs` (только `cfg(windows)`) — служба `homeproxy-server`:
-  `hp-server install --config …` / `uninstall` / `--service` (запуск диспетчером служб,
-  остановка по SCM). Читатель ответов моста переживает рестарт WireGuard
-  (`ConnectionReset`/`ConnectionRefused` — не конец клиента). `hp-server/README.md`.
-  Библиотека (`bridge`, `settings`, `Common`, `serve`) переиспользуется `vps-server`.
+- `hp-router/` — бинарный крейт для роутера OpenWrt, две роли в одном процессе: шлюз дома
+  (TUN `hp0` ↔ 10 дыр к `vps-server`, как `vps-client`) и P2P-пир для телефонов (`PHONE_<n>_*`,
+  n = `client_id`, u8): пакеты телефона не разбирает и не упорядочивает, перекладывает к VPS как
+  `WrappedData { client_id, flow? }` с номерами телефона (`MultiLinkOptions::reorder_clients =
+  false`), ответы VPS — обратно телефону. Сокеты дыр телефонов, STUN и MQTT идут мимо `hp0`
+  (маршрут по умолчанию в `hp0` — только для LAN, правило по источнику). Настройки —
+  `router.env` (`router.env.example`), `hp-router/README.md`, `OpenWRT/Tun.md`. Раньше на этом
+  месте был `router` — релей телефоны ↔ ПК для WireGuard.
+- `hp-server/` — крейт (библиотека + бинарник `hp-server`), домашний ПК: дыры (STUN + MQTT) → TUN
+  (`TUN_ADDR`, по умолчанию `10.80.0.1/16`) → NAT на ПК. `serve(discovery, common)` поднимает TUN,
+  `MultiLink` и мост `hp_tun::bridge`; клиенты — телефон напрямую или телефоны за роутером
+  (адрес источника → `client_id`). `src/settings.rs` — файл настроек `server.env` (`KEY=VALUE`,
+  `--config`, по умолчанию `server.env` рядом с бинарником; переменная окружения главнее файла;
+  относительные пути — от каталога файла). Только Linux (на Windows — в WSL2). Библиотека
+  (`settings`, `Common`, `serve`) переиспользуется `vps-server` и `hp-router`. Раньше был мост к
+  WireGuard (сокет на клиента к `WG_ADDR`) и служба Windows. `hp-server/README.md`.
 - `vps-server/`, `vps-client/` — схема «клиент — сервер» для VPS с белым IP (не P2P):
-  без STUN, MQTT и пробива (`connection::vps`). `vps-server` — мост `hp-server` с
-  `Discovery::VpsServer` (`VPS_PUBLIC_IP`, `VPS_BOOTSTRAP_PORT`, `VPS_PORTS`), `vps-client` — мост
-  `hp_client::bridge` с `Discovery::VpsClient`. Android их не использует; `vps-client` собирается
-  под OpenWrt. Режим TUN без WireGuard (`TUN_ADDR` / `VPS_TUN_ADDR`): мост `hp_tun::bridge`, TCP
-  идёт `Ordered` (номер в корзине потока, порядок восстанавливает `reorder`), прочее — `Data`
-  сразу. `OpenWRT/Tun.md`.
+  без STUN, MQTT и пробива (`connection::vps`). `vps-server` — `hp_server::serve` с
+  `Discovery::VpsServer` (`VPS_PUBLIC_IP`, `VPS_BOOTSTRAP_PORT`, `VPS_PORTS`, `TUN_ADDR`),
+  `vps-client` — TUN + `Discovery::VpsClient` для хоста (на роутере — `hp-router`). TCP идёт
+  `Ordered` (номер в корзине потока, порядок восстанавливает `reorder`), прочее — `Data` сразу.
+  Android их не использует. `OpenWRT/Tun.md`.
 - `control/` — только описание (`README.md`): протокол управления (тот же protobuf, без XOR, TCP в
   «демилитаризованной зоне»: loopback или доверенная LAN), трей на Slint, показ QR с пакетом
-  сопряжения и его сканирование в Android. Кода пока нет; `hp-server`/`router` от него не зависят.
-- `wsl/` — образ для WSL2 (Alpine + `wireguard-tools` + `iptables` + статический `server`): `Dockerfile`,
+  сопряжения (полные GUID пары, адрес в туннеле) и его сканирование в Android. Кода пока нет.
+- `wsl/` — образ для WSL2 (Alpine + `iptables` + статический `hp-server`): `Dockerfile`,
   `build.sh` (→ `wsl/out/homeproxy-wsl.tar.gz`, в git нет), `rootfs/` (`wsl.conf` с `[boot] command`,
-  `homeproxy-start`/`homeproxy-stop`). Настройки — `/etc/homeproxy/{server.env,wghp.conf,ca.crt}`.
-  Проверен в контейнере и в настоящем WSL2 на тестовой ВМ (пробив 10/10 с VPS); дистрибутив надо
-  удерживать сессией `wsl.exe`, иначе WSL останавливает его вместе со `server`. `wsl/README.md`.
-- `windows/` — установка службы на Windows: `install.ps1` (WireGuard-туннель `wghp`
-  из `wghp.conf` без PostUp/PostDown, NAT через `New-NetNat`, правило брандмауэра,
-  служба после туннеля, обход VPN для STUN), `uninstall.ps1`, `stun-bypass.ps1`
-  (если маршрут до STUN идёт не через физический адаптер, добавляет /32-маршрут
-  через физический шлюз; `-WhatIf`, `-Remove`). PowerShell-файлы — UTF-8 **с BOM**
-  (иначе PowerShell 5.1 ломает кириллицу); NAT — `New-NetNat` или ICS (`-Nat`). `windows/README.md`,
-  `hp-server/WINDOWS.md`.
-- `wireguard/` — схема «телефон -> дыры -> этот ПК -> интернет» без роутера:
-  `gen.sh` (ключи и конфиги WireGuard, GUID'ы; результат в `wireguard/out/`, в git
-  не попадает) и README по пунктам (WireGuard `wghp` на ПК, прокси-служба
-  `homeproxy-server`, APK с ключами, запуск на телефоне, сетевые оговорки).
+  `homeproxy-start` — пересылка, `MASQUERADE` подсети туннеля, запуск службы в цикле;
+  `homeproxy-stop`). Настройки — `/etc/homeproxy/{server.env,ca.crt}`. В контейнере проверено:
+  `hp0` поднимается, NAT ставится. Дистрибутив надо удерживать сессией `wsl.exe`, иначе WSL
+  останавливает его вместе со службой. `wsl/README.md`.
+- `windows/` — только `stun-bypass.ps1` (если маршрут до STUN идёт не через физический адаптер,
+  добавляет /32-маршрут через физический шлюз; `-WhatIf`, `-Remove`) и README. PowerShell-файлы —
+  UTF-8 **с BOM** (иначе PowerShell 5.1 ломает кириллицу). Нативная служба Windows с WireGuard и
+  NAT (ICS) удалена вместе с WireGuard.
 - `iPhone/` — только заметки (`README.md`): что нужно для iOS-клиента (Mac, платный
   Apple Developer Program, Network Extension) и почему это отложено. Кода нет.
-- `android-vpn/` — Android-приложение (Kotlin, Gradle): экран, foreground-сервис,
-  VPN на библиотеке WireGuard; сначала поднимаются дыры с keep-alive, VPN
-  включается только при наличии живых дыр. Тулчейн — NDK 26.1 как в
+- `android-vpn/` — Android-приложение (Kotlin, Gradle): экран, foreground-сервис, свой
+  `HpVpnService` (TUN `10.80.1.<n>/32`, маршрут на всё, приложение исключено из VPN, дескриптор
+  отдаётся ядру через JNI); сначала поднимаются дыры с keep-alive, VPN включается только при
+  наличии живых дыр. Раньше — библиотека WireGuard. Тулчейн — NDK 26.1 как в
   `build-android.sh`. Сборка, проверка из adb — `android-vpn/README.md`.
 - `docker-compose.yml` — локальный dev-стек: `stun` (coturn, только STUN) и
   `mqtt` (Eclipse Mosquitto, только TLS-порт `8883`). Порты переопределяются
@@ -298,7 +287,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     только `slot` (короткий заголовок — меньше сигнатура). Принимается с любого
     адреса при верном слоте и подписи, адрес отправителя становится текущим эндпоинтом.
     - `KeepAlive { seq }` — держит NAT-маппинг живым (случайный период 2..10 c).
-    - `Data { payload }` — нагрузка поверх дыры (будущий WireGuard).
+    - `Data { payload }` — IP-пакет без номера (UDP, ICMP) поверх дыры.
     - `Stats { links: [LinkStat{slot, sent, received}] }` — статистика пакетов
       по всем дырам (раз в 10 c).
     - `DeleteLink { slot }` — команда пиру удалить линк (пробиваем заново).
@@ -382,12 +371,10 @@ NAT/провайдерами.
   тестовая Windows-машина: Rust MSVC и git есть, `protoc` лежит в
   `C:\Users\user\tools\protoc`, исходники синхронизируем `tar` через ssh в
   `C:\Users\user\home-proxy` и собираем там (`set PROTOC=…`, `cargo build --release -p hp-server`).
-  WireGuard для Windows установлен, `New-NetNat` не работает (нет WMI-провайдера NetNat),
-  поэтому NAT на ВМ — через ICS (`install.ps1 -Nat Auto` выбирает его сам). Ловушки и выводы —
-  `hp-server/WINDOWS.md`. Сквозная проверка с телефоном на этой ВМ
-  проходила (дыры 10/10, рукопожатие WireGuard, ping туннеля) с отдельной парой из
-  `wireguard/out/win/` (`WG_OUT_DIR=out/win ./gen.sh`). Скрипты для
-  PowerShell через ssh запускаем как `-File` (stdin-режим ломает многострочные блоки).
+  WSL2 на ней работает (CPU ВМ — `Skylake-Client-noTSX-IBRS` + `vmx`). Раньше здесь проверялась
+  нативная служба с WireGuard (NAT через ICS: `New-NetNat` без WMI-провайдера не работает) —
+  теперь только WSL2 (`wsl/`). Скрипты для PowerShell через ssh запускаем как `-File`
+  (stdin-режим ломает многострочные блоки).
 - Тестовые прогоны — только со свежими одноразовыми GUID
   (`cat /proc/sys/kernel/random/uuid`): `exchange()` публикует retained-запись
   на топик *своего* имени (первая группа GUID), так что тест с чужим GUID затирает регистрацию
