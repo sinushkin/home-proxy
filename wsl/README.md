@@ -1,5 +1,9 @@
 # wsl — home-proxy на Windows в лёгком образе WSL2
 
+Запасной вариант. Основной путь на Windows — нативный `hp-server.exe` (свой сетевой стек, без
+WSL и прав): [`../windows/README.md`](../windows/README.md). WSL2 нужен, если хочется Linux-режима
+`tun` (ядро и NAT вместо стека в процессе).
+
 Домашний ПК на Windows (схема без роутера OpenWrt): `hp-server` работает внутри WSL2. Он сам
 поднимает интерфейс TUN `hp0`, принимает IP-пакеты телефона по дырам и пишет их в TUN; дальше
 пакеты выходят через NAT WSL и Windows — тем же путём, что и остальной трафик ПК (в том числе
@@ -119,7 +123,9 @@ schtasks /Create /SC ONLOGON /TN homeproxy-wsl /TR "wsl.exe -d homeproxy -u root
   Тогда WSL2 делит сетевые интерфейсы с Windows (тот же адрес, общий loopback), пробив
   надёжнее. `homeproxy-start` берёт внешний интерфейс из маршрута по умолчанию.
 - **VPN на Windows.** Если весь трафик ПК идёт через VPN, STUN должен видеть тот же адрес, с
-  которого идут дыры: [`../windows/stun-bypass.ps1`](../windows/README.md).
+  которого идут дыры: [`../windows/stun-bypass.ps1`](../windows/README.md). Автоопределение
+  `BIND_ADDR` внутри WSL не поможет: для Windows весь трафик WSL — один поток. Нативный
+  `hp-server.exe` обходит VPN сам.
 - **Localhost forwarding.** Порт, слушающий `127.0.0.1` внутри WSL2, доступен из Windows как
   `127.0.0.1` (в NAT-режиме работает `localhostForwarding`, в `mirrored` loopback общий). Это
   нужно для будущего `control` (трей на Windows обращается к `hp-server` в WSL2 по TCP).

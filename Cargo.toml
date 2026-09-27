@@ -42,4 +42,6 @@ hmac = "0.12"
 # Свой сетевой стек процесса (hp-netstack): TCP/UDP телефона завершаются в hp-server и уходят
 # обычными сокетами — без TUN и NAT (Windows). На роутер не собирается.
 ipstack = "1"
+# Адреса интерфейсов машины: hp-server ищет физический адаптер мимо VPN (BIND_ADDR=auto).
+if-addrs = "0.15"
 etherparse = { version = "0.20", default-features = false, features = ["std"] }

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod bind;
 pub mod codec;
 pub mod label;
 pub mod link_id;

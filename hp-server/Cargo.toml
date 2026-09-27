@@ -13,6 +13,7 @@ connection = { path = "../hp-backend/connection" }
 hp-logging = { path = "../hp-backend/logging" }
 hp-tun = { path = "../hp-backend/tun" }
 hp-netstack = { path = "../hp-backend/netstack", optional = true }
+if-addrs = { workspace = true }
 
 [features]
 default = ["netstack"]

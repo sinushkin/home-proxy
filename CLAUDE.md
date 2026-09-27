@@ -172,7 +172,11 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     - `src/vps.rs` — VPS-режим (белый IP сервера): порт знакомства вместо MQTT, случайные
       порты слотов из диапазона, пассивный пробив на сервере; `MultiLink::start_discovery`
       с `Discovery::{StunMqtt, VpsServer, VpsClient}`, `MultiLink::move_slot`.
-    - `src/lib.rs` — подключает модули (`auth`, `codec`, `label`, `link_id`,
+    - `src/bind.rs` — `udp(ip, port, ifindex)`: сокет слота на адресе и, на Linux, на интерфейсе
+      (`SO_BINDTOIFINDEX`, без прав на ядре 5.7+): там маршрут выбирается по назначению, и сокет с
+      адресом `eth0` без привязки к интерфейсу всё равно ушёл бы в VPN. На Windows хватает адреса.
+      `MultiLinkOptions::{bind_ip, bind_ifindex}`.
+    - `src/lib.rs` — подключает модули (`auth`, `bind`, `codec`, `label`, `link_id`,
       `multilink`, `pool`, `port_utils`, `punch`, `reorder`, `rendezvous`, `stun`, `vps`,
       `wire`, `xor`, `proto`).
   - `client/` — крейт `hp-client`: клиент телефона (`MultiLink` + мост TUN ↔ дыры,
@@ -183,8 +187,15 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
     скриптом `android-vpn/build-native.sh`.
   - `tun/` — крейт `hp-tun`: свой TUN (`libc` + `AsyncFd`, без сторонних tun-крейтов): `Tun::create`
     (Linux, OpenWrt — нужен `kmod-tun`, WSL2), `Tun::from_fd` (Android `VpnService`), `packet` —
-    разбор IPv4/IPv6 (протокол, порты, `flow_hash`). Тест с ядром — `unshare -rn cargo test -p hp-tun`.
-    Проверка на машине — `hp-tun-check`. `hp-backend/tun/README.md`.
+    разбор IPv4/IPv6 (протокол, порты, `flow_hash`). Кроссплатформенно: `device::PacketDevice`
+    (TUN или канал в памяти `channel_pair()`), `bridge::Bridge` (клиент: запрос адреса и DNS),
+    `hub::Hub` (сервер: маршрут по выданному адресу, проверка источника). Тест с ядром —
+    `unshare -rn cargo test -p hp-tun`. Проверка на машине — `hp-tun-check`. `hp-backend/tun/README.md`.
+  - `netstack/` — крейт `hp-netstack`: свой сетевой стек процесса (`ipstack`) для
+    `hp-server MODE=netstack`: TCP/UDP телефона завершаются в процессе и открываются заново
+    обычными сокетами ОС (значит, идут маршрутами ПК — в том числе через его VPN), ping отвечает
+    сам. Без TUN, NAT и прав — так работает Windows. Окно TCP 64 КБ без масштабирования (около
+    6 Мбит/с на соединение при 80 мс RTT).
   - `logging/` — крейт `hp-logging`: общая инициализация логов (`env_logger`
     без regex, `LOG_TARGET=syslog` — в syslog для OpenWrt (только Unix), `LOG_FILE=путь` —
     дописывать в файл; `init_with(get)` берёт настройки
@@ -219,7 +230,13 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   `MultiLink` и мост `hp_tun::bridge`; клиенты — телефон напрямую или телефоны за роутером
   (адрес источника → `client_id`). `src/settings.rs` — файл настроек `server.env` (`KEY=VALUE`,
   `--config`, по умолчанию `server.env` рядом с бинарником; переменная окружения главнее файла;
-  относительные пути — от каталога файла). Только Linux (на Windows — в WSL2). Библиотека
+  относительные пути — от каталога файла). `MODE=tun` (Linux, root, NAT подсети) или `netstack`
+  (`hp-netstack`, по умолчанию на Windows — нативно, без WSL). `src/bypass.rs` — `BIND_ADDR`
+  (`auto` по умолчанию, IP или `off`): STUN по маршруту по умолчанию и с каждого адреса машины
+  (на Linux — с привязкой к интерфейсу), ответы сравниваются по каждому серверу отдельно (к
+  разным серверам домашняя сеть может выходить с разных адресов); адаптер, через который ответ
+  другой (или есть, когда по умолчанию тишина), — путь мимо VPN, к нему привязываются сокеты
+  дыр. Соединения телефона при этом идут через VPN ПК. Библиотека
   (`settings`, `Common`, `serve`) переиспользуется `vps-server` и `hp-router`. Раньше был мост к
   WireGuard (сокет на клиента к `WG_ADDR`) и служба Windows. `hp-server/README.md`.
 - `vps-server/`, `vps-client/` — схема «клиент — сервер» для VPS с белым IP (не P2P):
@@ -237,8 +254,9 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   `homeproxy-stop`). Настройки — `/etc/homeproxy/{server.env,ca.crt}`. В контейнере проверено:
   `hp0` поднимается, NAT ставится. Дистрибутив надо удерживать сессией `wsl.exe`, иначе WSL
   останавливает его вместе со службой. `wsl/README.md`.
-- `windows/` — только `stun-bypass.ps1` (если маршрут до STUN идёт не через физический адаптер,
-  добавляет /32-маршрут через физический шлюз; `-WhatIf`, `-Remove`) и README. PowerShell-файлы —
+- `windows/` — README (нативный `hp-server.exe`, `MODE=netstack`, основной путь на Windows) и
+  `stun-bypass.ps1` (для WSL2: если маршрут до STUN идёт не через физический адаптер,
+  добавляет /32-маршрут через физический шлюз; `-WhatIf`, `-Remove`). PowerShell-файлы —
   UTF-8 **с BOM** (иначе PowerShell 5.1 ломает кириллицу). Нативная служба Windows с WireGuard и
   NAT (ICS) удалена вместе с WireGuard.
 - `iPhone/` — только заметки (`README.md`): что нужно для iOS-клиента (Mac, платный
@@ -378,10 +396,16 @@ NAT/провайдерами.
   тестовая Windows-машина: Rust MSVC и git есть, `protoc` лежит в
   `C:\Users\user\tools\protoc`, исходники синхронизируем `tar` через ssh в
   `C:\Users\user\home-proxy` и собираем там (`set PROTOC=…`, `cargo build --release -p hp-server`).
-  WSL2 на ней работает (CPU ВМ — `Skylake-Client-noTSX-IBRS` + `vmx`). Раньше здесь проверялась
-  нативная служба с WireGuard (NAT через ICS: `New-NetNat` без WMI-провайдера не работает) —
-  теперь только WSL2 (`wsl/`). Скрипты для PowerShell через ssh запускаем как `-File`
-  (stdin-режим ломает многострочные блоки).
+  WSL2 на ней работает (CPU ВМ — `Skylake-Client-noTSX-IBRS` + `vmx`). Нативный `hp-server.exe`
+  (`MODE=netstack`) проверен здесь с эмулятором телефона и с полным туннелем OpenVPN (`BIND_ADDR`).
+  Процесс, запущенный из ssh, умирает вместе с сессией — долгие прогоны через WMI
+  (`Win32_Process.Create`). Скрипты для PowerShell через ssh запускаем как `-File`
+  (stdin-режим ломает многострочные блоки). Установленный клиент OpenVPN — без конфига.
+- `test` (SSH-алиас, libvirt-ВМ на этом ПК, Debian 13, `sudo` без пароля, `openvpn` стоит) —
+  Linux-машина для проверок с VPN на ПК: полный туннель OpenVPN до `profit` (клиентский
+  сертификат выпускается локальным easy-rsa; порт `1194/udp` на `profit` закрыт и открывается
+  только на время теста). Из домашней сети канал данных OpenVPN режет ТСПУ — это тоже годится
+  для проверки «маршрут по умолчанию в VPN».
 - Тестовые прогоны — только со свежими одноразовыми GUID
   (`cat /proc/sys/kernel/random/uuid`): `exchange()` публикует retained-запись
   на топик *своего* имени (первая группа GUID), так что тест с чужим GUID затирает регистрацию

@@ -386,11 +386,14 @@ pub struct MultiLinkOptions {
     /// адаптера уводит дыры мимо VPN на этой машине: система отправляет пакет с интерфейса, которому
     /// принадлежит адрес источника (Windows — всегда, Linux — при правиле по источнику).
     pub bind_ip: Option<IpAddr>,
+    /// Номер интерфейса, к которому привязать сокеты слотов (Linux: без него сокет с адресом
+    /// физического адаптера всё равно ушёл бы по маршруту по умолчанию — в VPN); см. `bind`.
+    pub bind_ifindex: Option<u32>,
 }
 
 impl Default for MultiLinkOptions {
     fn default() -> Self {
-        Self { reorder_wait: DEFAULT_REORDER_WAIT, data_holes: 0, local_port_base: 0, reorder_clients: true, bind_ip: None }
+        Self { reorder_wait: DEFAULT_REORDER_WAIT, data_holes: 0, local_port_base: 0, reorder_clients: true, bind_ip: None, bind_ifindex: None }
     }
 }
 
@@ -498,7 +501,7 @@ impl MultiLink {
             };
             let bind_ip = options.bind_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]));
             let socket = Arc::new(
-                UdpSocket::bind((bind_ip, port))
+                crate::bind::udp(bind_ip, port, options.bind_ifindex)
                     .await
                     .with_context(|| format!("не удалось создать сокет для слота {slot}"))?,
             );
@@ -519,6 +522,7 @@ impl MultiLink {
                 peer_id,
                 pair: pair.clone(),
                 bind_ip,
+                bind_ifindex: options.bind_ifindex,
                 announce,
                 registry: registry.clone(),
                 punch: punch.clone(),
@@ -889,6 +893,7 @@ struct SlotCtx {
     peer_id: Uuid,
     pair: PairSecret,
     bind_ip: IpAddr,
+    bind_ifindex: Option<u32>,
     announce: Announce,
     registry: Arc<Mutex<LinkRegistry>>,
     punch: PunchConfig,
@@ -914,7 +919,7 @@ async fn slot_worker(mut ctx: SlotCtx) {
         let rebound = match &ctx.mode {
             SlotMode::Stun(_) => None,
             SlotMode::VpsServer { ports, bootstrap_port, .. } => Some(vps::bind_random_port(ports, *bootstrap_port).await),
-            SlotMode::VpsClient => Some(UdpSocket::bind((ctx.bind_ip, 0)).await.context("сокет слота")),
+            SlotMode::VpsClient => Some(crate::bind::udp(ctx.bind_ip, 0, ctx.bind_ifindex).await.context("сокет слота")),
         };
         match rebound {
             Some(Ok(socket)) => ctx.socket = Arc::new(socket),
