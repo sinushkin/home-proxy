@@ -12,4 +12,10 @@ anyhow = { workspace = true }
 connection = { path = "../hp-backend/connection" }
 hp-logging = { path = "../hp-backend/logging" }
 hp-tun = { path = "../hp-backend/tun" }
+hp-netstack = { path = "../hp-backend/netstack", optional = true }
+
+[features]
+default = ["netstack"]
+# Свой сетевой стек (MODE=netstack): Windows и ПК без root. На роутер не нужен (hp-router — без него).
+netstack = ["dep:hp-netstack"]
 

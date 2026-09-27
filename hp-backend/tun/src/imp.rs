@@ -7,24 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
-/// Настройки нового интерфейса.
-#[derive(Clone, Debug)]
-pub struct TunConfig {
-    /// Имя (`hp0`) или шаблон ядра (`hp%d`); пусто — выберет ядро (`tun0`, `tun1`, …).
-    pub name: String,
-    /// Адрес IPv4 и длина префикса (`10.79.0.1/24`); `None` — не задавать.
-    pub address: Option<(Ipv4Addr, u8)>,
-    /// MTU; `None` — оставить по умолчанию (1500).
-    pub mtu: Option<u16>,
-    /// Поднять интерфейс (`IFF_UP`).
-    pub up: bool,
-}
-
-impl Default for TunConfig {
-    fn default() -> Self {
-        Self { name: String::new(), address: None, mtu: None, up: true }
-    }
-}
+use crate::TunConfig;
 
 /// TUN-интерфейс: чтение и запись по одному IP-пакету, асинхронно (tokio).
 pub struct Tun {

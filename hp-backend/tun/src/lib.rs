@@ -18,6 +18,26 @@ pub mod packet;
 
 use std::net::Ipv4Addr;
 
+/// Настройки нового интерфейса.
+#[derive(Clone, Debug)]
+pub struct TunConfig {
+    /// Имя (`hp0`) или шаблон ядра (`hp%d`); пусто — выберет ядро (`tun0`, `tun1`, …).
+    pub name: String,
+    /// Адрес IPv4 и длина префикса (`10.79.0.1/24`); `None` — не задавать.
+    pub address: Option<(Ipv4Addr, u8)>,
+    /// MTU; `None` — оставить по умолчанию (1500).
+    pub mtu: Option<u16>,
+    /// Поднять интерфейс (`IFF_UP`).
+    pub up: bool,
+}
+
+impl Default for TunConfig {
+    fn default() -> Self {
+        Self { name: String::new(), address: None, mtu: None, up: true }
+    }
+}
+
+
 /// Адрес интерфейса `ip/префикс` (`10.80.0.2/24`); `None`, если записано не так.
 pub fn parse_cidr(value: &str) -> Option<(Ipv4Addr, u8)> {
     let (ip, prefix) = value.trim().split_once('/')?;
@@ -36,14 +56,12 @@ mod tests {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod bridge;
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod device;
 pub mod hub;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use imp::{Tun, TunConfig};
+pub use imp::Tun;

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::bridge::{send_routed, BridgeStats, Sequencer};
 use crate::packet;
-use crate::Tun;
+use crate::device::PacketDevice;
 
 /// Кто за адресом: пир (по GUID его набора дыр) и клиент за ним (телефон за роутером).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -42,14 +42,14 @@ struct Routes {
 }
 
 /// Запущенный серверный мост; дроп останавливает его задачи.
-pub struct Hub {
-    tun: Arc<Tun>,
+pub struct Hub<D: PacketDevice> {
+    tun: Arc<D>,
     routes: Arc<Mutex<Routes>>,
     stats: Arc<BridgeStats>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl Drop for Hub {
+impl<D: PacketDevice> Drop for Hub<D> {
     fn drop(&mut self) {
         for task in self.tasks.lock().unwrap().iter() {
             task.abort();
@@ -57,8 +57,8 @@ impl Drop for Hub {
     }
 }
 
-impl Hub {
-    pub fn start(tun: Tun) -> Self {
+impl<D: PacketDevice> Hub<D> {
+    pub fn start(tun: D) -> Self {
         let tun = Arc::new(tun);
         let routes = Arc::new(Mutex::new(Routes::default()));
         let stats = Arc::new(BridgeStats::default());
@@ -106,7 +106,7 @@ impl Hub {
     }
 }
 
-async fn uplink(tun: Arc<Tun>, routes: Arc<Mutex<Routes>>, stats: Arc<BridgeStats>) {
+async fn uplink<D: PacketDevice>(tun: Arc<D>, routes: Arc<Mutex<Routes>>, stats: Arc<BridgeStats>) {
     let mut buf = [0u8; PACKET_CAP];
     loop {
         let n = match tun.recv(&mut buf).await {
@@ -135,8 +135,8 @@ async fn uplink(tun: Arc<Tun>, routes: Arc<Mutex<Routes>>, stats: Arc<BridgeStat
     }
 }
 
-async fn downlink(
-    tun: Arc<Tun>,
+async fn downlink<D: PacketDevice>(
+    tun: Arc<D>,
     peer: Uuid,
     mut incoming: mpsc::Receiver<Incoming>,
     routes: Arc<Mutex<Routes>>,

@@ -7,6 +7,7 @@ members = [
     "hp-backend/client",
     "hp-backend/android-lib",
     "hp-backend/tun",
+    "hp-backend/netstack",
     "hp-server",
     "vps-server",
     "vps-client",
@@ -38,3 +39,7 @@ android_logger = { version = "0.15", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = "0.12"
+# Свой сетевой стек процесса (hp-netstack): TCP/UDP телефона завершаются в hp-server и уходят
+# обычными сокетами — без TUN и NAT (Windows). На роутер не собирается.
+ipstack = "1"
+etherparse = { version = "0.20", default-features = false, features = ["std"] }

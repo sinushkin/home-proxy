@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::packet::{self, Proto};
-use crate::Tun;
+use crate::device::PacketDevice;
 
 /// Сколько корзин (счётчиков номеров) у TCP-потоков.
 pub const FLOW_BUCKETS: u32 = 16;
@@ -135,14 +135,14 @@ impl Drop for Bridge {
 
 impl Bridge {
     /// Клиентский конец: всё от сервера пишется в TUN.
-    pub fn start(tun: Tun, link: Arc<MultiLink>, incoming: mpsc::Receiver<Incoming>) -> Self {
+    pub fn start<D: PacketDevice>(tun: D, link: Arc<MultiLink>, incoming: mpsc::Receiver<Incoming>) -> Self {
         Self::spawn(tun, link, incoming, None)
     }
 
     /// Роутер: свой трафик — через TUN, как обычно, а пакеты клиентов (`WrappedData` от VPS)
     /// в TUN не пишутся, а уходят в `clients` — их перекладывают телефонам как есть.
-    pub fn start_relay(
-        tun: Tun,
+    pub fn start_relay<D: PacketDevice>(
+        tun: D,
         link: Arc<MultiLink>,
         incoming: mpsc::Receiver<Incoming>,
         clients: mpsc::Sender<Incoming>,
@@ -150,8 +150,8 @@ impl Bridge {
         Self::spawn(tun, link, incoming, Some(clients))
     }
 
-    fn spawn(
-        tun: Tun,
+    fn spawn<D: PacketDevice>(
+        tun: D,
         link: Arc<MultiLink>,
         incoming: mpsc::Receiver<Incoming>,
         relay: Option<mpsc::Sender<Incoming>>,
@@ -168,7 +168,7 @@ impl Bridge {
     }
 }
 
-async fn uplink(tun: Arc<Tun>, link: Arc<MultiLink>, stats: Arc<BridgeStats>) {
+async fn uplink<D: PacketDevice>(tun: Arc<D>, link: Arc<MultiLink>, stats: Arc<BridgeStats>) {
     let mut buf = [0u8; PACKET_CAP];
     let mut sequencer = Sequencer::default();
     loop {
@@ -185,7 +185,7 @@ async fn uplink(tun: Arc<Tun>, link: Arc<MultiLink>, stats: Arc<BridgeStats>) {
     }
 }
 
-async fn downlink(tun: Arc<Tun>, mut incoming: mpsc::Receiver<Incoming>, relay: Option<mpsc::Sender<Incoming>>, stats: Arc<BridgeStats>) {
+async fn downlink<D: PacketDevice>(tun: Arc<D>, mut incoming: mpsc::Receiver<Incoming>, relay: Option<mpsc::Sender<Incoming>>, stats: Arc<BridgeStats>) {
     while let Some(packet) = incoming.recv().await {
         if packet.wrapped.is_some() {
             match &relay {

@@ -14,8 +14,13 @@
 //!   ADDRESS_FILE — где хранить выданные адреса (`addresses.state` рядом с файлом настроек);
 //!   DNS — DNS для клиентов через запятую (по умолчанию — резолверы этой машины из resolv.conf;
 //!   в конце всегда 8.8.8.8, 1.1.1.1);
+//!   MODE — `tun` (интерфейс TUN + NAT подсети на машине; Linux, нужен root) или `netstack` (свой
+//!   сетевой стек процесса: соединения телефона открывает сам `hp-server` обычными сокетами —
+//!   без TUN, NAT и прав; на Windows только так); по умолчанию `tun`, на Windows `netstack`;
 //!   TUN_ADDR — адрес сервера в туннеле и подсеть клиентов (`10.80.0.1/16`, по умолчанию так),
-//!   TUN_NAME (`hp0`), TUN_MTU (1400); нужны права root (`CAP_NET_ADMIN`);
+//!   TUN_NAME (`hp0`), TUN_MTU (1400);
+//!   BIND_ADDR — адрес физического адаптера для сокетов дыр и STUN: они пойдут мимо VPN этой
+//!   машины, с настоящего домашнего адреса (соединения телефона в режиме `netstack` — через VPN);
 //!   REORDER_WAIT_MS — сколько мс ждать недостающий TCP-пакет при восстановлении порядка (8;
 //!   0 — выключить); DATA_HOLES — через сколько дыр слать данные (0 — через все живые).
 //!
@@ -24,8 +29,7 @@
 //!
 //! Библиотечная часть (`settings`, `Common`, `serve`) переиспользуется `vps-server` и
 //! `hp-router`. Запуск: `hp-server [--config server.env]` (без `--config` берётся
-//! `server.env` рядом с бинарником, если есть, иначе только окружение). Linux (в т.ч. WSL2 на
-//! Windows, см. `wsl/README.md`).
+//! `server.env` рядом с бинарником, если есть, иначе только окружение). Linux и Windows.
 
 pub mod addresses;
 pub mod settings;
@@ -57,9 +61,30 @@ pub struct Peer {
     pub peer_id: Uuid,
 }
 
+/// Что стоит за мостом: интерфейс TUN ядра или свой сетевой стек процесса.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Tun,
+    Netstack,
+}
+
+impl Mode {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(str::trim) {
+            None | Some("") => Ok(if cfg!(windows) { Mode::Netstack } else { Mode::Tun }),
+            Some("tun") => Ok(Mode::Tun),
+            Some("netstack") => Ok(Mode::Netstack),
+            Some(other) => anyhow::bail!("MODE: «{other}» — ожидается tun или netstack"),
+        }
+    }
+}
+
 /// Настройки, общие для `hp-server` и `vps-server`.
 pub struct Common {
     pub peers: Vec<Peer>,
+    pub mode: Mode,
+    /// Локальный адрес сокетов дыр и STUN (адрес физического адаптера — мимо VPN этой машины).
+    pub bind_ip: Option<std::net::IpAddr>,
     pub tun: hp_tun::TunConfig,
     /// Где хранить выданные адреса (`None` — только в памяти).
     pub address_file: Option<PathBuf>,
@@ -75,6 +100,8 @@ impl Common {
         let tun_addr = get("TUN_ADDR").unwrap_or_else(|| DEFAULT_TUN_ADDR.to_string());
         Ok(Self {
             peers: parse_peers(&get)?,
+            mode: Mode::parse(get("MODE").as_deref())?,
+            bind_ip: get("BIND_ADDR").map(|v| v.trim().parse().context("BIND_ADDR: ожидается IP-адрес")).transpose()?,
             address_file: Some(settings.resolve(get("ADDRESS_FILE").as_deref().unwrap_or("addresses.state").trim())),
             dns: addresses::client_dns(get("DNS").as_deref())?,
             tun: hp_tun::TunConfig {
@@ -174,20 +201,52 @@ pub fn main() -> Result<()> {
 /// встречи с `common.peers[i]`), раздаёт адреса и гоняет мост TUN ↔ дыры, пока жив процесс.
 pub async fn serve(discoveries: Vec<Discovery>, common: Common) -> Result<()> {
     anyhow::ensure!(discoveries.len() == common.peers.len(), "способов встречи {} на {} пиров", discoveries.len(), common.peers.len());
-    let (server_addr, prefix) = common.tun.address.context("у TUN сервера нет адреса")?;
+    let (server_addr, prefix) = common.tun.address.context("у сервера нет адреса в туннеле (TUN_ADDR)")?;
+    match common.mode {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        Mode::Tun => {
+            let tun = hp_tun::Tun::create(&common.tun).context("создание TUN (нужны права root)")?;
+            log::info!("сервер: TUN {} {server_addr}/{prefix}", tun.name());
+            run(hp_tun::hub::Hub::start(tun), discoveries, common).await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        Mode::Tun => anyhow::bail!("MODE=tun есть только на Linux; здесь — MODE=netstack"),
+        Mode::Netstack => {
+            #[cfg(feature = "netstack")]
+            {
+                let (device, stack_end) = hp_tun::device::channel_pair();
+                let stack = hp_netstack::start(stack_end);
+                log::info!("сервер: свой сетевой стек, адрес {server_addr}/{prefix} (соединения телефонов открывает этот процесс)");
+                let result = run(hp_tun::hub::Hub::start(device), discoveries, common).await;
+                stack.abort();
+                result
+            }
+            #[cfg(not(feature = "netstack"))]
+            anyhow::bail!("сборка без фичи netstack")
+        }
+    }
+}
+
+/// Раздаёт адреса, поднимает наборы дыр к пирам и гоняет мост, пока жив процесс.
+async fn run<D: hp_tun::device::PacketDevice>(hub: hp_tun::hub::Hub<D>, discoveries: Vec<Discovery>, common: Common) -> Result<()> {
+    let (server_addr, prefix) = common.tun.address.context("у сервера нет адреса в туннеле")?;
     let book = Arc::new(std::sync::Mutex::new(AddressBook::load(server_addr, prefix, common.address_file.clone())?));
-    let tun = hp_tun::Tun::create(&common.tun).context("создание TUN (нужны права root)")?;
     log::info!(
-        "сервер: TUN {} {server_addr}/{prefix}, пиров {}, порядок пакетов: ожидание {} мс, дыр для данных: {}",
-        tun.name(),
+        "сервер: пиров {}, порядок пакетов: ожидание {} мс, дыр для данных: {}, сокеты дыр: {}",
         common.peers.len(),
         common.reorder_wait.as_millis(),
-        if common.data_holes == 0 { "все".to_string() } else { common.data_holes.to_string() }
+        if common.data_holes == 0 { "все".to_string() } else { common.data_holes.to_string() },
+        common.bind_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "любой адрес".into())
     );
     log::info!("сервер: DNS для клиентов {:?}", common.dns);
-    let hub = Arc::new(hp_tun::hub::Hub::start(tun));
+    let hub = Arc::new(hub);
     let dns: Arc<Vec<Vec<u8>>> = Arc::new(common.dns.iter().map(|a| a.octets().to_vec()).collect());
-    let options = MultiLinkOptions { reorder_wait: common.reorder_wait, data_holes: common.data_holes, ..MultiLinkOptions::default() };
+    let options = MultiLinkOptions {
+        reorder_wait: common.reorder_wait,
+        data_holes: common.data_holes,
+        bind_ip: common.bind_ip,
+        ..MultiLinkOptions::default()
+    };
     let mut links = Vec::new();
     for (peer, discovery) in common.peers.iter().zip(discoveries) {
         log::info!("сервер: я {} ищу пира {}", peer.my_id, peer.peer_id);
@@ -215,10 +274,10 @@ pub async fn serve(discoveries: Vec<Discovery>, common: Common) -> Result<()> {
 
 /// Отвечает на запросы адреса пира `link` (и клиентов за ним): выдаёт адрес из книги и
 /// закрепляет его в мосту.
-async fn serve_addresses(
+async fn serve_addresses<D: hp_tun::device::PacketDevice>(
     link: Arc<MultiLink>,
     mut control: mpsc::Receiver<Control>,
-    hub: Arc<hp_tun::hub::Hub>,
+    hub: Arc<hp_tun::hub::Hub<D>>,
     book: Arc<std::sync::Mutex<AddressBook>>,
     dns: Arc<Vec<Vec<u8>>>,
 ) {
