@@ -175,11 +175,31 @@ async fn detect(servers: &[SocketAddr], tunnel: Option<(Ipv4Addr, u8)>) -> Bindi
     Binding { ip: Some(IpAddr::V4(candidate.ip)), ifindex: candidate.index }
 }
 
+/// Адрес из интернета: не частный, не loopback, не link-local и не CGNAT (100.64/10).
+fn is_global(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || (a == 100 && (b & 0xc0) == 64))
+        }
+        IpAddr::V6(_) => true,
+    }
+}
+
 /// Какой адаптер выбрать: тот, у которого хоть один STUN-сервер ответил не так, как по маршруту
 /// по умолчанию (другой внешний адрес или ответ там, где по умолчанию тишина) — это путь мимо
 /// VPN; из нескольких — сначала частный адрес (домашняя сеть). `None` — обходного пути нет.
+///
+/// Ответ с частным адресом не в счёт: сервер достигнут внутри той же сети или туннеля. Так
+/// STUN на самом сервере VPN видит через туннель внутренний адрес туннеля — это не путь мимо VPN.
 fn choose(default: &[Option<IpAddr>], list: &[Candidate], seen: &[Vec<Option<IpAddr>>]) -> Option<usize> {
-    let differs = |ext: &Vec<Option<IpAddr>>| ext.iter().zip(default).any(|(ext, def)| ext.is_some() && ext != def);
+    let global = |ext: &Option<IpAddr>| ext.filter(|ip| is_global(*ip));
+    let differs = |ext: &Vec<Option<IpAddr>>| {
+        ext.iter().zip(default).any(|(ext, def)| {
+            let (ext, def) = (global(ext), global(def));
+            ext.is_some() && ext != def
+        })
+    };
     let bypass: Vec<usize> = (0..list.len()).filter(|&i| differs(&seen[i])).collect();
     bypass.iter().copied().find(|&i| list[i].ip.is_private()).or_else(|| bypass.first().copied())
 }
@@ -223,6 +243,17 @@ mod tests {
         assert_eq!(choose(&[None, other], &list, &[vec![home, other]]), Some(0));
         // Без VPN оба сервера отвечают одинаково по обоим путям, хоть адреса у серверов и разные.
         assert_eq!(choose(&[home, other], &list, &[vec![home, other]]), None);
+    }
+
+    #[test]
+    fn tunnel_address_from_the_vpn_server_is_not_a_bypass() {
+        // Windows с полным туннелем до сервера, на котором же стоит второй STUN: через туннель он
+        // видит внутренний адрес туннеля, а маршрут к нему по умолчанию идёт мимо туннеля.
+        let (vpn, grey, home) = (Some(IpAddr::from([203, 0, 113, 10])), Some(IpAddr::from([198, 51, 100, 8])), Some(IpAddr::from([198, 51, 100, 7])));
+        let inside = Some(IpAddr::from([10, 8, 0, 10]));
+        let list = [candidate("OpenVPN Wintun", [10, 8, 0, 10]), candidate("Ethernet", [192, 168, 122, 33])];
+        let default = [vpn, grey];
+        assert_eq!(choose(&default, &list, &[vec![vpn, inside], vec![home, grey]]), Some(1));
     }
 
     #[test]

@@ -12,6 +12,8 @@ members = [
     "vps-server",
     "vps-client",
     "hp-router",
+    "control",
+    "control/tray",
 ]
 
 [workspace.package]
@@ -45,3 +47,11 @@ ipstack = "1"
 # Адреса интерфейсов машины: hp-server ищет физический адаптер мимо VPN (BIND_ADDR=auto).
 if-addrs = "0.15"
 etherparse = { version = "0.20", default-features = false, features = ["std"] }
+# Трей (control/tray): окно на Slint (winit + программный рендер — работает и без GPU, в ВМ и по
+# RDP), QR — qrcode без картинок, значок в трее — ksni (Linux, StatusNotifierItem по D-Bus, без
+# GTK) и tray-icon (Windows).
+slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software"] }
+slint-build = "1.18"
+qrcode = { version = "0.14", default-features = false }
+ksni = "0.3"
+tray-icon = { version = "0.25", default-features = false }

@@ -12,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use connection::auth::peer_name;
 use connection::multilink::{Incoming, MultiLink};
 use connection::pool::PACKET_CAP;
 use tokio::sync::mpsc;
@@ -89,9 +90,10 @@ impl<D: PacketDevice> Hub<D> {
                 routes.by_owner.remove(&previous_owner);
             }
         }
+        // Только имя: полный GUID — секрет пары.
         log::info!(
             "TUN: {address} — пир {}{}",
-            owner.peer,
+            peer_name(&owner.peer),
             client.map(|c| format!(", клиент {c}")).unwrap_or_default()
         );
     }
@@ -99,6 +101,24 @@ impl<D: PacketDevice> Hub<D> {
     /// Адрес, закреплённый за владельцем.
     pub fn address_of(&self, owner: Owner) -> Option<Ipv4Addr> {
         self.routes.lock().unwrap().by_owner.get(&owner).copied()
+    }
+
+    /// Адреса пира `peer` и клиентов за ним, по возрастанию.
+    pub fn addresses_of(&self, peer: Uuid) -> Vec<Ipv4Addr> {
+        let routes = self.routes.lock().unwrap();
+        let mut list: Vec<Ipv4Addr> = routes.by_owner.iter().filter(|(owner, _)| owner.peer == peer).map(|(_, a)| *a).collect();
+        list.sort();
+        list
+    }
+
+    /// Забывает пира: его адреса больше никуда не ведут (сам набор дыр останавливает вызывающий).
+    pub fn remove_peer(&self, peer: Uuid) {
+        let mut routes = self.routes.lock().unwrap();
+        let gone: Vec<(Owner, Ipv4Addr)> = routes.by_owner.iter().filter(|(owner, _)| owner.peer == peer).map(|(o, a)| (*o, *a)).collect();
+        for (owner, address) in gone {
+            routes.by_owner.remove(&owner);
+            routes.by_addr.remove(&address);
+        }
     }
 
     pub fn stats(&self) -> &BridgeStats {
@@ -151,7 +171,7 @@ async fn downlink<D: PacketDevice>(
         let allowed = src.is_some() && routes.lock().unwrap().by_owner.get(&owner).copied() == src;
         if !allowed {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
-            log::debug!("TUN: пакет от {owner:?} с адресом {src:?} отброшен: адрес ему не выдан");
+            log::debug!("TUN: пакет от {} ({:?}) с адресом {src:?} отброшен: адрес ему не выдан", peer_name(&owner.peer), owner.client);
             continue;
         }
         match tun.send(&packet.payload).await {
@@ -164,5 +184,5 @@ async fn downlink<D: PacketDevice>(
             }
         }
     }
-    log::warn!("TUN: канал входящих пира {peer} закрыт");
+    log::debug!("TUN: канал входящих пира {} закрыт", peer_name(&peer));
 }

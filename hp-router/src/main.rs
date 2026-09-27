@@ -180,7 +180,7 @@ struct RelayStats {
 }
 
 async fn run(config: Config) -> Result<()> {
-    log::info!("hp-router: VPS {} (я {}), телефонов {}", config.vps_server, config.vps_my_id, config.phones.len());
+    log::info!("hp-router: VPS {} (я {}), телефонов {}", config.vps_server, connection::auth::peer_name(&config.vps_my_id), config.phones.len());
     // Пакеты телефонов роутер перекладывает насквозь: порядок им вернёт VPS или сам телефон.
     let vps_options = MultiLinkOptions {
         reorder_wait: config.reorder_wait,

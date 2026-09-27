@@ -1,0 +1,115 @@
+// Протокол управления службой (hp-server) — трей и другие «пульты». TCP в доверенной зоне
+// (loopback или LAN), кадр: u32 big-endian длина + ControlMessage. Без XOR и подписи: канал не
+// выходит в интернет; доступ — по токену в первом сообщении (Hello). См. control/README.md.
+syntax = "proto3";
+
+package hp.control;
+
+message ControlMessage {
+  oneof body {
+    Hello hello = 1;
+    GetStatus get_status = 2;
+    Status status = 3;
+    Subscribe subscribe = 4;
+    // 5 — Event, 6/7 — Identity, 8 — SetPeer, 11 — Restart: зарезервированы в замысле.
+    CreatePairing create_pairing = 9;
+    Pairing pairing = 10;
+    Welcome welcome = 12;
+    Error error = 13;
+    RemovePeer remove_peer = 14;
+    Done done = 15;
+  }
+}
+
+// Первое сообщение клиента. Неверный токен — служба закрывает соединение.
+message Hello {
+  string token = 1;
+  uint32 version = 2;
+}
+
+// Ответ службы на Hello.
+message Welcome {
+  uint32 version = 1;
+  string service = 2;  // "hp-server"
+  string build = 3;    // версия пакета
+}
+
+message GetStatus {}
+
+// Присылать Status раз в interval_ms (0 — прекратить), пока соединение открыто.
+message Subscribe {
+  uint32 interval_ms = 1;
+}
+
+message Status {
+  string service = 1;
+  uint64 uptime_s = 2;
+  string mode = 3;           // tun | netstack
+  string bind = 4;           // к чему привязаны сокеты дыр (BIND_ADDR), пусто — любой адрес
+  repeated PeerStatus peers = 5;
+  Traffic traffic = 6;
+  bool pairing_supported = 7;
+}
+
+// Пир (телефон или роутер). Полные GUID — секрет пары и сюда не входят, только имя.
+message PeerStatus {
+  string name = 1;           // первая группа GUID пира
+  string state = 2;          // rendezvous | punching | connected
+  uint32 live = 3;           // живых дыр
+  uint32 target = 4;         // сколько держим
+  repeated HoleStatus holes = 5;
+  repeated string addresses = 6;  // адреса в туннеле, выданные этому пиру и клиентам за ним
+  bool pending = 7;          // сопряжение ещё не завершено (телефон не подключался)
+  uint64 pending_expires_unix = 8;
+  bool removable = 9;         // сопряжён из трея (заданный в файле настроек удаляется только там)
+}
+
+message HoleStatus {
+  uint32 slot = 1;
+  string peer_addr = 2;
+  uint64 sent = 3;
+  uint64 received = 4;
+  // Потери по последнему отчёту пира, доли 0..1; отрицательное — нет данных.
+  float loss_out = 5;
+  float loss_in = 6;
+}
+
+message Traffic {
+  uint64 to_peers = 1;
+  uint64 ordered = 2;
+  uint64 from_peers = 3;
+  uint64 dropped = 4;
+}
+
+// Добавить телефон: служба заводит новую пару GUID и её набор дыр, отвечает Pairing.
+message CreatePairing {}
+
+message Pairing {
+  PairingBundle bundle = 1;
+  string uri = 2;            // homeproxy://pair?d=<base64url(bundle)> — это и есть QR
+  string name = 3;           // имя телефона (первая группа его GUID)
+}
+
+// Пакет сопряжения для телефона. Внутри — полные GUID пары, из них выводятся все ключи:
+// показывать только по кнопке, не логировать, не хранить.
+message PairingBundle {
+  uint32 version = 1;
+  string pc_guid = 2;        // GUID службы — PEER_ID телефона
+  string phone_guid = 3;     // GUID телефона — MY_ID телефона
+  string stun = 4;           // ip:порт[,ip2:порт]
+  string mqtt = 5;           // ip:порт, TLS
+  bytes mqtt_ca_pem = 6;
+  reserved 7;                // было: конфиг WireGuard
+  uint64 expires_unix = 8;
+}
+
+// Удалить пира по имени (телефон перестанет подключаться, его пара забывается).
+message RemovePeer {
+  string name = 1;
+}
+
+message Done {}
+
+message Error {
+  string message = 1;
+}

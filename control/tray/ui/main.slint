@@ -1,0 +1,272 @@
+// Окно трея home-proxy: состояние службы, телефоны и их дыры, сопряжение по QR.
+import { Button, ListView, Palette } from "std-widgets.slint";
+
+// Уровни: 0 — нет данных / нет связи со службой, 1 — плохо, 2 — частично / идёт пробив, 3 — хорошо.
+global Colors {
+    out property <color> none: #8a8f98;
+    out property <color> bad: #d9534f;
+    out property <color> warn: #e3a008;
+    out property <color> good: #2ea043;
+    pure public function level(l: int) -> color {
+        return l == 3 ? good : l == 2 ? warn : l == 1 ? bad : none;
+    }
+}
+
+export struct HoleRow {
+    slot: int,
+    addr: string,
+    sent: string,
+    received: string,
+    loss-out: string,
+    loss-in: string,
+    level: int,
+}
+
+export struct PeerRow {
+    name: string,
+    state: string,
+    level: int,
+    live: int,
+    target: int,
+    addresses: string,
+    loss: string,
+    pending: bool,
+    removable: bool,
+    expanded: bool,
+    holes: [HoleRow],
+}
+
+component Dot inherits Rectangle {
+    in property <int> level;
+    width: 12px;
+    height: 12px;
+    border-radius: 6px;
+    background: Colors.level(level);
+}
+
+component HoleTable inherits VerticalLayout {
+    in property <[HoleRow]> holes;
+    spacing: 2px;
+    HorizontalLayout {
+        spacing: 8px;
+        Text { width: 28px; text: "#"; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { horizontal-stretch: 1; text: "адрес телефона"; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { width: 64px; text: "отправлено"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { width: 64px; text: "получено"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { width: 56px; text: "потери ↑"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { width: 56px; text: "потери ↓"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+    }
+    for hole in holes: HorizontalLayout {
+        spacing: 8px;
+        HorizontalLayout {
+            width: 28px;
+            spacing: 4px;
+            alignment: start;
+            Dot { level: hole.level; width: 8px; height: 8px; border-radius: 4px; y: 4px; }
+            Text { text: hole.slot; font-size: 12px; }
+        }
+        Text { horizontal-stretch: 1; text: hole.addr; font-size: 12px; overflow: elide; }
+        Text { width: 64px; text: hole.sent; horizontal-alignment: right; font-size: 12px; }
+        Text { width: 64px; text: hole.received; horizontal-alignment: right; font-size: 12px; }
+        Text { width: 56px; text: hole.loss-out; horizontal-alignment: right; font-size: 12px; }
+        Text { width: 56px; text: hole.loss-in; horizontal-alignment: right; font-size: 12px; }
+    }
+    if holes.length == 0: Text { text: "живых дыр нет"; font-size: 12px; color: Palette.foreground.transparentize(0.4); }
+}
+
+component PeerCard inherits Rectangle {
+    in property <PeerRow> peer;
+    callback toggle();
+    callback remove();
+    property <bool> confirm: false;
+
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+    background: Palette.alternate-background;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        TouchArea {
+            clicked => { root.toggle(); }
+            mouse-cursor: pointer;
+            VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: stretch;
+                    Dot { level: peer.level; y: 4px; }
+                    Text { text: "Телефон " + peer.name; font-weight: 700; font-size: 14px; vertical-alignment: center; }
+                    if peer.pending: Rectangle {
+                        border-radius: 4px;
+                        background: Colors.warn.transparentize(0.75);
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            Text { text: "ждёт первого подключения"; font-size: 11px; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: peer.live + "/" + peer.target + " дыр"; font-size: 13px; vertical-alignment: center; }
+                    Text { text: peer.expanded ? "▾" : "▸"; font-size: 13px; vertical-alignment: center; }
+                }
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text { text: peer.state; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
+                    Text { text: peer.addresses; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: peer.loss; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
+                }
+            }
+        }
+        if peer.expanded: HoleTable { holes: peer.holes; }
+        if peer.expanded && peer.removable: HorizontalLayout {
+            alignment: end;
+            Button {
+                text: root.confirm ? "Точно удалить?" : "Удалить телефон";
+                clicked => {
+                    if root.confirm {
+                        root.confirm = false;
+                        root.remove();
+                    } else {
+                        root.confirm = true;
+                    }
+                }
+            }
+        }
+    }
+    Timer {
+        interval: 4s;
+        running: root.confirm;
+        triggered => { root.confirm = false; }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Home Proxy";
+    icon: @image-url("icon.png");
+    preferred-width: 560px;
+    preferred-height: 640px;
+    min-width: 420px;
+    min-height: 420px;
+    background: Palette.background;
+
+    in property <int> overall: 0;
+    in property <string> headline: "Подключение к службе…";
+    in property <string> details;
+    in property <string> traffic;
+    in property <string> error;
+    in property <[PeerRow]> peers;
+    in property <bool> pairing-supported: true;
+    in property <bool> connected: false;
+
+    in property <bool> qr-visible: false;
+    in property <image> qr-image;
+    in property <string> qr-name;
+    in property <string> qr-status;
+    in property <int> qr-level: 2;
+    in property <bool> busy: false;
+
+    callback add-phone();
+    callback close-qr();
+    callback remove-peer(string);
+    callback toggle-peer(int);
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            spacing: 10px;
+            Dot { level: root.overall; width: 16px; height: 16px; border-radius: 8px; y: 4px; }
+            VerticalLayout {
+                spacing: 2px;
+                Text { text: root.headline; font-size: 18px; font-weight: 700; wrap: word-wrap; }
+                if root.details != "": Text { text: root.details; font-size: 12px; color: Palette.foreground.transparentize(0.3); wrap: word-wrap; }
+                if root.traffic != "": Text { text: root.traffic; font-size: 12px; color: Palette.foreground.transparentize(0.3); wrap: word-wrap; }
+            }
+        }
+
+        if root.error != "": Rectangle {
+            border-radius: 6px;
+            background: Colors.bad.transparentize(0.8);
+            HorizontalLayout {
+                padding: 8px;
+                Text { text: root.error; wrap: word-wrap; font-size: 12px; }
+            }
+        }
+
+        ListView {
+            vertical-stretch: 1;
+            for peer[i] in root.peers: VerticalLayout {
+                padding-bottom: 8px;
+                PeerCard {
+                    peer: peer;
+                    toggle => { root.toggle-peer(i); }
+                    remove => { root.remove-peer(peer.name); }
+                }
+            }
+        }
+
+        if root.connected && root.peers.length == 0: Text {
+            text: "Телефонов пока нет. Нажмите «Добавить телефон» и отсканируйте QR-код в приложении Home Proxy на телефоне.";
+            wrap: word-wrap;
+            horizontal-alignment: center;
+            color: Palette.foreground.transparentize(0.3);
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            Button {
+                text: root.busy ? "Готовлю код…" : "Добавить телефон";
+                primary: true;
+                enabled: root.connected && root.pairing-supported && !root.busy;
+                clicked => { root.add-phone(); }
+            }
+        }
+    }
+
+    if root.qr-visible: Rectangle {
+        background: Palette.background;
+        TouchArea { }  // перехватывает клики под экраном QR
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+            alignment: center;
+            Text { text: "Добавить телефон"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+            Text {
+                text: "Откройте Home Proxy на телефоне → «Сканировать» и наведите камеру на код. Код — секрет пары: не показывайте его посторонним.";
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                font-size: 12px;
+                color: Palette.foreground.transparentize(0.3);
+            }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    // Поле вокруг кода — в самой картинке (белое и в тёмной теме: камеры читают тёмное на светлом).
+                    background: white;
+                    width: min(root.width - 32px, root.height - 220px, 420px);
+                    height: self.width;
+                    Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: root.qr-image;
+                        image-rendering: pixelated;
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                spacing: 8px;
+                Dot { level: root.qr-level; y: 3px; }
+                Text { text: root.qr-status; font-size: 13px; }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Button { text: "Закрыть"; clicked => { root.close-qr(); } }
+            }
+        }
+    }
+}

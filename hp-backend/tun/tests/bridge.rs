@@ -71,7 +71,7 @@ async fn vps_pair(ports: std::ops::RangeInclusive<u16>, client_options: MultiLin
 
 /// Сервер с `Hub` и простой выдачей адресов (как `hp-server`: хост — `10.80.0.2`, телефоны
 /// — `10.80.1.<client_id>`).
-fn serve(hub: Arc<Hub>, link: Arc<MultiLink>, incoming: Rx) {
+fn serve(hub: Arc<Hub<Tun>>, link: Arc<MultiLink>, incoming: Rx) {
     hub.add_link(&link, incoming);
     let mut control = link.take_control().unwrap();
     tokio::spawn(async move {

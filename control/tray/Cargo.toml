@@ -1,0 +1,21 @@
+[package]
+name = "hp-tray"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hp-control = { path = ".." }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+slint = { workspace = true }
+qrcode = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

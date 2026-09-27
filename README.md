@@ -171,7 +171,7 @@ flowchart LR
 | `hp-server/` | служба на домашнем ПК (схема без роутера) |
 | `android-vpn/` | приложение для Android (Kotlin): свой VPN на TUN |
 | `OpenWRT/` | сборка под роутеры, настройка TUN и ускорение (`Tun.md`) |
-| `control/` | (описание) пульт управления: трей на Slint, сопряжение по QR с Android |
+| `control/` | управление службой: протокол, трей на Slint (Windows, Linux), `hpctl`, сопряжение по QR |
 | `windows/`, `wsl/` | домашний ПК на Windows: нативный `hp-server.exe`; запасной вариант — образ Alpine для WSL2 |
 | `cert/`, `mosquitto/`, `coturn/` | TLS, MQTT-брокер и STUN для рандеву-сервера |
 | `iPhone/` | заметки про iOS |
@@ -184,6 +184,8 @@ flowchart LR
 
 - Проверить вживую схему с настоящим телефоном → ПК (Windows нативно, Linux на TUN).
 - Служба Windows для `hp-server.exe` (сейчас — процесс в сеансе пользователя).
+- Android: сканирование QR сопряжения (`control/README.md`); трей на Windows — проверить окно и
+  значок в интерактивном сеансе.
 - `hp-router`: служба procd (сейчас запуск руками из `/tmp`).
 
 ## Лицензия

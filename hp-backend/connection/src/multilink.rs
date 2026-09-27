@@ -183,6 +183,10 @@ impl StateTracker {
         }
     }
 
+    fn current(&self) -> ConnState {
+        aggregate(&self.inner.lock().unwrap().phases)
+    }
+
     fn set(&self, slot: u8, phase: SlotPhase) {
         let label = &self.label;
         let mut inner = self.inner.lock().unwrap();
@@ -290,10 +294,52 @@ struct LiveLink {
 struct LinkRegistry {
     by_slot: HashMap<u8, LiveLink>,
     index: HashMap<PeerLinkId, u8>,
+    /// Последний отчёт пира по дыре и наши счётчики на момент его прихода — для потерь.
+    reports: HashMap<u8, SlotReport>,
+}
+
+/// Отчёт пира о дыре (`Stats`) и наши счётчики той же дыры в момент его получения.
+#[derive(Clone, Copy, Debug, Default)]
+struct SlotReport {
+    peer_sent: u64,
+    peer_received: u64,
+    my_sent: u64,
+    my_received: u64,
+}
+
+/// Минимум пакетов для оценки потерь: на меньшей выборке доля бессмысленна.
+const MIN_LOSS_SAMPLE: u64 = 20;
+
+/// Доля потерь: отправлено `sent`, дошло `received`; `None` — мало данных.
+fn loss(sent: u64, received: u64) -> Option<f32> {
+    (sent >= MIN_LOSS_SAMPLE).then(|| (1.0 - received as f32 / sent as f32).clamp(0.0, 1.0))
+}
+
+/// Состояние одной живой дыры.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoleStatus {
+    pub slot: u8,
+    /// Адрес пира на этой дыре.
+    pub peer_addr: Option<SocketAddr>,
+    /// Пакетов отправлено и получено по дыре с её открытия.
+    pub sent: u64,
+    pub received: u64,
+    /// Потери от нас к пиру и от пира к нам по последнему отчёту пира (раз в 10 с); `None` —
+    /// отчёта ещё нет или мало пакетов.
+    pub loss_out: Option<f32>,
+    pub loss_in: Option<f32>,
+}
+
+/// Снимок набора дыр: общее состояние и живые дыры по порядку слотов.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkStatus {
+    pub state: ConnState,
+    pub holes: Vec<HoleStatus>,
 }
 
 impl LinkRegistry {
     fn insert(&mut self, link_id: PeerLinkId, link: LiveLink) {
+        self.reports.remove(&link.slot);
         self.index.insert(link_id, link.slot);
         self.by_slot.insert(link.slot, link);
     }
@@ -301,6 +347,7 @@ impl LinkRegistry {
     fn remove(&mut self, link_id: PeerLinkId) {
         if let Some(slot) = self.index.remove(&link_id) {
             self.by_slot.remove(&slot);
+            self.reports.remove(&slot);
         }
     }
 
@@ -314,6 +361,35 @@ impl LinkRegistry {
 
     fn received_on(&self, slot: u8) -> u64 {
         self.by_slot.get(&slot).map(|l| l.sender.stats().1).unwrap_or(0)
+    }
+
+    /// Запоминает отчёт пира о дыре вместе с нашими счётчиками на этот момент.
+    fn record_report(&mut self, stat: &PeerLinkStat) {
+        if let Some(link) = self.by_slot.get(&stat.slot) {
+            let (my_sent, my_received) = link.sender.stats();
+            self.reports.insert(stat.slot, SlotReport { peer_sent: stat.sent, peer_received: stat.received, my_sent, my_received });
+        }
+    }
+
+    fn holes(&self) -> Vec<HoleStatus> {
+        let mut holes: Vec<HoleStatus> = self
+            .by_slot
+            .values()
+            .map(|link| {
+                let (sent, received) = link.sender.stats();
+                let report = self.reports.get(&link.slot);
+                HoleStatus {
+                    slot: link.slot,
+                    peer_addr: link.sender.peer_addr(),
+                    sent,
+                    received,
+                    loss_out: report.and_then(|r| loss(r.my_sent, r.peer_received)),
+                    loss_in: report.and_then(|r| loss(r.peer_sent, r.my_received)),
+                }
+            })
+            .collect();
+        holes.sort_by_key(|h| h.slot);
+        holes
     }
 }
 
@@ -418,6 +494,9 @@ pub struct MultiLink {
     data_holes: u8,
     redrop_txs: Vec<mpsc::Sender<()>>,
     control_rx: Mutex<Option<mpsc::Receiver<Control>>>,
+    state: Arc<StateTracker>,
+    /// Задачи набора: дроп `MultiLink` останавливает их, а с ними — дыры, сокеты и MQTT.
+    _tasks: Vec<AbortOnDrop>,
 }
 
 impl MultiLink {
@@ -491,6 +570,7 @@ impl MultiLink {
         let (control_tx, control_rx) = mpsc::channel::<Control>(CONTROL_CHANNEL_CAPACITY);
         let state = Arc::new(StateTracker::new(TARGET_LINKS as usize, label.clone()));
 
+        let mut tasks: Vec<AbortOnDrop> = Vec::new();
         let mut slot_txs: Vec<mpsc::Sender<PeerSession>> = Vec::new();
         let mut redrop_txs: Vec<mpsc::Sender<()>> = Vec::new();
         for slot in 0..TARGET_LINKS {
@@ -514,7 +594,7 @@ impl MultiLink {
             } else {
                 Announce::VirtualBroker(registry.clone())
             };
-            tokio::spawn(slot_worker(SlotCtx {
+            tasks.push(AbortOnDrop(tokio::spawn(slot_worker(SlotCtx {
                 slot,
                 socket,
                 mode: mode.clone(),
@@ -531,7 +611,7 @@ impl MultiLink {
                 events: events_tx.clone(),
                 state: state.clone(),
                 label: label.clone(),
-            }));
+            }))));
         }
 
         match (&slot0_announce, &discovery) {
@@ -540,28 +620,28 @@ impl MultiLink {
                     .await
                     .with_context(|| format!("не удалось занять порт знакомства {bootstrap_port}"))?;
                 log::info!("{label}VPS-сервер: порт знакомства {bootstrap_port}");
-                tokio::spawn(vps::serve_bootstrap(
+                tasks.push(AbortOnDrop(tokio::spawn(vps::serve_bootstrap(
                     socket,
                     boot.clone(),
                     pair.clone(),
                     peer_id,
                     slot_txs[BOOTSTRAP_SLOT as usize].clone(),
-                ));
+                ))));
             }
             (Announce::VpsClient(boot), _) => {
                 log::info!("{label}VPS-клиент: сервер {}", boot.server);
                 let (boot, tx) = (boot.clone(), slot_txs[BOOTSTRAP_SLOT as usize].clone());
-                tokio::spawn(async move { boot.receive(peer_id, tx).await });
+                tasks.push(AbortOnDrop(tokio::spawn(async move { boot.receive(peer_id, tx).await })));
             }
             _ => {}
         }
         if let Some(peer_rx) = mqtt_rx {
-            tokio::spawn(demux(peer_rx, slot_txs.clone()));
+            tasks.push(AbortOnDrop(tokio::spawn(demux(peer_rx, slot_txs.clone()))));
         }
         let redrop_for_api = redrop_txs.clone();
-        tokio::spawn(keepalive_loop(registry.clone()));
-        tokio::spawn(stats_loop(registry.clone()));
-        tokio::spawn(control_loop(
+        tasks.push(AbortOnDrop(tokio::spawn(keepalive_loop(registry.clone()))));
+        tasks.push(AbortOnDrop(tokio::spawn(stats_loop(registry.clone()))));
+        tasks.push(AbortOnDrop(tokio::spawn(control_loop(
             label.clone(),
             events_rx,
             registry.clone(),
@@ -569,7 +649,7 @@ impl MultiLink {
             SlotFeed { slot_txs, pair, peer_id },
             (incoming_tx, control_tx),
             options,
-        ));
+        ))));
 
         let multilink = Self {
             registry,
@@ -580,6 +660,8 @@ impl MultiLink {
             data_holes: options.data_holes,
             redrop_txs: redrop_for_api,
             control_rx: Mutex::new(Some(control_rx)),
+            state,
+            _tasks: tasks,
         };
         Ok((multilink, incoming_rx))
     }
@@ -670,6 +752,11 @@ impl MultiLink {
             self.registry.lock().unwrap().links().into_iter().map(|l| (l.slot, l.sender.peer_addr())).collect();
         links.sort_by_key(|l| l.0);
         links
+    }
+
+    /// Снимок состояния: общее состояние и живые дыры со счётчиками и потерями.
+    pub fn status(&self) -> LinkStatus {
+        LinkStatus { state: self.state.current(), holes: self.registry.lock().unwrap().holes() }
     }
 
     pub fn my_peer_id(&self) -> Uuid {
@@ -792,6 +879,7 @@ async fn control_loop(
             LinkEvent::PeerStats(peer_stats) => {
                 log::debug!("получена статистика пира: {} дыр", peer_stats.len());
                 for stat in peer_stats {
+                    registry.lock().unwrap().record_report(&stat);
                     if is_link_bad(&registry, &stat) {
                         log::warn!(
                             "{label}слот {}: пир отправил {}, мы получили {} — дыра плохая, пробиваем заново",
@@ -1248,6 +1336,15 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loss_needs_a_sample_and_is_clamped() {
+        assert_eq!(loss(10, 5), None, "мало пакетов — оценки нет");
+        assert_eq!(loss(100, 75), Some(0.25));
+        assert_eq!(loss(100, 100), Some(0.0));
+        // Пакеты в пути на момент отчёта могут дать «получено больше отправленного».
+        assert_eq!(loss(100, 104), Some(0.0));
+    }
 
     #[test]
     fn bad_link_needs_a_sample() {

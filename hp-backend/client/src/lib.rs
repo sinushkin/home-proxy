@@ -99,7 +99,7 @@ impl Client {
         tokio::spawn(switch(incoming, attached.clone()));
         let address = Arc::new(Mutex::new(None));
         tokio::spawn(obtain_address(multilink.clone(), address.clone()));
-        log::info!("клиент запущен: дыры к {}", config.peer_id);
+        log::info!("клиент запущен: дыры к {}", connection::auth::peer_name(&config.peer_id));
         Ok(Self { multilink, attached, address })
     }
 
