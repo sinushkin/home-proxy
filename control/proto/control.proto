@@ -1,6 +1,6 @@
-// Протокол управления службой (hp-server) — трей и другие «пульты». TCP в доверенной зоне
-// (loopback или LAN), кадр: u32 big-endian длина + ControlMessage. Без XOR и подписи: канал не
-// выходит в интернет; доступ — по токену в первом сообщении (Hello). См. control/README.md.
+// Протокол управления службой (hp-server, hp-router) — трей и другие «пульты». TCP на loopback
+// или в LAN, кадр: u32 big-endian длина + данные. После рукопожатия (secure.rs) каждый кадр —
+// ControlMessage, зашифрованный ключом из строки подключения. См. control/README.md.
 syntax = "proto3";
 
 package hp.control;
@@ -21,16 +21,17 @@ message ControlMessage {
   }
 }
 
-// Первое сообщение клиента. Неверный токен — служба закрывает соединение.
+// Первое зашифрованное сообщение клиента. Не расшифровалось (другой ключ) — служба закрывает
+// соединение.
 message Hello {
-  string token = 1;
+  reserved 1;                // было: токен открытым текстом
   uint32 version = 2;
 }
 
 // Ответ службы на Hello.
 message Welcome {
   uint32 version = 1;
-  string service = 2;  // "hp-server"
+  string service = 2;  // "hp-server" | "hp-router"
   string build = 3;    // версия пакета
 }
 
@@ -44,7 +45,7 @@ message Subscribe {
 message Status {
   string service = 1;
   uint64 uptime_s = 2;
-  string mode = 3;           // tun | netstack
+  string mode = 3;           // tun | netstack | router
   string bind = 4;           // к чему привязаны сокеты дыр (BIND_ADDR), пусто — любой адрес
   repeated PeerStatus peers = 5;
   Traffic traffic = 6;
@@ -62,6 +63,7 @@ message PeerStatus {
   bool pending = 7;          // сопряжение ещё не завершено (телефон не подключался)
   uint64 pending_expires_unix = 8;
   bool removable = 9;         // сопряжён из трея (заданный в файле настроек удаляется только там)
+  string kind = 10;          // phone | vps
 }
 
 message HoleStatus {
@@ -74,11 +76,15 @@ message HoleStatus {
   float loss_in = 6;
 }
 
+// Пакеты: к пирам (телефонам) и от них, TCP с номером в потоке, отброшенные. У роутера ещё
+// шлюз дома: LAN → VPS и VPS → LAN.
 message Traffic {
   uint64 to_peers = 1;
   uint64 ordered = 2;
   uint64 from_peers = 3;
   uint64 dropped = 4;
+  uint64 lan_to_vps = 5;
+  uint64 vps_to_lan = 6;
 }
 
 // Добавить телефон: служба заводит новую пару GUID и её набор дыр, отвечает Pairing.

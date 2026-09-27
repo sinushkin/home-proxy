@@ -1,5 +1,5 @@
 // Окно трея home-proxy: состояние службы, телефоны и их дыры, сопряжение по QR.
-import { Button, ListView, Palette } from "std-widgets.slint";
+import { Button, LineEdit, ListView, Palette } from "std-widgets.slint";
 
 // Уровни: 0 — нет данных / нет связи со службой, 1 — плохо, 2 — частично / идёт пробив, 3 — хорошо.
 global Colors {
@@ -24,6 +24,7 @@ export struct HoleRow {
 
 export struct PeerRow {
     name: string,
+    title: string,
     state: string,
     level: int,
     live: int,
@@ -97,7 +98,7 @@ component PeerCard inherits Rectangle {
                     spacing: 8px;
                     alignment: stretch;
                     Dot { level: peer.level; y: 4px; }
-                    Text { text: "Телефон " + peer.name; font-weight: 700; font-size: 14px; vertical-alignment: center; }
+                    Text { text: peer.title; font-weight: 700; font-size: 14px; vertical-alignment: center; }
                     if peer.pending: Rectangle {
                         border-radius: 4px;
                         background: Colors.warn.transparentize(0.75);
@@ -168,6 +169,14 @@ export component MainWindow inherits Window {
     in property <int> qr-level: 2;
     in property <bool> busy: false;
 
+    // Настройка подключения: строка homeproxy-control://… от службы.
+    in-out property <bool> setup-visible: false;
+    in property <bool> setup-can-cancel: false;
+    in property <string> setup-error;
+    in property <bool> setup-busy: false;
+    callback connect-with(string);
+    callback open-setup();
+
     callback add-phone();
     callback close-qr();
     callback remove-peer(string);
@@ -217,7 +226,12 @@ export component MainWindow inherits Window {
         }
 
         HorizontalLayout {
-            alignment: end;
+            spacing: 8px;
+            Button {
+                text: "Служба…";
+                clicked => { root.open-setup(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
             Button {
                 text: root.busy ? "Готовлю код…" : "Добавить телефон";
                 primary: true;
@@ -266,6 +280,43 @@ export component MainWindow inherits Window {
             HorizontalLayout {
                 alignment: center;
                 Button { text: "Закрыть"; clicked => { root.close-qr(); } }
+            }
+        }
+    }
+
+    if root.setup-visible: Rectangle {
+        background: Palette.background;
+        TouchArea { }  // перехватывает клики под экраном настройки
+        VerticalLayout {
+            padding: 24px;
+            spacing: 12px;
+            alignment: center;
+            Text { text: "Подключение к службе"; font-size: 18px; font-weight: 700; }
+            Text {
+                text: "Вставьте строку подключения homeproxy-control://… — она хранится только в настройках этого трея.\n\n• Служба на этом ПК: выполните  hp-server --connection-string\n• Роутер: LuCI → Службы → Home Proxy → «Скопировать»";
+                wrap: word-wrap;
+                font-size: 13px;
+                color: Palette.foreground.transparentize(0.2);
+            }
+            input := LineEdit {
+                placeholder-text: "homeproxy-control://192.168.1.1:47001/…";
+                input-type: password;
+                accepted(text) => { root.connect-with(text); }
+            }
+            if root.setup-error != "": Text { text: root.setup-error; wrap: word-wrap; font-size: 12px; color: Colors.bad; }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                if root.setup-can-cancel: Button {
+                    text: "Отмена";
+                    clicked => { root.setup-visible = false; }
+                }
+                Button {
+                    text: root.setup-busy ? "Проверяю…" : "Подключить";
+                    primary: true;
+                    enabled: !root.setup-busy && input.text != "";
+                    clicked => { root.connect-with(input.text); }
+                }
             }
         }
     }

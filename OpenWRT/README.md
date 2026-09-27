@@ -150,6 +150,10 @@ $TOOLCHAIN_DIR/bin/mipsel-openwrt-linux-musl-readelf -d target/mipsel-unknown-li
 | + size-профиль (`opt-level=z`, LTO, `panic=abort`) | 2.43 МБ |
 | + без `regex` в `env_logger` | **1.71 МБ** |
 
+Это `peer`. `hp-router` (шлюз + телефоны): 1,97 МБ, с протоколом управления (трей, LuCI) —
+2,10 МБ; шифрование канала управления новых зависимостей не добавило (тот же ChaCha20-Poly1305,
+что у подписи дыр).
+
 Что ещё можно урезать (не сделано): фичи `tokio` (вместо `full` только
 `rt`, `net`, `time`, `sync`, `io-util`, `io-std`, `macros`; для одного ядра
 без `rt-multi-thread`).
@@ -175,7 +179,8 @@ logread -f -e peer
 Ввод с клавиатуры на роутере обычно не нужен (`</dev/null`: `peer` при закрытом
 stdin просто отключает ввод и работает). Автозапуск через procd — обычный
 init-скрипт (`/etc/init.d/peer`, `procd_set_param command`, `env LOG_TARGET=syslog`).
-Этот скрипт в репозитории не проверялся.
+Этот скрипт в репозитории не проверялся. Для `hp-router` init-скрипт есть и проверен —
+`luci-app-homeproxy/root/etc/init.d/hp-router` (вместе со страницей LuCI, `Tun.md`).
 
 ## Другие роутеры
 

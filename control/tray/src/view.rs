@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hp_control::proto::{HoleStatus, PeerStatus};
+use hp_control::proto::{HoleStatus, PeerStatus, Status};
 use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::{HoleRow, MainWindow, PeerRow, UiState};
@@ -92,12 +92,28 @@ fn state_text(peer: &PeerStatus) -> &'static str {
     }
 }
 
+fn is_vps(peer: &PeerStatus) -> bool {
+    peer.kind == "vps"
+}
+
+/// Телефоны (без VPS роутера и без ещё не сопряжённых).
+fn phones(status: &Status) -> Vec<&PeerStatus> {
+    status.peers.iter().filter(|p| !p.pending && !is_vps(p)).collect()
+}
+
 /// Уровень и подсказка для значка трея.
 pub fn summary(state: &UiState) -> (u8, String) {
     let Some(status) = &state.status else {
-        return (0, "Home Proxy: нет связи со службой".into());
+        let text = if state.configured { "Home Proxy: нет связи со службой" } else { "Home Proxy: служба не выбрана" };
+        return (0, text.into());
     };
-    let peers: Vec<&PeerStatus> = status.peers.iter().filter(|p| !p.pending).collect();
+    let vps = status.peers.iter().find(|p| is_vps(p));
+    if let Some(vps) = vps
+        && vps.live == 0
+    {
+        return (1, "Home Proxy: роутер без связи с VPS".into());
+    }
+    let peers = phones(status);
     if peers.is_empty() {
         return (2, "Home Proxy: телефонов нет".into());
     }
@@ -120,15 +136,20 @@ pub fn render(window: &MainWindow, state: &UiState) {
     window.set_error(state.error.clone().map(|e| format!("Служба недоступна: {e}")).unwrap_or_default().into());
 
     let Some(status) = &state.status else {
-        window.set_headline("Нет связи со службой".into());
-        window.set_details("Проверьте, что hp-server запущен и трей видит его control.token.".into());
+        if state.configured {
+            window.set_headline("Нет связи со службой".into());
+            window.set_details("Проверьте, что служба запущена. Если строку подключения меняли — вставьте новую («Служба…»).".into());
+        } else {
+            window.set_headline("Служба не выбрана".into());
+            window.set_details("Нажмите «Служба…» и вставьте строку подключения homeproxy-control://…".into());
+        }
         window.set_traffic(SharedString::new());
         sync_peers(window, Vec::new());
         render_pairing(window, state);
         return;
     };
 
-    let real: Vec<&PeerStatus> = status.peers.iter().filter(|p| !p.pending).collect();
+    let real = phones(status);
     let connected = real.iter().filter(|p| p.live > 0).count();
     window.set_headline(
         if real.is_empty() { "Служба работает, телефонов нет".to_string() } else { format!("На связи телефонов: {connected} из {}", real.len()) }.into(),
@@ -140,11 +161,16 @@ pub fn render(window: &MainWindow, state: &UiState) {
             .traffic
             .as_ref()
             .map(|t| {
+                let lan = if status.service == "hp-router" {
+                    format!("LAN → VPS {} · VPS → LAN {} · ", grouped(t.lan_to_vps), grouped(t.vps_to_lan))
+                } else {
+                    String::new()
+                };
                 format!(
-                    "пакетов к телефонам {} (TCP по порядку {}) · от телефонов {} · отброшено {}",
+                    "{lan}пакетов к телефонам {} · от телефонов {} · TCP по порядку {} · отброшено {}",
                     grouped(t.to_peers),
-                    grouped(t.ordered),
                     grouped(t.from_peers),
+                    grouped(t.ordered),
                     grouped(t.dropped)
                 )
             })
@@ -173,6 +199,7 @@ pub fn render(window: &MainWindow, state: &UiState) {
                 .collect();
             PeerRow {
                 name: peer.name.clone().into(),
+                title: if is_vps(peer) { "VPS (шлюз дома)".into() } else { format!("Телефон {}", peer.name).into() },
                 state: state_text(peer).into(),
                 level: peer_level(peer),
                 live: peer.live as i32,
@@ -234,7 +261,6 @@ fn render_pairing(window: &MainWindow, state: &UiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hp_control::proto::Status;
 
     #[test]
     fn number_and_percent_formatting() {
@@ -267,5 +293,11 @@ mod tests {
         assert_eq!(summary(&state).0, 2);
         state.status = Some(Status { peers: vec![peer("a", 0)], ..Default::default() });
         assert_eq!(summary(&state).0, 1);
+        // Роутер: без связи с VPS — красный, даже если телефоны на связи.
+        let vps = |live| PeerStatus { name: "VPS".into(), kind: "vps".into(), live, target: 10, ..Default::default() };
+        state.status = Some(Status { peers: vec![vps(0), peer("a", 10)], ..Default::default() });
+        assert_eq!(summary(&state).0, 1);
+        state.status = Some(Status { peers: vec![vps(10), peer("a", 10)], ..Default::default() });
+        assert_eq!(summary(&state).0, 3);
     }
 }

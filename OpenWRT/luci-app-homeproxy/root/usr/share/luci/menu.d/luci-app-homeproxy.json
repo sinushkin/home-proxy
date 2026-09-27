@@ -1,0 +1,13 @@
+{
+	"admin/services/homeproxy": {
+		"title": "Home Proxy",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "homeproxy/control"
+		},
+		"depends": {
+			"acl": [ "luci-app-homeproxy" ]
+		}
+	}
+}

@@ -1,10 +1,11 @@
 //! hpctl — консольный клиент протокола управления (без графики: сервер, роутер, скрипты).
 //!
-//!   hpctl [--addr ip:порт] [--token-file путь] status
+//!   hpctl --connect <строка подключения> status
 //!   hpctl … pair            — ссылка сопряжения нового телефона (секрет! для QR: qrencode -t ansiutf8)
 //!   hpctl … remove <имя>    — удалить сопряжённый телефон
 //!
-//! Токен — `control.token` из каталога настроек службы (по умолчанию — в текущем каталоге).
+//! Строка подключения — `--connect` или переменная `HP_CONTROL`. На той же машине, что и
+//! служба, можно вместо неё указать ключ службы: `--addr ip:порт --key-file control.key`.
 
 use std::path::PathBuf;
 
@@ -14,25 +15,33 @@ use hp_control::proto::{CreatePairing, GetStatus, RemovePeer};
 use hp_control::Client;
 
 fn usage() -> ! {
-    eprintln!("использование: hpctl [--addr ip:порт] [--token-file путь] status | pair | remove <имя>");
+    eprintln!("использование: hpctl [--connect строка | --addr ip:порт --key-file путь] status | pair | remove <имя>");
     std::process::exit(2);
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let mut connect = std::env::var("HP_CONTROL").ok();
     let mut addr = hp_control::DEFAULT_ADDR.to_string();
-    let mut token_file = PathBuf::from(hp_control::TOKEN_FILE);
+    let mut key_file: Option<PathBuf> = None;
     let mut command = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--connect" => connect = Some(args.next().unwrap_or_else(|| usage())),
             "--addr" => addr = args.next().unwrap_or_else(|| usage()),
-            "--token-file" => token_file = args.next().unwrap_or_else(|| usage()).into(),
+            "--key-file" => key_file = Some(args.next().unwrap_or_else(|| usage()).into()),
             _ => command.push(arg),
         }
     }
-    let token = hp_control::read_token(&token_file)?;
-    let (mut client, welcome) = Client::connect(addr.parse().context("--addr: ожидается ip:порт")?, &token).await?;
+    let (mut client, welcome) = match (key_file, connect) {
+        (Some(path), _) => {
+            let key = std::fs::read_to_string(&path).with_context(|| format!("не удалось прочитать ключ {}", path.display()))?;
+            Client::connect(addr.parse().context("--addr: ожидается ip:порт")?, key.trim()).await?
+        }
+        (None, Some(text)) => Client::connect_string(&text).await?,
+        (None, None) => usage(),
+    };
     match command.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["status"] => {
             let Body::Status(s) = client.request(Body::GetStatus(GetStatus {})).await? else { anyhow::bail!("ждали Status") };

@@ -1,6 +1,12 @@
-//! Протокол управления службой home-proxy (`hp-server`): сообщения (`proto`), кадрирование,
-//! токен доступа, клиент и ссылка сопряжения для QR. Сервер протокола живёт в самой службе,
-//! клиент — в трее (`control/tray`). Описание — `control/README.md`.
+//! Протокол управления службой home-proxy (`hp-server`, `hp-router`): сообщения (`proto`),
+//! защищённый канал (`secure`), сервер (`server`), клиент, строка подключения и ссылка
+//! сопряжения для QR. Описание — `control/README.md`.
+//!
+//! **Строка подключения** — `homeproxy-control://<ip:порт>/<ключ>`: адрес службы и ключ канала
+//! (32 случайных байта в base64url). Служба хранит ключ у себя (`control.key`, права 600) и
+//! показывает строку по запросу (`hp-server --connection-string`, LuCI на роутере); трей
+//! получает её от пользователя один раз и хранит в своих настройках. По сети ключ не
+//! передаётся: из него выводятся ключи шифрования сессии.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -8,7 +14,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+
+pub mod secure;
+pub mod server;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/hp.control.rs"));
@@ -17,24 +27,26 @@ pub mod proto {
 use proto::control_message::Body;
 use proto::{ControlMessage, Hello, PairingBundle, Welcome};
 
-/// Версия протокола в `Hello`/`Welcome`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Версия протокола в `Hello`/`Welcome` (2 — канал шифруется ключом строки подключения).
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Адрес управления по умолчанию: только loopback.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:47001";
-/// Имя файла токена рядом с настройками службы.
-pub const TOKEN_FILE: &str = "control.token";
+/// Имя файла ключа рядом с настройками службы.
+pub const KEY_FILE: &str = "control.key";
 /// Самый длинный кадр: статус десятков пиров — единицы килобайт.
 pub const MAX_FRAME: usize = 256 * 1024;
 /// Схема ссылки сопряжения (QR и deep link Android).
 pub const PAIRING_PREFIX: &str = "homeproxy://pair?d=";
+/// Схема строки подключения трея к службе.
+pub const CONNECTION_PREFIX: &str = "homeproxy-control://";
 
 /// Сообщение с телом `body`.
 pub fn message(body: Body) -> ControlMessage {
     ControlMessage { body: Some(body) }
 }
 
-/// Читает один кадр; `None` — соединение закрыто между кадрами.
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<ControlMessage>> {
+/// Читает один кадр (`u32` BE длина + байты); `None` — соединение закрыто между кадрами.
+pub async fn read_raw<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match reader.read_exact(&mut len).await {
         Ok(_) => {}
@@ -45,53 +57,55 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<C
     anyhow::ensure!(len <= MAX_FRAME, "кадр {len} байт длиннее {MAX_FRAME}");
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await.context("обрыв посреди кадра")?;
-    Ok(Some(ControlMessage::decode(buf.as_slice()).context("битый кадр управления")?))
+    Ok(Some(buf))
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, message: &ControlMessage) -> Result<()> {
-    let body = message.encode_to_vec();
+pub async fn write_raw<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<()> {
     anyhow::ensure!(body.len() <= MAX_FRAME, "кадр {} байт длиннее {MAX_FRAME}", body.len());
     let mut frame = Vec::with_capacity(4 + body.len());
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&body);
+    frame.extend_from_slice(body);
     writer.write_all(&frame).await?;
     Ok(())
 }
 
-/// Сравнение токенов за время, не зависящее от места первого расхождения.
-pub fn token_matches(expected: &str, given: &str) -> bool {
-    let (a, b) = (expected.as_bytes(), given.as_bytes());
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
-    }
-    diff == 0
-}
-
-/// Новый случайный токен: 32 байта из CSPRNG ОС (через v4 UUID), в hex.
-pub fn new_token() -> String {
+/// Новый ключ: 32 байта из CSPRNG ОС (через v4 UUID), base64url.
+pub fn new_key() -> String {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
     bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    base64url_encode(&bytes)
 }
 
-/// Токен из файла; если файла нет — создаёт новый (на Unix — с правами 600).
-pub fn load_or_create_token(path: &Path) -> Result<String> {
+/// Ключ из файла службы; если файла нет — создаёт новый (на Unix — с правами 600).
+pub fn load_or_create_key(path: &Path) -> Result<String> {
     if let Ok(text) = std::fs::read_to_string(path) {
-        let token = text.trim().to_string();
-        anyhow::ensure!(!token.is_empty(), "файл токена {} пуст", path.display());
-        return Ok(token);
+        let key = text.trim().to_string();
+        anyhow::ensure!(!key.is_empty(), "файл ключа {} пуст", path.display());
+        return Ok(key);
     }
-    let token = new_token();
-    write_private(path, &token).with_context(|| format!("не удалось записать токен {}", path.display()))?;
-    Ok(token)
+    replace_key(path)
 }
 
-/// Токен из файла (для клиента).
-pub fn read_token(path: &Path) -> Result<String> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("не удалось прочитать токен {}", path.display()))?;
-    Ok(text.trim().to_string())
+/// Новый ключ вместо прежнего: старые строки подключения перестают работать.
+pub fn replace_key(path: &Path) -> Result<String> {
+    let key = new_key();
+    write_private(path, &format!("{key}\n")).with_context(|| format!("не удалось записать ключ {}", path.display()))?;
+    Ok(key)
+}
+
+/// `homeproxy-control://<ip:порт>/<ключ>`.
+pub fn connection_string(addr: SocketAddr, key: &str) -> String {
+    format!("{CONNECTION_PREFIX}{addr}/{key}")
+}
+
+/// Адрес и ключ из строки подключения.
+pub fn parse_connection_string(text: &str) -> Result<(SocketAddr, String)> {
+    let rest = text.trim().strip_prefix(CONNECTION_PREFIX).context("строка подключения начинается с homeproxy-control://")?;
+    let (addr, key) = rest.split_once('/').context("в строке подключения нет ключа")?;
+    let addr = addr.parse().context("адрес службы в строке подключения: ожидается ip:порт")?;
+    anyhow::ensure!(key.len() >= 16 && base64url_decode(key).is_ok(), "ключ в строке подключения повреждён");
+    Ok((addr, key.to_string()))
 }
 
 /// Пишет файл, доступный только владельцу (на Unix — 600; на Windows права наследуются от каталога).
@@ -147,32 +161,44 @@ pub fn parse_pairing_uri(uri: &str) -> Result<PairingBundle> {
     Ok(PairingBundle::decode(base64url_decode(data)?.as_slice())?)
 }
 
-/// Соединение с `hp-server` после успешного `Hello`.
+/// Соединение со службой после рукопожатия и `Hello`.
 pub struct Client {
-    stream: TcpStream,
+    reader: secure::SealedReader<OwnedReadHalf>,
+    writer: secure::SealedWriter<OwnedWriteHalf>,
 }
 
 impl Client {
-    pub async fn connect(addr: SocketAddr, token: &str) -> Result<(Self, Welcome)> {
-        let mut stream = TcpStream::connect(addr).await.with_context(|| format!("нет связи со службой {addr}"))?;
+    /// Подключение по строке подключения.
+    pub async fn connect_string(connection: &str) -> Result<(Self, Welcome)> {
+        let (addr, key) = parse_connection_string(connection)?;
+        Self::connect(addr, &key).await
+    }
+
+    pub async fn connect(addr: SocketAddr, key: &str) -> Result<(Self, Welcome)> {
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("служба {addr} не отвечает"))?
+            .with_context(|| format!("нет связи со службой {addr}"))?;
         stream.set_nodelay(true)?;
-        let hello = message(Body::Hello(Hello { token: token.to_string(), version: PROTOCOL_VERSION }));
-        write_frame(&mut stream, &hello).await?;
-        match read_frame(&mut stream).await? {
-            Some(ControlMessage { body: Some(Body::Welcome(welcome)) }) => Ok((Self { stream }, welcome)),
-            Some(ControlMessage { body: Some(Body::Error(e)) }) => anyhow::bail!("служба отказала: {}", e.message),
-            None => anyhow::bail!("служба закрыла соединение (неверный токен?)"),
-            Some(other) => anyhow::bail!("неожиданный ответ на Hello: {other:?}"),
+        let (reader, writer) = stream.into_split();
+        let (reader, writer) = secure::client(reader, writer, key).await?;
+        let mut client = Self { reader, writer };
+        client.send(Body::Hello(Hello { version: PROTOCOL_VERSION })).await?;
+        match client.reader.recv().await {
+            Ok(Some(ControlMessage { body: Some(Body::Welcome(welcome)) })) => Ok((client, welcome)),
+            Ok(Some(ControlMessage { body: Some(Body::Error(e)) })) => anyhow::bail!("служба отказала: {}", e.message),
+            Ok(None) | Err(_) => anyhow::bail!("служба не приняла ключ: строка подключения устарела или от другой службы"),
+            Ok(Some(_)) => anyhow::bail!("неожиданный ответ на Hello"),
         }
     }
 
     pub async fn send(&mut self, body: Body) -> Result<()> {
-        write_frame(&mut self.stream, &message(body)).await
+        self.writer.send(&message(body)).await
     }
 
     /// Следующее сообщение службы; ошибка — если соединение закрыто.
     pub async fn recv(&mut self) -> Result<Body> {
-        let message = read_frame(&mut self.stream).await?.context("служба закрыла соединение")?;
+        let message = self.reader.recv().await?.context("служба закрыла соединение")?;
         message.body.context("пустое сообщение")
     }
 
@@ -219,24 +245,26 @@ mod tests {
     }
 
     #[test]
-    fn tokens() {
-        assert!(token_matches("abc", "abc"));
-        assert!(!token_matches("abc", "abd"));
-        assert!(!token_matches("abc", "abcd"));
-        assert!(!token_matches("abc", ""));
-        let token = new_token();
-        assert_eq!(token.len(), 64);
-        assert_ne!(token, new_token());
+    fn keys_and_connection_strings() {
+        let key = new_key();
+        assert_eq!(key.len(), 43);
+        assert_ne!(key, new_key());
+        let text = connection_string("192.168.1.1:47001".parse().unwrap(), &key);
+        assert_eq!(text, format!("homeproxy-control://192.168.1.1:47001/{key}"));
+        assert_eq!(parse_connection_string(&format!("  {text}\n")).unwrap(), ("192.168.1.1:47001".parse().unwrap(), key));
+        assert!(parse_connection_string("192.168.1.1:47001/abc").is_err());
+        assert!(parse_connection_string("homeproxy-control://192.168.1.1:47001").is_err());
+        assert!(parse_connection_string("homeproxy-control://router:47001/aaaaaaaaaaaaaaaaaaaa").is_err());
     }
 
     #[tokio::test]
-    async fn frames_keep_boundaries() {
+    async fn raw_frames_keep_boundaries() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        write_frame(&mut a, &message(Body::GetStatus(proto::GetStatus {}))).await.unwrap();
-        write_frame(&mut a, &message(Body::Subscribe(proto::Subscribe { interval_ms: 1000 }))).await.unwrap();
+        write_raw(&mut a, b"one").await.unwrap();
+        write_raw(&mut a, b"second").await.unwrap();
         drop(a);
-        assert!(matches!(read_frame(&mut b).await.unwrap().unwrap().body, Some(Body::GetStatus(_))));
-        assert!(matches!(read_frame(&mut b).await.unwrap().unwrap().body, Some(Body::Subscribe(s)) if s.interval_ms == 1000));
-        assert!(read_frame(&mut b).await.unwrap().is_none());
+        assert_eq!(read_raw(&mut b).await.unwrap().unwrap(), b"one");
+        assert_eq!(read_raw(&mut b).await.unwrap().unwrap(), b"second");
+        assert!(read_raw(&mut b).await.unwrap().is_none());
     }
 }

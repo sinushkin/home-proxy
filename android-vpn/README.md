@@ -99,3 +99,11 @@ adb shell ping -c3 10.80.0.1      # adb shell ходит через VPN (иск�
 телефон до домашнего ПК на Windows (10/10 дыр, `ping` через туннель).
 
 Не проверено: схема телефон → ПК с TUN, arm64, длительная работа и смена сети.
+
+## Сопряжение по QR (ещё не сделано)
+
+Трей на ПК ([`../control`](../control/README.md)) уже показывает QR сопряжения —
+`homeproxy://pair?d=<base64url(PairingBundle)>` с GUID телефона и службы (ПК или роутера),
+STUN, MQTT и CA. В приложении пока нет экрана «Сканировать» и обработки deep link: GUID и
+адреса по-прежнему задаются вручную (или `am start` из adb). План — камера + ZXing
+(`zxing-android-embedded`, без Google Play Services), разбор пакета в `Settings`.

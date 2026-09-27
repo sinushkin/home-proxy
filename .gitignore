@@ -33,6 +33,8 @@ wsl/out/
 # Книга выданных адресов в туннеле (hp-server, vps-server)
 addresses.state
 
-# Сопряжённые из трея телефоны (полные GUID пары) и токен управления (hp-server)
+# Сопряжённые из трея телефоны (полные GUID пары) и ключ канала управления (hp-server, hp-router)
 peers.state
+phones.state
+control.key
 control.token

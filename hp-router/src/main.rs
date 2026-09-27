@@ -9,38 +9,52 @@
 //!    этого `client_id` — обратно телефону. Порядок возвращает конечный получатель (VPS или
 //!    телефон), TUN и стек ядра роутера пакеты телефонов не проходят.
 //!
-//! Запуск: `hp-router [--config router.env]` (без `--config` — `router.env` рядом с бинарником,
-//! если есть, иначе только окружение). Настройки:
+//! Телефоны задаются в настройках (`PHONE_<n>_*`) или добавляются из трея по протоколу
+//! управления (`hp-control`): роутер сам заводит пару GUID и номер телефона, после первого
+//! подключения телефон сохраняется в `phones.state`.
+//!
+//! Запуск: `hp-router [--config router.env] [--connection-string | --new-connection-string]`
+//! (без `--config` — `router.env` рядом с бинарником, если есть, иначе только окружение).
+//! `--connection-string` печатает строку подключения трея, `--new-connection-string` меняет ключ
+//! (прежние строки перестают работать сразу) — это вызывает LuCI. Настройки:
 //!   VPS_SERVER — адрес VPS `ip[:порт знакомства]` (порт по умолчанию 40000);
 //!   VPS_MY_ID / VPS_PEER_ID — GUID роутера и VPS-сервера;
 //!   TUN_NAME (`hp0`), TUN_MTU (1400) — адрес в туннеле роутеру выдаёт VPS (и телефонам тоже:
 //!   их запросы роутер пересылает на VPS со своим номером телефона);
-//!   STUN_ADDR (один или несколько через запятую), MQTT_ADDR, MQTT_CA — для телефонов;
+//!   STUN_ADDR (один или несколько через запятую), MQTT_ADDR, MQTT_CA — для телефонов (без них
+//!   телефонов нет и сопряжение недоступно);
 //!   PHONE_<n>_MY_ID / PHONE_<n>_PEER_ID — GUID роутера и телефона n, n = 1, 2, 3 … подряд
 //!   (до 255); `n` и есть `client_id`. У каждого набора свой GUID роутера: брокер различает
-//!   клиентов по нему. Телефонов может не быть — тогда только шлюз;
+//!   клиентов по нему;
+//!   CONTROL_ADDR — адрес протокола управления в LAN (`192.168.1.1:47001`; по умолчанию выключен:
+//!   не `0.0.0.0` и не WAN); CONTROL_KEY_FILE (`control.key`), PHONES_FILE (`phones.state`) —
+//!   рядом с настройками;
 //!   REORDER_WAIT_MS, DATA_HOLES — как у `vps-client`; RUNTIME=multi — многопоточный tokio
 //!   (по умолчанию однопоточный: на одноядерном роутере так быстрее);
 //!   RUST_LOG, LOG_FILE — логи.
 //! Сокеты дыр телефонов, STUN и MQTT должны ходить мимо `hp0` (напрямую через WAN): маршрут по
-//! умолчанию в `hp0` — только для LAN (правило по источнику), см. `OpenWRT/Router.md`.
+//! умолчанию в `hp0` — только для LAN (правило по источнику), см. `OpenWRT/Tun.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use connection::multilink::{Control, Discovery, Incoming, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::auth::peer_name;
+use connection::multilink::{ConnState, Control, Discovery, Incoming, LinkStatus, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
 use connection::proto::AddressKind;
+use hp_control::proto;
+use hp_server::service::{now_unix, pairing, PAIRING_TTL};
 use hp_server::settings::Settings;
+use hp_server::Peer;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Phone {
     /// Номер телефона (`n` из `PHONE_<n>_*`), он же `client_id` в `WrappedData`.
     client_id: u8,
@@ -49,10 +63,11 @@ struct Phone {
 }
 
 /// Общее для наборов дыр к телефонам.
+#[derive(Clone)]
 struct PhoneDiscovery {
     stun_addrs: Vec<SocketAddr>,
     mqtt_addr: SocketAddr,
-    mqtt_ca: PathBuf,
+    mqtt_ca_pem: Vec<u8>,
 }
 
 struct Config {
@@ -64,8 +79,11 @@ struct Config {
     reorder_wait: Duration,
     data_holes: u8,
     phones: Vec<Phone>,
-    /// `None`, если телефонов нет.
+    /// `None` — STUN/MQTT не заданы: телефонов нет, сопряжение недоступно.
     phone_discovery: Option<PhoneDiscovery>,
+    control: Option<SocketAddr>,
+    key_file: PathBuf,
+    phones_file: PathBuf,
 }
 
 impl Config {
@@ -78,13 +96,14 @@ impl Config {
         };
 
         let phones = parse_phones(&get)?;
-        let phone_discovery = if phones.is_empty() {
+        let phone_discovery = if phones.is_empty() && get("STUN_ADDR").is_none() {
             None
         } else {
+            let mqtt_ca = settings.resolve(need("MQTT_CA")?.trim());
             Some(PhoneDiscovery {
                 stun_addrs: connection::stun::parse_servers(&need("STUN_ADDR")?).context("STUN_ADDR")?,
                 mqtt_addr: need("MQTT_ADDR")?.trim().parse().context("MQTT_ADDR: ожидается ip:порт")?,
-                mqtt_ca: settings.resolve(need("MQTT_CA")?.trim()),
+                mqtt_ca_pem: std::fs::read(&mqtt_ca).with_context(|| format!("не удалось прочитать CA-сертификат {}", mqtt_ca.display()))?,
             })
         };
         let config = Self {
@@ -97,6 +116,9 @@ impl Config {
             data_holes: u8::try_from(number("DATA_HOLES", 0)?).context("DATA_HOLES")?,
             phones,
             phone_discovery,
+            control: control_addr(&get)?,
+            key_file: settings.resolve(get("CONTROL_KEY_FILE").as_deref().unwrap_or(hp_control::KEY_FILE).trim()),
+            phones_file: settings.resolve(get("PHONES_FILE").as_deref().unwrap_or("phones.state").trim()),
         };
 
         let mut router_ids = HashSet::from([config.vps_my_id]);
@@ -104,10 +126,22 @@ impl Config {
             anyhow::ensure!(
                 router_ids.insert(phone.my_id),
                 "GUID роутера {} встречается дважды: у каждого набора дыр он должен быть свой",
-                phone.my_id
+                peer_name(&phone.my_id)
             );
         }
         Ok(config)
+    }
+}
+
+/// `CONTROL_ADDR`: выключено, если не задан или `off`; `0.0.0.0` не принимаем — только адрес LAN.
+fn control_addr(get: &impl Fn(&str) -> Option<String>) -> Result<Option<SocketAddr>> {
+    match get("CONTROL_ADDR").as_deref().map(str::trim) {
+        None | Some("") | Some("off") => Ok(None),
+        Some(text) => {
+            let addr: SocketAddr = text.parse().context("CONTROL_ADDR: ожидается ip:порт адреса LAN")?;
+            anyhow::ensure!(!addr.ip().is_unspecified(), "CONTROL_ADDR: не 0.0.0.0 — только адрес LAN (иначе управление видно из WAN)");
+            Ok(Some(addr))
+        }
     }
 }
 
@@ -128,26 +162,49 @@ fn parse_phones(get: &impl Fn(&str) -> Option<String>) -> Result<Vec<Phone>> {
             my_id: my.trim().parse().with_context(|| format!("{my_name}: некорректный GUID"))?,
             peer_id: peer.trim().parse().with_context(|| format!("{peer_name}: некорректный GUID"))?,
         };
-        anyhow::ensure!(phone_ids.insert(phone.peer_id), "GUID телефона {} указан дважды", phone.peer_id);
+        anyhow::ensure!(phone_ids.insert(phone.peer_id), "GUID телефона {} указан дважды", connection::auth::peer_name(&phone.peer_id));
         phones.push(phone);
     }
     Ok(phones)
 }
 
-fn config_path() -> Result<Option<PathBuf>> {
-    let mut args = std::env::args().skip(1);
-    match (args.next().as_deref(), args.next()) {
-        (None, _) => {
-            let default = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("router.env")));
-            Ok(default.filter(|p| p.is_file()))
+/// Что сделать вместо запуска.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Run,
+    ConnectionString,
+    NewConnectionString,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Option<PathBuf>, Action)> {
+    let (mut config, mut action) = (None, Action::Run);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => config = Some(args.next().context("--config: нужен путь")?.into()),
+            "--connection-string" => action = Action::ConnectionString,
+            "--new-connection-string" => action = Action::NewConnectionString,
+            _ => anyhow::bail!("использование: hp-router [--config router.env] [--connection-string | --new-connection-string]"),
         }
-        (Some("--config"), Some(path)) => Ok(Some(path.into())),
-        _ => anyhow::bail!("использование: hp-router [--config router.env]"),
     }
+    if config.is_none() {
+        let default = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("router.env")));
+        config = default.filter(|p| p.is_file());
+    }
+    Ok((config, action))
 }
 
 fn main() -> Result<()> {
-    let settings = Settings::load(config_path()?.as_deref())?;
+    let (config_path, action) = parse_args(std::env::args().skip(1))?;
+    let settings = Settings::load(config_path.as_deref())?;
+    if action != Action::Run {
+        let get = |name: &str| settings.get(name);
+        let addr = control_addr(&get)?.context("управление выключено: задайте CONTROL_ADDR=<адрес LAN>:47001")?;
+        let key_file = settings.resolve(get("CONTROL_KEY_FILE").as_deref().unwrap_or(hp_control::KEY_FILE).trim());
+        let key = if action == Action::NewConnectionString { hp_control::replace_key(&key_file)? } else { hp_control::load_or_create_key(&key_file)? };
+        println!("{}", hp_control::connection_string(addr, &key));
+        return Ok(());
+    }
     hp_server::init_logging(&settings)?;
     let config = Config::from_settings(&settings)?;
     let runtime = if settings.get("RUNTIME").as_deref() == Some("multi") {
@@ -179,8 +236,248 @@ struct RelayStats {
     to_phones: DirectionStats,
 }
 
+/// Откуда телефон.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    /// `PHONE_<n>_*` в настройках: удалить можно только там.
+    Settings,
+    /// Сопряжён из трея, хранится в `phones.state`.
+    Paired,
+    /// Ждёт первого подключения до этого момента (unix-время).
+    Pending(u64),
+}
+
+struct PhoneEntry {
+    phone: Phone,
+    link: Arc<MultiLink>,
+    origin: Origin,
+    /// Адрес в туннеле, который VPS выдал телефону.
+    address: Option<Ipv4Addr>,
+    _tasks: [AbortOnDrop; 2],
+}
+
+/// Телефоны по `client_id`. Пакеты VPS → телефон берут блокировку на чтение (без записи в
+/// горячем пути); запись — только при добавлении, удалении и выдаче адреса.
+type Phones = Arc<RwLock<HashMap<u8, PhoneEntry>>>;
+
+fn link_of(phones: &Phones, client_id: u8) -> Option<Arc<MultiLink>> {
+    phones.read().unwrap().get(&client_id).map(|e| e.link.clone())
+}
+
+struct Router {
+    vps: Arc<MultiLink>,
+    vps_address: Ipv4Addr,
+    phones: Phones,
+    discovery: Option<PhoneDiscovery>,
+    phone_options: MultiLinkOptions,
+    stats: Arc<RelayStats>,
+    bridge: hp_tun::bridge::Bridge,
+    phones_file: PathBuf,
+    started: Instant,
+    /// Сопряжения по одному: номер телефона и ожидающий набор выбираются без гонок.
+    pairing_lock: tokio::sync::Mutex<()>,
+}
+
+impl Router {
+    async fn add_phone(&self, phone: Phone, origin: Origin) -> Result<()> {
+        let discovery = self.discovery.as_ref().context("для телефонов нужны STUN_ADDR, MQTT_ADDR и MQTT_CA")?;
+        let (link, rx) = MultiLink::start_with(
+            &peer_name(&phone.peer_id),
+            discovery.stun_addrs.clone(),
+            discovery.mqtt_addr,
+            discovery.mqtt_ca_pem.clone(),
+            phone.my_id,
+            phone.peer_id,
+            self.phone_options,
+        )
+        .await
+        .with_context(|| format!("телефон {}", phone.client_id))?;
+        let link = Arc::new(link);
+        let control = link.take_control().expect("приёмник служебных сообщений забираем один раз");
+        let tasks = [
+            AbortOnDrop(tokio::spawn(phone_to_vps(phone.client_id, rx, self.vps.clone(), self.stats.clone()))),
+            AbortOnDrop(tokio::spawn(phone_requests_to_vps(phone.client_id, control, self.vps.clone()))),
+        ];
+        log::info!("телефон {} ({}): ищем", phone.client_id, peer_name(&phone.peer_id));
+        self.phones.write().unwrap().insert(phone.client_id, PhoneEntry { phone, link, origin, address: None, _tasks: tasks });
+        Ok(())
+    }
+
+    /// Сопряжённые раньше телефоны из `phones.state`: `client_id GUID-роутера GUID-телефона`.
+    async fn add_paired_from_file(&self) -> Result<()> {
+        let Ok(text) = std::fs::read_to_string(&self.phones_file) else { return Ok(()) };
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let parsed = (parts.next().map(str::parse::<u8>), parts.next().map(str::parse::<Uuid>), parts.next().map(str::parse::<Uuid>));
+            let (Some(Ok(client_id)), Some(Ok(my_id)), Some(Ok(peer_id))) = parsed else {
+                log::warn!("{}:{}: ожидается «номер GUID-роутера GUID-телефона», строка пропущена", self.phones_file.display(), n + 1);
+                continue;
+            };
+            if client_id == 0 || self.phones.read().unwrap().contains_key(&client_id) {
+                log::warn!("{}:{}: номер телефона {client_id} уже занят, строка пропущена", self.phones_file.display(), n + 1);
+                continue;
+            }
+            self.add_phone(Phone { client_id, my_id, peer_id }, Origin::Paired).await?;
+        }
+        Ok(())
+    }
+
+    fn save_paired(&self) -> Result<()> {
+        let mut text = String::from("# Сопряжённые телефоны: номер, GUID роутера, GUID телефона. Секрет пары — не публиковать.\n");
+        let phones = self.phones.read().unwrap();
+        let mut paired: Vec<&PhoneEntry> = phones.values().filter(|e| e.origin == Origin::Paired).collect();
+        paired.sort_by_key(|e| e.phone.client_id);
+        for e in paired {
+            text.push_str(&format!("{} {} {}\n", e.phone.client_id, e.phone.my_id, e.phone.peer_id));
+        }
+        hp_control::write_private(&self.phones_file, &text).with_context(|| format!("запись {}", self.phones_file.display()))
+    }
+
+    /// Раз в секунду: ожидающий телефон подключился — сохранить; истёк — остановить.
+    fn housekeeping(&self) {
+        let now = now_unix();
+        let mut promoted = false;
+        self.phones.write().unwrap().retain(|_, e| {
+            let Origin::Pending(expires) = e.origin else { return true };
+            if e.link.live_count() > 0 {
+                log::info!("сопряжение: телефон {} подключился", e.phone.client_id);
+                e.origin = Origin::Paired;
+                promoted = true;
+                true
+            } else if now > expires {
+                log::info!("сопряжение: телефон {} не подключился, пакет истёк", e.phone.client_id);
+                false
+            } else {
+                true
+            }
+        });
+        if promoted && let Err(e) = self.save_paired() {
+            log::warn!("не удалось сохранить сопряжённые телефоны: {e:#}");
+        }
+    }
+
+    fn live_counts(&self) -> Vec<(u8, usize)> {
+        let mut v: Vec<_> = self.phones.read().unwrap().iter().map(|(id, e)| (*id, e.link.live_count())).collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+fn peer_status(name: String, kind: &str, status: LinkStatus) -> proto::PeerStatus {
+    proto::PeerStatus {
+        name,
+        state: match status.state {
+            ConnState::Rendezvous => "rendezvous",
+            ConnState::Punching => "punching",
+            ConnState::Connected(_) => "connected",
+        }
+        .into(),
+        live: status.holes.len() as u32,
+        target: u32::from(TARGET_LINKS),
+        holes: status
+            .holes
+            .iter()
+            .map(|h| proto::HoleStatus {
+                slot: u32::from(h.slot),
+                peer_addr: h.peer_addr.map(|a| a.to_string()).unwrap_or_default(),
+                sent: h.sent,
+                received: h.received,
+                loss_out: h.loss_out.unwrap_or(-1.0),
+                loss_in: h.loss_in.unwrap_or(-1.0),
+            })
+            .collect(),
+        kind: kind.into(),
+        ..Default::default()
+    }
+}
+
+impl hp_control::server::Controlled for Router {
+    fn service(&self) -> &'static str {
+        "hp-router"
+    }
+
+    fn status(&self) -> proto::Status {
+        let mut peers = vec![proto::PeerStatus {
+            addresses: vec![self.vps_address.to_string()],
+            ..peer_status("VPS".into(), "vps", self.vps.status())
+        }];
+        let phones = self.phones.read().unwrap();
+        let mut list: Vec<&PhoneEntry> = phones.values().collect();
+        list.sort_by_key(|e| e.phone.client_id);
+        for e in list {
+            peers.push(proto::PeerStatus {
+                addresses: e.address.iter().map(|a| a.to_string()).collect(),
+                pending: matches!(e.origin, Origin::Pending(_)),
+                pending_expires_unix: if let Origin::Pending(t) = e.origin { t } else { 0 },
+                removable: e.origin != Origin::Settings,
+                ..peer_status(peer_name(&e.phone.peer_id), "phone", e.link.status())
+            });
+        }
+        let (lan_to_vps, ordered, vps_to_lan, lan_dropped) = self.bridge.stats().snapshot();
+        let (to_vps, to_vps_dropped) = self.stats.to_vps.snapshot();
+        let (to_phones, to_phones_dropped) = self.stats.to_phones.snapshot();
+        proto::Status {
+            service: "hp-router".into(),
+            uptime_s: self.started.elapsed().as_secs(),
+            mode: "router".into(),
+            peers,
+            traffic: Some(proto::Traffic {
+                to_peers: to_phones.into(),
+                ordered: ordered.into(),
+                from_peers: to_vps.into(),
+                dropped: u64::from(lan_dropped) + u64::from(to_vps_dropped) + u64::from(to_phones_dropped),
+                lan_to_vps: lan_to_vps.into(),
+                vps_to_lan: vps_to_lan.into(),
+            }),
+            pairing_supported: self.discovery.is_some(),
+            ..Default::default()
+        }
+    }
+
+    async fn create_pairing(&self) -> Result<proto::Pairing> {
+        let discovery = self.discovery.clone().context("сопряжение недоступно: не заданы STUN_ADDR, MQTT_ADDR, MQTT_CA")?;
+        let _guard = self.pairing_lock.lock().await;
+        let expires = now_unix() + PAIRING_TTL.as_secs();
+        let reused = self.phones.write().unwrap().values_mut().find(|e| matches!(e.origin, Origin::Pending(_))).map(|e| {
+            e.origin = Origin::Pending(expires);
+            e.phone
+        });
+        let phone = match reused {
+            Some(phone) => phone,
+            None => {
+                let client_id = {
+                    let phones = self.phones.read().unwrap();
+                    (1..=u8::MAX).find(|id| !phones.contains_key(id)).context("все 255 номеров телефонов заняты")?
+                };
+                let phone = Phone { client_id, my_id: Uuid::new_v4(), peer_id: Uuid::new_v4() };
+                self.add_phone(phone, Origin::Pending(expires)).await?;
+                phone
+            }
+        };
+        log::info!("сопряжение: ждём телефон {} ({}) до {expires} (unix)", phone.client_id, peer_name(&phone.peer_id));
+        let peer = Peer { my_id: phone.my_id, peer_id: phone.peer_id };
+        Ok(pairing(peer, &discovery.stun_addrs, discovery.mqtt_addr, discovery.mqtt_ca_pem, expires))
+    }
+
+    fn remove_peer(&self, name: &str) -> Result<()> {
+        let removed = {
+            let mut phones = self.phones.write().unwrap();
+            let client_id = phones.iter().find(|(_, e)| peer_name(&e.phone.peer_id) == name).map(|(id, _)| *id).with_context(|| format!("нет телефона {name}"))?;
+            anyhow::ensure!(phones[&client_id].origin != Origin::Settings, "телефон {name} задан в настройках (PHONE_<n>_*) — удалите его там");
+            phones.remove(&client_id)
+        };
+        drop(removed);
+        log::info!("телефон {name} удалён");
+        self.save_paired()
+    }
+}
+
 async fn run(config: Config) -> Result<()> {
-    log::info!("hp-router: VPS {} (я {}), телефонов {}", config.vps_server, connection::auth::peer_name(&config.vps_my_id), config.phones.len());
+    log::info!("hp-router: VPS {} (я {}), телефонов в настройках {}", config.vps_server, peer_name(&config.vps_my_id), config.phones.len());
     // Пакеты телефонов роутер перекладывает насквозь: порядок им вернёт VPS или сам телефон.
     let vps_options = MultiLinkOptions {
         reorder_wait: config.reorder_wait,
@@ -213,48 +510,43 @@ async fn run(config: Config) -> Result<()> {
     let (to_phones_tx, to_phones_rx) = mpsc::channel::<Incoming>(256);
     let bridge = hp_tun::bridge::Bridge::start_relay(tun, vps.clone(), vps_rx, to_phones_tx);
 
-    let stats = Arc::new(RelayStats::default());
-    let mut phones = HashMap::new();
-    if let Some(discovery) = &config.phone_discovery {
-        let ca_pem = std::fs::read(&discovery.mqtt_ca)
-            .with_context(|| format!("не удалось прочитать CA-сертификат {}", discovery.mqtt_ca.display()))?;
-        let phone_options = MultiLinkOptions {
-            reorder_wait: Duration::ZERO,
-            data_holes: config.data_holes,
-            ..MultiLinkOptions::default()
-        };
-        for phone in &config.phones {
-            let (link, rx) = MultiLink::start_with(
-                &format!("phone{}", phone.client_id),
-                discovery.stun_addrs.clone(),
-                discovery.mqtt_addr,
-                ca_pem.clone(),
-                phone.my_id,
-                phone.peer_id,
-                phone_options,
-            )
-            .await
-            .with_context(|| format!("телефон {}", phone.client_id))?;
-            let link = Arc::new(link);
-            tokio::spawn(phone_to_vps(phone.client_id, rx, vps.clone(), stats.clone()));
-            let control = link.take_control().expect("приёмник служебных сообщений забираем один раз");
-            tokio::spawn(phone_requests_to_vps(phone.client_id, control, vps.clone()));
-            phones.insert(phone.client_id, link);
-        }
+    let router = Arc::new(Router {
+        vps: vps.clone(),
+        vps_address: assigned.address,
+        phones: Arc::default(),
+        discovery: config.phone_discovery.clone(),
+        phone_options: MultiLinkOptions { reorder_wait: Duration::ZERO, data_holes: config.data_holes, ..MultiLinkOptions::default() },
+        stats: Arc::new(RelayStats::default()),
+        bridge,
+        phones_file: config.phones_file.clone(),
+        started: Instant::now(),
+        pairing_lock: tokio::sync::Mutex::new(()),
+    });
+    for phone in &config.phones {
+        router.add_phone(*phone, Origin::Settings).await?;
     }
-    let phones = Arc::new(phones);
-    tokio::spawn(vps_to_phones(to_phones_rx, phones.clone(), stats.clone()));
-    tokio::spawn(vps_answers_to_phones(vps_control, phones.clone()));
+    router.add_paired_from_file().await?;
+    tokio::spawn(vps_to_phones(to_phones_rx, router.phones.clone(), router.stats.clone()));
+    tokio::spawn(vps_answers_to_phones(vps_control, router.phones.clone()));
 
+    if let Some(addr) = config.control {
+        hp_control::load_or_create_key(&config.key_file)?;
+        let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("управление: не удалось занять {addr}"))?;
+        log::info!("управление: {addr}; строка подключения — hp-router --connection-string (или LuCI)");
+        tokio::spawn(hp_control::server::serve(listener, config.key_file.clone(), router.clone()));
+    }
+
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut last_log = Instant::now();
     let mut last = None;
     loop {
-        tokio::time::sleep(STATUS_INTERVAL).await;
-        let phone_holes: Vec<(u8, usize)> = {
-            let mut v: Vec<_> = phones.iter().map(|(id, link)| (*id, link.live_count())).collect();
-            v.sort_unstable();
-            v
-        };
-        let now = (vps.live_count(), bridge.stats().snapshot(), stats.to_vps.snapshot(), stats.to_phones.snapshot(), phone_holes);
+        tick.tick().await;
+        router.housekeeping();
+        if last_log.elapsed() < STATUS_INTERVAL {
+            continue;
+        }
+        last_log = Instant::now();
+        let now = (vps.live_count(), router.bridge.stats().snapshot(), router.stats.to_vps.snapshot(), router.stats.to_phones.snapshot(), router.live_counts());
         if Some(&now) != last.as_ref() {
             let (to, ordered, from, dropped) = now.1;
             let holes: Vec<String> = now.4.iter().map(|(id, n)| format!("{id}:{n}")).collect();
@@ -293,11 +585,20 @@ async fn phone_requests_to_vps(client_id: u8, mut control: mpsc::Receiver<Contro
 }
 
 /// Ответы VPS на адреса телефонов — телефону по `client_id` (без номера: телефон его не знает).
-async fn vps_answers_to_phones(mut control: mpsc::Receiver<Control>, phones: Arc<HashMap<u8, Arc<MultiLink>>>) {
+async fn vps_answers_to_phones(mut control: mpsc::Receiver<Control>, phones: Phones) {
     while let Some(message) = control.recv().await {
         let Control::AddressAssign(mut assign) = message else { continue };
         let Some(client_id) = assign.client_id.take().and_then(|c| u8::try_from(c).ok()) else { continue };
-        match phones.get(&client_id) {
+        let link = {
+            let mut phones = phones.write().unwrap();
+            phones.get_mut(&client_id).map(|entry| {
+                if let Ok(octets) = <[u8; 4]>::try_from(assign.address.as_slice()) {
+                    entry.address = Some(Ipv4Addr::from(octets));
+                }
+                entry.link.clone()
+            })
+        };
+        match link {
             Some(phone) => {
                 let _ = phone.send_control(Control::AddressAssign(assign)).await;
             }
@@ -322,15 +623,15 @@ async fn phone_to_vps(client_id: u8, mut rx: mpsc::Receiver<Incoming>, vps: Arc<
             }
         };
     }
-    log::warn!("телефон {client_id}: канал входящих закрыт");
+    log::debug!("телефон {client_id}: канал входящих закрыт");
 }
 
 /// VPS → телефон по `client_id`: номера VPS сохраняются (`Ordered`), телефон вернёт порядок сам.
-async fn vps_to_phones(mut rx: mpsc::Receiver<Incoming>, phones: Arc<HashMap<u8, Arc<MultiLink>>>, stats: Arc<RelayStats>) {
+async fn vps_to_phones(mut rx: mpsc::Receiver<Incoming>, phones: Phones, stats: Arc<RelayStats>) {
     use std::sync::atomic::Ordering::Relaxed;
     while let Some(packet) = rx.recv().await {
         let Some(client_id) = packet.wrapped.map(|w| w.client_id) else { continue };
-        let Some(phone) = phones.get(&client_id) else {
+        let Some(phone) = link_of(&phones, client_id) else {
             log::debug!("VPS прислал пакет неизвестному телефону {client_id}");
             stats.to_phones.dropped.fetch_add(1, Relaxed);
             continue;
@@ -376,6 +677,22 @@ mod tests {
             "после пропуска номера (3) дальше не читаем"
         );
         assert!(parse_phones(&getter(&[])).unwrap().is_empty(), "без телефонов — только шлюз");
+    }
+
+    #[test]
+    fn control_only_on_a_lan_address() {
+        assert_eq!(control_addr(&getter(&[])).unwrap(), None, "по умолчанию выключено");
+        assert_eq!(control_addr(&getter(&[("CONTROL_ADDR", "off")])).unwrap(), None);
+        assert_eq!(control_addr(&getter(&[("CONTROL_ADDR", "192.168.1.1:47001")])).unwrap(), Some("192.168.1.1:47001".parse().unwrap()));
+        assert!(control_addr(&getter(&[("CONTROL_ADDR", "0.0.0.0:47001")])).is_err(), "не на всех интерфейсах");
+    }
+
+    #[test]
+    fn connection_string_flags() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_args(args(&["--config", "/etc/hp-router/router.env", "--connection-string"])).unwrap(), (Some("/etc/hp-router/router.env".into()), Action::ConnectionString));
+        assert_eq!(parse_args(args(&["--config", "r.env", "--new-connection-string"])).unwrap().1, Action::NewConnectionString);
+        assert!(parse_args(args(&["--bogus"])).is_err());
     }
 
     #[test]

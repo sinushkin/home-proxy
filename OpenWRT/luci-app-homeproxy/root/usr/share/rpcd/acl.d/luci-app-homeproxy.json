@@ -1,0 +1,15 @@
+{
+	"luci-app-homeproxy": {
+		"description": "Home Proxy: строка подключения трея (показать, сменить ключ)",
+		"read": {
+			"file": {
+				"/usr/bin/hp-router --config /etc/hp-router/router.env --connection-string": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/bin/hp-router --config /etc/hp-router/router.env --new-connection-string": [ "exec" ]
+			}
+		}
+	}
+}

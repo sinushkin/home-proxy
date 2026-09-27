@@ -1,10 +1,13 @@
 //! hp-tray — трей home-proxy для Windows и Linux: значок с цветом состояния, окно на Slint со
 //! статусом службы, телефонами, дырами и потерями, сопряжение нового телефона по QR.
 //!
-//! Тонкий клиент протокола управления (`hp-control`): своих ключей и GUID не хранит, всё берёт у
-//! `hp-server` по TCP (`--addr`, по умолчанию 127.0.0.1:47001) с токеном из `control.token`.
+//! Тонкий клиент протокола управления (`hp-control`): GUID телефонов не хранит, всё берёт у
+//! службы (`hp-server` на ПК или `hp-router` на роутере). Единственное, что трей помнит, —
+//! строку подключения `homeproxy-control://<ip:порт>/<ключ>`: пользователь вставляет её при
+//! первом запуске (кнопка «Служба…» — сменить), трей хранит её в `tray.conf` в каталоге
+//! настроек пользователя (права 600). По файлам службы трей не ходит.
 //!
-//! Запуск: `hp-tray [--addr ip:порт] [--token-file путь] [--hidden]`.
+//! Запуск: `hp-tray [--connect строка] [--hidden]`. `--connect` — сразу запомнить строку;
 //! `--hidden` — не показывать окно при старте (для автозапуска: окно открывается из трея).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -15,7 +18,6 @@ mod tray;
 mod view;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,6 +27,7 @@ use hp_control::proto::control_message::Body;
 use hp_control::proto::{CreatePairing, RemovePeer, Status, Subscribe};
 use hp_control::Client;
 use slint::ComponentHandle;
+use tokio::sync::watch;
 
 slint::include_modules!();
 
@@ -33,91 +36,117 @@ const STATUS_INTERVAL_MS: u32 = 1000;
 /// Пауза перед повторным подключением к службе.
 const RECONNECT: Duration = Duration::from_secs(2);
 
-#[derive(Clone)]
-struct Config {
-    addr: SocketAddr,
-    token_file: PathBuf,
-    hidden: bool,
-}
+/// Текущая строка подключения; её смена переподключает подписку на статус.
+type Connection = watch::Receiver<Option<String>>;
 
 /// Что окно помнит между статусами.
 #[derive(Default)]
 pub struct UiState {
     pub status: Option<Status>,
     pub error: Option<String>,
+    /// Строка подключения задана.
+    pub configured: bool,
     pub expanded: HashSet<String>,
     /// Показанный QR: имя телефона и срок пакета.
     pub pairing: Option<(String, u64)>,
 }
 
 fn usage() -> ! {
-    eprintln!("использование: hp-tray [--addr ip:порт] [--token-file путь] [--hidden]");
+    eprintln!("использование: hp-tray [--connect строка-подключения] [--hidden]");
     std::process::exit(2);
 }
 
-/// Токен ищется: `--token-file`, `HP_CONTROL_TOKEN_FILE`, `control.token` рядом с программой,
-/// `control.token` в текущем каталоге.
-fn default_token_file() -> PathBuf {
-    if let Ok(path) = std::env::var("HP_CONTROL_TOKEN_FILE") {
-        return path.into();
-    }
-    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join(hp_control::TOKEN_FILE)));
-    match beside {
-        Some(path) if path.is_file() => path,
-        _ => PathBuf::from(hp_control::TOKEN_FILE),
-    }
+/// Файл настроек трея: `$XDG_CONFIG_HOME/home-proxy/tray.conf` (или `~/.config/…`), на Windows —
+/// `%APPDATA%\home-proxy\tray.conf`.
+fn config_file() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    base.map(|dir| dir.join("home-proxy").join("tray.conf"))
 }
 
-fn parse_args() -> Config {
-    let mut addr = std::env::var("HP_CONTROL_ADDR").unwrap_or_else(|_| hp_control::DEFAULT_ADDR.into());
-    let mut token_file = None;
-    let mut hidden = false;
+fn load_connection() -> Option<String> {
+    let text = std::fs::read_to_string(config_file()?).ok()?;
+    let line = text.lines().map(str::trim).find(|l| l.starts_with(hp_control::CONNECTION_PREFIX))?;
+    hp_control::parse_connection_string(line).ok().map(|_| line.to_string())
+}
+
+fn save_connection(connection: &str) -> Result<()> {
+    let path = config_file().context("не найден каталог настроек пользователя")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    hp_control::write_private(&path, &format!("{connection}\n")).with_context(|| format!("запись {}", path.display()))
+}
+
+struct Args {
+    connect: Option<String>,
+    hidden: bool,
+}
+
+fn parse_args() -> Args {
+    let mut parsed = Args { connect: None, hidden: false };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--addr" => addr = args.next().unwrap_or_else(|| usage()),
-            "--token-file" => token_file = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
-            "--hidden" => hidden = true,
+            "--connect" => parsed.connect = Some(args.next().unwrap_or_else(|| usage())),
+            "--hidden" => parsed.hidden = true,
             _ => usage(),
         }
     }
-    let addr = addr.parse().unwrap_or_else(|_| usage());
-    Config { addr, token_file: token_file.unwrap_or_else(default_token_file), hidden }
+    parsed
 }
 
-async fn connect(config: &Config) -> Result<Client> {
-    let token = hp_control::read_token(&config.token_file)?;
-    let (client, _) = Client::connect(config.addr, &token).await?;
+async fn connect(connection: &Connection) -> Result<Client> {
+    let text = connection.borrow().clone().context("строка подключения не задана")?;
+    let (client, _) = Client::connect_string(&text).await?;
     Ok(client)
 }
 
-/// Подписка на статус; при обрыве — переподключение.
-async fn status_loop(config: Config, ui: slint::Weak<MainWindow>, state: Arc<Mutex<UiState>>, tray: tray::Tray) {
+/// Подписка на статус по строке `text`: возвращается только с ошибкой (обрыв, чужой ключ).
+async fn subscribe(text: Option<String>, ui: &slint::Weak<MainWindow>, state: &Arc<Mutex<UiState>>, tray: &tray::Tray) -> Result<()> {
+    let text = text.context("строка подключения не задана")?;
+    let (mut client, _) = Client::connect_string(&text).await?;
+    client.send(Body::Subscribe(Subscribe { interval_ms: STATUS_INTERVAL_MS })).await?;
     loop {
-        let result: Result<()> = async {
-            let mut client = connect(&config).await?;
-            client.send(Body::Subscribe(Subscribe { interval_ms: STATUS_INTERVAL_MS })).await?;
-            loop {
-                if let Body::Status(status) = client.recv().await? {
-                    {
-                        let mut state = state.lock().unwrap();
-                        state.status = Some(status);
-                        state.error = None;
-                    }
-                    refresh(&ui, &state, &tray);
-                }
-            }
-        }
-        .await;
-        if let Err(e) = result {
+        if let Body::Status(status) = client.recv().await? {
             {
                 let mut state = state.lock().unwrap();
-                state.status = None;
-                state.error = Some(format!("{e:#}"));
+                state.status = Some(status);
+                state.error = None;
+                state.configured = true;
             }
-            refresh(&ui, &state, &tray);
+            refresh(ui, state, tray);
         }
-        tokio::time::sleep(RECONNECT).await;
+    }
+}
+
+/// Подписка на статус; при обрыве или смене строки подключения — переподключение.
+async fn status_loop(mut connection: Connection, ui: slint::Weak<MainWindow>, state: Arc<Mutex<UiState>>, tray: tray::Tray) {
+    loop {
+        let text = connection.borrow_and_update().clone();
+        let configured = text.is_some();
+        let changed = tokio::select! {
+            result = subscribe(text, &ui, &state, &tray) => {
+                if let Err(e) = result {
+                    let mut locked = state.lock().unwrap();
+                    locked.status = None;
+                    locked.configured = configured;
+                    locked.error = configured.then(|| format!("{e:#}"));
+                }
+                refresh(&ui, &state, &tray);
+                false
+            }
+            _ = connection.changed() => true,
+        };
+        if !changed {
+            tokio::select! {
+                _ = tokio::time::sleep(RECONNECT) => {}
+                _ = connection.changed() => {}
+            }
+        }
     }
 }
 
@@ -130,7 +159,12 @@ fn refresh(ui: &slint::Weak<MainWindow>, state: &Arc<Mutex<UiState>>, tray: &tra
 }
 
 fn main() -> Result<()> {
-    let config = parse_args();
+    let args = parse_args();
+    if let Some(text) = &args.connect {
+        hp_control::parse_connection_string(text)?;
+        save_connection(text)?;
+    }
+    let (connection_tx, connection) = watch::channel(load_connection());
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     let window = MainWindow::new().context("не удалось создать окно")?;
     let state = Arc::new(Mutex::new(UiState::default()));
@@ -140,7 +174,50 @@ fn main() -> Result<()> {
     });
     let tray_available = tray.available();
 
-    runtime.spawn(status_loop(config.clone(), window.as_weak(), state.clone(), tray.clone()));
+    runtime.spawn(status_loop(connection.clone(), window.as_weak(), state.clone(), tray.clone()));
+
+    window.on_open_setup({
+        let ui = window.as_weak();
+        let connection = connection.clone();
+        move || {
+            if let Some(window) = ui.upgrade() {
+                window.set_setup_error(Default::default());
+                window.set_setup_can_cancel(connection.borrow().is_some());
+                window.set_setup_visible(true);
+            }
+        }
+    });
+
+    window.on_connect_with({
+        let (ui, runtime, connection_tx) = (window.as_weak(), runtime.handle().clone(), Arc::new(connection_tx));
+        move |text| {
+            let text = text.trim().to_string();
+            if let Some(window) = ui.upgrade() {
+                window.set_setup_busy(true);
+                window.set_setup_error(Default::default());
+            }
+            let (ui, connection_tx) = (ui.clone(), connection_tx.clone());
+            runtime.spawn(async move {
+                // Строку проверяем подключением и только потом запоминаем.
+                let checked = async {
+                    let (_, welcome) = Client::connect_string(&text).await?;
+                    save_connection(&text)?;
+                    anyhow::Ok(welcome)
+                }
+                .await;
+                if checked.is_ok() {
+                    let _ = connection_tx.send(Some(text));
+                }
+                let _ = ui.upgrade_in_event_loop(move |window| {
+                    window.set_setup_busy(false);
+                    match checked {
+                        Ok(_) => window.set_setup_visible(false),
+                        Err(e) => window.set_setup_error(format!("{e:#}").into()),
+                    }
+                });
+            });
+        }
+    });
 
     window.on_toggle_peer({
         let (ui, state) = (window.as_weak(), state.clone());
@@ -158,15 +235,15 @@ fn main() -> Result<()> {
     });
 
     window.on_add_phone({
-        let (ui, state, config, runtime) = (window.as_weak(), state.clone(), config.clone(), runtime.handle().clone());
+        let (ui, state, connection, runtime) = (window.as_weak(), state.clone(), connection.clone(), runtime.handle().clone());
         move || {
             if let Some(window) = ui.upgrade() {
                 window.set_busy(true);
             }
-            let (ui, state, config) = (ui.clone(), state.clone(), config.clone());
+            let (ui, state, connection) = (ui.clone(), state.clone(), connection.clone());
             runtime.spawn(async move {
                 let result = async {
-                    let mut client = connect(&config).await?;
+                    let mut client = connect(&connection).await?;
                     match client.request(Body::CreatePairing(CreatePairing {})).await? {
                         Body::Pairing(pairing) => Ok(pairing),
                         other => anyhow::bail!("неожиданный ответ: {other:?}"),
@@ -209,12 +286,12 @@ fn main() -> Result<()> {
     });
 
     window.on_remove_peer({
-        let (ui, config, runtime) = (window.as_weak(), config.clone(), runtime.handle().clone());
+        let (ui, connection, runtime) = (window.as_weak(), connection.clone(), runtime.handle().clone());
         move |name| {
-            let (ui, config, name) = (ui.clone(), config.clone(), name.to_string());
+            let (ui, connection, name) = (ui.clone(), connection.clone(), name.to_string());
             runtime.spawn(async move {
                 let result = async {
-                    let mut client = connect(&config).await?;
+                    let mut client = connect(&connection).await?;
                     client.request(Body::RemovePeer(RemovePeer { name: name.clone() })).await
                 }
                 .await;
@@ -248,8 +325,14 @@ fn main() -> Result<()> {
         }
     });
 
+    let configured = connection.borrow().is_some();
+    state.lock().unwrap().configured = configured;
     view::render(&window, &state.lock().unwrap());
-    if !config.hidden || !tray_available {
+    if !configured {
+        // Первый запуск: сначала строка подключения.
+        window.set_setup_visible(true);
+    }
+    if !args.hidden || !tray_available || !configured {
         window.show()?;
     }
     slint::run_event_loop_until_quit()?;

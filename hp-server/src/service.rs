@@ -70,7 +70,7 @@ pub struct Service<D: PacketDevice> {
     bind: Option<IpAddr>,
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -167,19 +167,8 @@ impl<D: PacketDevice> Service<D> {
                 peer
             }
         };
-        let stun: Vec<String> = stun_addrs.iter().map(SocketAddr::to_string).collect();
-        let bundle = proto::PairingBundle {
-            version: 1,
-            pc_guid: peer.my_id.to_string(),
-            phone_guid: peer.peer_id.to_string(),
-            stun: stun.join(","),
-            mqtt: mqtt_addr.to_string(),
-            mqtt_ca_pem,
-            expires_unix: expires,
-        };
-        let name = peer_name(&peer.peer_id);
-        log::info!("сопряжение: ждём телефон {name} до {expires} (unix)");
-        Ok(proto::Pairing { uri: hp_control::pairing_uri(&bundle), bundle: Some(bundle), name })
+        log::info!("сопряжение: ждём телефон {} до {expires} (unix)", peer_name(&peer.peer_id));
+        Ok(pairing(peer, &stun_addrs, mqtt_addr, mqtt_ca_pem, expires))
     }
 
     /// Удаляет сопряжённого (или ожидающего) пира по имени.
@@ -273,6 +262,7 @@ impl<D: PacketDevice> Service<D> {
                         _ => 0,
                     },
                     removable: e.origin != Origin::Settings,
+                    kind: "phone".into(),
                 }
             })
             .collect();
@@ -286,10 +276,26 @@ impl<D: PacketDevice> Service<D> {
             .into(),
             bind: self.bind.map(|ip| ip.to_string()).unwrap_or_default(),
             peers,
-            traffic: Some(proto::Traffic { to_peers: to_peers.into(), ordered: ordered.into(), from_peers: from_peers.into(), dropped: dropped.into() }),
+            traffic: Some(proto::Traffic { to_peers: to_peers.into(), ordered: ordered.into(), from_peers: from_peers.into(), dropped: dropped.into(), ..Default::default() }),
             pairing_supported: self.pairing.is_some(),
         }
     }
+}
+
+/// Пакет сопряжения: `peer.my_id` — GUID службы, `peer.peer_id` — телефона (общий для
+/// `hp-server` и `hp-router`).
+pub fn pairing(peer: Peer, stun_addrs: &[SocketAddr], mqtt_addr: SocketAddr, mqtt_ca_pem: Vec<u8>, expires: u64) -> proto::Pairing {
+    let stun: Vec<String> = stun_addrs.iter().map(SocketAddr::to_string).collect();
+    let bundle = proto::PairingBundle {
+        version: 1,
+        pc_guid: peer.my_id.to_string(),
+        phone_guid: peer.peer_id.to_string(),
+        stun: stun.join(","),
+        mqtt: mqtt_addr.to_string(),
+        mqtt_ca_pem,
+        expires_unix: expires,
+    };
+    proto::Pairing { uri: hp_control::pairing_uri(&bundle), bundle: Some(bundle), name: peer_name(&peer.peer_id) }
 }
 
 /// Отвечает на запросы адреса пира `link` (и клиентов за ним): выдаёт адрес из книги и
@@ -326,5 +332,23 @@ async fn serve_addresses<D: PacketDevice>(
             }
             Err(e) => log::warn!("адрес для {key}: {e:#}"),
         }
+    }
+}
+
+impl<D: PacketDevice> hp_control::server::Controlled for Service<D> {
+    fn service(&self) -> &'static str {
+        "hp-server"
+    }
+
+    fn status(&self) -> proto::Status {
+        Service::status(self)
+    }
+
+    async fn create_pairing(&self) -> Result<proto::Pairing> {
+        Service::create_pairing(self).await
+    }
+
+    fn remove_peer(&self, name: &str) -> Result<()> {
+        Service::remove_peer(self, name)
     }
 }

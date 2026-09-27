@@ -248,12 +248,23 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   `Ordered` (номер в корзине потока, порядок восстанавливает `reorder`), прочее — `Data` сразу.
   Android их не использует. `OpenWRT/Tun.md`.
 - `control/` — крейт `hp-control`: протокол управления службой (`proto/control.proto`, кадр
-  `u32` BE + protobuf, без XOR — только loopback/LAN; доступ по токену `control.token` в `Hello`),
-  клиент, ссылка сопряжения `homeproxy://pair?d=<base64url(PairingBundle)>`; `hpctl` — консольный
-  клиент (`status`, `pair`, `remove`). `control/tray/` — `hp-tray`, трей на Slint (winit +
+  `u32` BE + protobuf; только loopback/LAN), `secure.rs` — канал, зашифрованный ключом из строки
+  подключения `homeproxy-control://<ip:порт>/<ключ>` (рукопожатие с nonce обеих сторон, ключи
+  сессии SHA-256, ChaCha20-Poly1305 со счётчиком кадров; ключ по сети не ходит), `server.rs` —
+  общий сервер (`trait Controlled`, ключ перечитывается на каждое соединение), клиент, ссылка
+  сопряжения `homeproxy://pair?d=<base64url(PairingBundle)>`; `hpctl` — консольный клиент
+  (`--connect <строка>`: `status`, `pair`, `remove`). Ключ хранит служба (`control.key`, 600),
+  строку печатает `hp-server|hp-router --connection-string` (`--new-connection-string` — новый
+  ключ). `control/tray/` — `hp-tray`, трей на Slint (winit +
   программный рендер): значок `ksni` (Linux) / `tray-icon` (Windows), окно со статусом, телефонами,
-  дырами и потерями, QR сопряжения. Сервер протокола — в `hp-server` (`src/control.rs`), пиры на
-  ходу — `src/service.rs` (ожидающий сопряжения телефон ≤ 1, сопряжённые — `peers.state`, 600).
+  дырами и потерями, QR сопряжения. Строку подключения трей получает от пользователя при первом
+  запуске и хранит в `tray.conf` (каталог настроек пользователя, 600) — по файлам службы не ходит.
+  Пиры на ходу — `hp-server/src/service.rs` (ожидающий сопряжения телефон ≤ 1, сопряжённые —
+  `peers.state`, 600) и `hp-router` (`phones.state`, свободный `client_id`, `RwLock` на телефонах;
+  `CONTROL_ADDR` — только адрес LAN). `OpenWRT/luci-app-homeproxy/` — страница LuCI (JS): показать
+  и скопировать строку, «Новая строка подключения» (`fs.exec` `hp-router --config
+  /etc/hp-router/router.env --connection-string|--new-connection-string`, права — ACL rpcd),
+  плюс `/etc/init.d/hp-router` (procd; бинарник `/usr/bin`, настройки `/etc/hp-router`).
   Полные GUID — секрет пары: в статус и в логи идут только имена (`peer_name`). `control/README.md`.
 - `wsl/` — образ для WSL2 (Alpine + `iptables` + статический `hp-server`): `Dockerfile`,
   `build.sh` (→ `wsl/out/homeproxy-wsl.tar.gz`, в git нет), `rootfs/` (`wsl.conf` с `[boot] command`,
@@ -409,6 +420,14 @@ NAT/провайдерами.
   (`Win32_Process.Create`). Скрипты для PowerShell через ssh запускаем как `-File`
   (stdin-режим ломает многострочные блоки). На ней постоянно стоит полный туннель OpenVPN до
   `profit` с обфускацией equalizer (как у `test`, см. ниже).
+- `jump1` (SSH-алиас; Xiaomi 4C, OpenWrt 23.05, это **домашний шлюз**: весь LAN идёт в VPS через
+  `hp0`) — `hp-router` установлен во флеш: `/usr/bin/hp-router`, настройки `/etc/hp-router/`
+  (`router.env` с `CONTROL_ADDR=192.168.1.1:47001`, `ca.crt`, `control.key`, `phones.state`),
+  служба procd `/etc/init.d/hp-router` (автозапуск **не** включён), LuCI-страница
+  `luci-app-homeproxy`. Прежняя копия — `/tmp/hp` (для отката). После перезапуска `hp-router`
+  пропадает `default dev hp0 table 100` — вернуть `ip route replace default dev hp0 table 100` и
+  `fw4 reload`, иначе LAN пойдёт мимо VPN. LAN роутера с этого ПК не видна (ПК со стороны его
+  WAN): трей — через `ssh -N -L 47001:192.168.1.1:47001 jump1` и строку с `127.0.0.1:47001`.
 - `test` (SSH-алиас, libvirt-ВМ на этом ПК, Debian 13, `sudo` без пароля) — Linux-машина для
   проверок с VPN на ПК. На `test` и `win` постоянно стоит полный туннель OpenVPN до `profit` через
   обфускацию equalizer (`server-rs` на `profit`, порты 51410–51419; голый OpenVPN из домашней

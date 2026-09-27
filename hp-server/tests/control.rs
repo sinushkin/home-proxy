@@ -1,5 +1,5 @@
-//! Протокол управления вживую на loopback: токен, статус, подписка, ошибки запросов. Служба —
-//! без пиров и без сопряжения (сеть не нужна).
+//! Протокол управления вживую на loopback: ключ, статус, подписка, ошибки запросов, смена ключа.
+//! Служба — без пиров и без сопряжения (сеть не нужна).
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -13,7 +13,8 @@ use hp_server::addresses::AddressBook;
 use hp_server::service::Service;
 use hp_server::Mode;
 
-async fn start() -> std::net::SocketAddr {
+/// Служба на случайном порту; ключ — во временном файле (его путь и отдаём).
+async fn start() -> (std::net::SocketAddr, std::path::PathBuf) {
     let (device, stack) = hp_tun::device::channel_pair();
     // Второй конец канала держим открытым до конца теста: иначе мост сочтёт устройство закрытым.
     tokio::spawn(async move {
@@ -25,20 +26,30 @@ async fn start() -> std::net::SocketAddr {
     let service = Arc::new(Service::new(hub, book, vec![Ipv4Addr::new(8, 8, 8, 8)], MultiLinkOptions::default(), None, None, Mode::Netstack, None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(hp_server::control::serve(listener, Arc::new("secret".to_string()), service));
-    addr
+    let key_file = std::env::temp_dir().join(format!("hp-control-test-{}.key", addr.port()));
+    std::fs::write(&key_file, "secret\n").unwrap();
+    tokio::spawn(hp_control::server::serve(listener, key_file.clone(), service));
+    (addr, key_file)
 }
 
 #[tokio::test]
-async fn wrong_token_is_rejected() {
-    let addr = start().await;
+async fn wrong_key_is_rejected_and_new_key_works_at_once() {
+    let (addr, key_file) = start().await;
     assert!(Client::connect(addr, "guess").await.is_err());
+    assert!(Client::connect(addr, "secret").await.is_ok());
+    // Новая строка подключения действует без перезапуска службы, старая — больше нет.
+    let key = hp_control::replace_key(&key_file).unwrap();
+    assert!(Client::connect(addr, "secret").await.is_err());
+    let (_, welcome) = Client::connect_string(&hp_control::connection_string(addr, &key)).await.unwrap();
+    assert_eq!(welcome.service, "hp-server");
+    let _ = std::fs::remove_file(key_file);
 }
 
 #[tokio::test]
 async fn status_subscription_and_errors() {
-    let addr = start().await;
+    let (addr, key_file) = start().await;
     let (mut client, welcome) = Client::connect(addr, "secret").await.unwrap();
+    let _ = std::fs::remove_file(key_file);
     assert_eq!(welcome.version, PROTOCOL_VERSION);
     assert_eq!(welcome.service, "hp-server");
 

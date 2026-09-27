@@ -1813,8 +1813,11 @@ name = "hp-control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chacha20poly1305",
+ "log",
  "prost",
  "prost-build",
+ "sha2",
  "tokio",
  "uuid",
 ]
@@ -1845,6 +1848,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "connection",
+ "hp-control",
  "hp-server",
  "hp-tun",
  "log",

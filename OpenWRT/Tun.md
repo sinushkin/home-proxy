@@ -61,7 +61,19 @@ LTE. Ниже `203.0.113.30` — белый IP VPS, `192.168.3.1` — шлюз �
      'cd /tmp/hp && exec ./hp-router --config /tmp/hp/router.env > /tmp/hp/hp-router.log 2>&1'
    ```
    Роутер получает от VPS адрес (`адрес в туннеле: 10.80.0.2/16`), поднимает с ним `hp0`; в
-   логе — `[vps] ... connected(10)`, для телефонов — `[phone1] ...`.
+   логе — `[vps] ... connected(10)`, для телефонов — `[<имя телефона>] ...`.
+
+   **Постоянная установка (флеш) и служба procd** — вместо `/tmp/hp`:
+   ```sh
+   scp -O target/openwrt/mipsel-unknown-linux-musl/release/hp-router root@<роутер>:/usr/bin/hp-router
+   ssh root@<роутер> 'mkdir -p /etc/hp-router'   # сюда router.env и ca.crt
+   OpenWRT/luci-app-homeproxy/install.sh root@<роутер>   # /etc/init.d/hp-router + страница LuCI
+   ssh root@<роутер> '/etc/init.d/hp-router start; logread -e hp-router | tail'
+   ```
+   Для трея и LuCI в `router.env` — `CONTROL_ADDR=<адрес LAN>:47001` (только LAN; ключ
+   `control.key` и сопряжённые из трея телефоны `phones.state` появятся рядом сами).
+   Автозапуск — `/etc/init.d/hp-router enable`, но шаги 3–4 (маршрут `hp0`, firewall) служба
+   пока не делает: после её запуска их нужно повторить.
 3. Маршруты: в `hp0` — только LAN (правило по источнику). Сам роутер — STUN, MQTT, дыры к VPS и
    к телефонам — ходит напрямую через WAN, иначе дыры телефонов ушли бы через VPS:
    ```sh
@@ -135,10 +147,29 @@ ping -c3 10.80.0.1                                  # VPS внутри тунн�
 
 ```sh
 start-stop-daemon -K -p /tmp/hp/hp-router.pid      # hp0 исчезает вместе с процессом
+# (или /etc/init.d/hp-router stop; disable — при установке во флеш)
 ip rule del prio 99; ip rule del prio 100; ip route flush table 100
 rm -f /etc/nftables.d/90-hp-offload.nft; uci delete firewall.hpvps
 uci del_list firewall.@zone[1].device='hp0'; uci commit firewall; /etc/init.d/firewall reload
 ```
+
+## Трей и LuCI
+
+С `CONTROL_ADDR` роутер слушает протокол управления ([`../control`](../control/README.md)):
+
+- **LuCI → Службы → Home Proxy** — строка подключения `homeproxy-control://192.168.1.1:47001/…`:
+  «Показать», «Скопировать», «Новая строка подключения» (новый ключ; прежние строки перестают
+  работать сразу, телефоны это не затрагивает). Страница вызывает только `hp-router --config
+  /etc/hp-router/router.env --connection-string` (право чтения) и `--new-connection-string`
+  (право записи) — ACL `luci-app-homeproxy`.
+- **Трей на ПК из LAN** (`hp-tray`): при первом запуске вставить строку. В окне VPS (шлюз дома) и
+  телефоны с дырами и потерями, трафик LAN ↔ VPS; «Добавить телефон» — QR: роутер сам заводит
+  пару GUID и свободный номер телефона, VPS выдаёт ему адрес; удалить — «Удалить телефон».
+  Телефоны из `PHONE_<n>_*` удаляются только правкой `router.env`.
+- Без графики, на самом роутере: `hp-router --config /etc/hp-router/router.env --connection-string`.
+
+Проверено на Xiaomi 4C: всё перечисленное, кроме открытия страницы LuCI в браузере (права
+проверены сессией rpcd). Размер `hp-router` с управлением — 2,10 МБ (без него 1,97 МБ).
 
 ## 6. Адреса, перезапуски и неполадки
 

@@ -14,7 +14,7 @@
 //!   ADDRESS_FILE — где хранить выданные адреса (`addresses.state` рядом с файлом настроек);
 //!   PEERS_FILE — телефоны, сопряжённые через трей (`peers.state` рядом с настройками);
 //!   CONTROL_ADDR — адрес протокола управления для трея (`127.0.0.1:47001`; `off` — выключить),
-//!   токен доступа — в CONTROL_TOKEN_FILE (`control.token` рядом с настройками, создаётся сам);
+//!   ключ канала — в CONTROL_KEY_FILE (`control.key` рядом с настройками, создаётся сам);
 //!   DNS — DNS для клиентов через запятую (по умолчанию — резолверы этой машины из resolv.conf;
 //!   в конце всегда 8.8.8.8, 1.1.1.1);
 //!   MODE — `tun` (интерфейс TUN + NAT подсети на машине; Linux, нужен root) или `netstack` (свой
@@ -35,10 +35,11 @@
 //! Библиотечная часть (`settings`, `Common`, `serve`) переиспользуется `vps-server` и
 //! `hp-router`. Запуск: `hp-server [--config server.env]` (без `--config` берётся
 //! `server.env` рядом с бинарником, если есть, иначе только окружение). Linux и Windows.
+//! `hp-server [--config …] --connection-string` печатает строку подключения для трея,
+//! `--new-connection-string` — меняет ключ (прежние строки перестают работать) и печатает новую.
 
 pub mod addresses;
 pub mod bypass;
-pub mod control;
 pub mod service;
 pub mod settings;
 
@@ -100,7 +101,7 @@ pub struct Common {
     pub data_holes: u8,
     /// Адрес протокола управления (трей); `None` — выключен.
     pub control: Option<std::net::SocketAddr>,
-    pub token_file: PathBuf,
+    pub key_file: PathBuf,
     /// Где хранить сопряжённые через трей телефоны.
     pub peers_file: Option<PathBuf>,
     /// Способ встречи для телефонов из `peers.state` и новых сопряжений (STUN + MQTT); `None` —
@@ -140,7 +141,7 @@ impl Common {
                 Some(addr) => Some(addr.parse().context("CONTROL_ADDR: ожидается ip:порт или off")?),
                 None => Some(hp_control::DEFAULT_ADDR.parse().expect("адрес по умолчанию")),
             },
-            token_file: settings.resolve(get("CONTROL_TOKEN_FILE").as_deref().unwrap_or(hp_control::TOKEN_FILE).trim()),
+            key_file: settings.resolve(get("CONTROL_KEY_FILE").as_deref().unwrap_or(hp_control::KEY_FILE).trim()),
             peers_file: Some(settings.resolve(get("PEERS_FILE").as_deref().unwrap_or("peers.state").trim())),
             pairing: None,
         })
@@ -195,14 +196,40 @@ fn p2p_discovery(settings: &Settings) -> Result<Discovery> {
     })
 }
 
-/// `--config файл` или ничего.
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>> {
+/// Что сделать вместо запуска службы.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Run,
+    /// Напечатать строку подключения трея (ключ создаётся, если его нет).
+    ConnectionString,
+    /// Сменить ключ и напечатать новую строку.
+    NewConnectionString,
+}
+
+/// `[--config файл] [--connection-string | --new-connection-string]`.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Option<PathBuf>, Action)> {
+    let (mut config, mut action) = (None, Action::Run);
     let mut args = args.into_iter();
-    match (args.next().as_deref(), args.next(), args.next()) {
-        (None, _, _) => Ok(None),
-        (Some("--config"), Some(path), None) => Ok(Some(path.into())),
-        _ => anyhow::bail!("использование: hp-server [--config server.env]"),
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => config = Some(args.next().context("--config: нужен путь")?.into()),
+            "--connection-string" => action = Action::ConnectionString,
+            "--new-connection-string" => action = Action::NewConnectionString,
+            _ => anyhow::bail!("использование: hp-server [--config server.env] [--connection-string | --new-connection-string]"),
+        }
     }
+    Ok((config, action))
+}
+
+/// Строка подключения трея к службе с этими настройками (`--connection-string`).
+pub fn print_connection_string(common: &Common, action: Action) -> Result<()> {
+    let addr = common.control.context("управление выключено (CONTROL_ADDR=off)")?;
+    let key = match action {
+        Action::NewConnectionString => hp_control::replace_key(&common.key_file)?,
+        _ => hp_control::load_or_create_key(&common.key_file)?,
+    };
+    println!("{}", hp_control::connection_string(addr, &key));
+    Ok(())
 }
 
 /// Файл настроек по умолчанию: `server.env` рядом с бинарником, если он есть.
@@ -213,8 +240,11 @@ pub fn default_config() -> Option<PathBuf> {
 
 /// Точка входа `hp-server`.
 pub fn main() -> Result<()> {
-    let config = parse_args(std::env::args().skip(1))?.or_else(default_config);
-    let settings = Settings::load(config.as_deref())?;
+    let (config, action) = parse_args(std::env::args().skip(1))?;
+    let settings = Settings::load(config.or_else(default_config).as_deref())?;
+    if action != Action::Run {
+        return print_connection_string(&Common::from_settings(&settings)?, action);
+    }
     init_logging(&settings)?;
     let mut common = Common::from_settings(&settings)?;
     let discovery = p2p_discovery(&settings)?;
@@ -290,10 +320,10 @@ async fn run<D: hp_tun::device::PacketDevice>(hub: hp_tun::hub::Hub<D>, discover
 
     match common.control {
         Some(addr) => {
-            let token = hp_control::load_or_create_token(&common.token_file)?;
+            hp_control::load_or_create_key(&common.key_file)?;
             let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("управление: не удалось занять {addr}"))?;
-            log::info!("управление: {addr}, токен — {}", common.token_file.display());
-            tokio::spawn(control::serve(listener, Arc::new(token), service.clone()));
+            log::info!("управление: {addr}; строка подключения для трея — hp-server --connection-string");
+            tokio::spawn(hp_control::server::serve(listener, common.key_file.clone(), service.clone()));
         }
         None if service.live_counts().is_empty() => anyhow::bail!("нет ни одного пира (MY_ID/PEER_ID) и выключено управление (CONTROL_ADDR)"),
         None => {}
@@ -329,8 +359,9 @@ mod tests {
 
     #[test]
     fn config_argument_is_optional() {
-        assert_eq!(parse_args(args(&[])).unwrap(), None);
-        assert_eq!(parse_args(args(&["--config", "/etc/hp/server.env"])).unwrap(), Some(PathBuf::from("/etc/hp/server.env")));
+        assert_eq!(parse_args(args(&[])).unwrap(), (None, Action::Run));
+        assert_eq!(parse_args(args(&["--config", "/etc/hp/server.env"])).unwrap(), (Some(PathBuf::from("/etc/hp/server.env")), Action::Run));
+        assert_eq!(parse_args(args(&["--connection-string"])).unwrap(), (None, Action::ConnectionString));
         assert!(parse_args(args(&["--config"])).is_err());
         assert!(parse_args(args(&["install"])).is_err());
     }
