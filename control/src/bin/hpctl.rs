@@ -51,7 +51,8 @@ async fn main() -> Result<()> {
             }
             for p in s.peers {
                 let pending = if p.pending { " (ждёт первого подключения)" } else { "" };
-                println!("{} {}{pending}: {}/{} дыр, адреса [{}]", p.name, p.state, p.live, p.target, p.addresses.join(", "));
+                let reorder = if p.reorder_wait_ms == 0 { "выкл".to_string() } else { format!("{} мс", p.reorder_wait_ms) };
+                println!("{} {}{pending}: {}/{} дыр, адреса [{}], порядок {reorder}", p.name, p.state, p.live, p.target, p.addresses.join(", "));
                 for h in p.holes {
                     let loss = |l: f32| if l < 0.0 { "—".to_string() } else { format!("{:.1}%", l * 100.0) };
                     println!("  #{} {} отправлено {} получено {} потери ↑{} ↓{}", h.slot, h.peer_addr, h.sent, h.received, loss(h.loss_out), loss(h.loss_in));

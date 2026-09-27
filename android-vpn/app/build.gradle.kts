@@ -39,5 +39,7 @@ android {
 }
 
 dependencies {
+    implementation(libs.zxing.embedded)
+    implementation(libs.androidx.core)
     testImplementation(libs.junit)
 }

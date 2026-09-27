@@ -70,7 +70,7 @@ iptables -t nat -A POSTROUTING -s 10.80.0.0/16 -o <внешний интерфе
 | `MODE` | `tun` или `netstack`; по умолчанию `tun`, на Windows `netstack` |
 | `BIND_ADDR` | `auto` (по умолчанию) — найти адаптер мимо VPN самому; IP-адрес адаптера; `off` — не привязывать (см. «ПК с включённым VPN») |
 | `TUN_NAME`, `TUN_MTU` | `hp0`, 1400 (только `MODE=tun`) |
-| `REORDER_WAIT_MS`, `DATA_HOLES` | начальное ожидание буфера порядка (8 мс; 0 — выключить), дыр для данных (0 — все) |
+| `REORDER_WAIT_MS`, `DATA_HOLES` | начальное ожидание буфера порядка (30 мс — предел адаптации, `connection::reorder::MAX_WAIT`; 0 — выключить), дыр для данных (0 — все) |
 | `LOG_LEVEL`, `RUST_LOG`, `LOG_TARGET=syslog`, `LOG_FILE` | логи (по умолчанию INFO); `LOG_FILE=путь` — дописывать в файл |
 
 `hp-server --config server.env` — то же без `run.sh` (без `--config` берётся `server.env`

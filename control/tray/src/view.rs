@@ -84,6 +84,11 @@ fn peer_level(peer: &PeerStatus) -> i32 {
     }
 }
 
+/// Текущее ожидание буфера порядка: «порядок: 8 мс» или «буфер порядка выкл» (`REORDER_WAIT_MS=0`).
+fn reorder_text(peer: &PeerStatus) -> String {
+    if peer.reorder_wait_ms == 0 { "буфер порядка выкл".into() } else { format!("порядок: {} мс", peer.reorder_wait_ms) }
+}
+
 fn state_text(peer: &PeerStatus) -> &'static str {
     match peer.state.as_str() {
         "connected" => "на связи",
@@ -205,6 +210,7 @@ pub fn render(window: &MainWindow, state: &UiState) {
                 live: peer.live as i32,
                 target: peer.target as i32,
                 addresses: peer.addresses.join(", ").into(),
+                reorder: reorder_text(peer).into(),
                 loss: if out < 0.0 && inn < 0.0 { SharedString::new() } else { format!("потери ↑{} ↓{}", percent(out), percent(inn)).into() },
                 pending: peer.pending,
                 removable: peer.removable,
@@ -271,6 +277,13 @@ mod tests {
         assert_eq!(percent(0.0), "0%");
         assert_eq!(percent(0.0123), "1.2%");
         assert_eq!(percent(0.5), "50%");
+    }
+
+    #[test]
+    fn reorder_wait_text() {
+        let peer = |ms| PeerStatus { reorder_wait_ms: ms, ..Default::default() };
+        assert_eq!(reorder_text(&peer(0)), "буфер порядка выкл");
+        assert_eq!(reorder_text(&peer(8)), "порядок: 8 мс");
     }
 
     #[test]

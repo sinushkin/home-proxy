@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -335,6 +336,9 @@ pub struct HoleStatus {
 pub struct LinkStatus {
     pub state: ConnState,
     pub holes: Vec<HoleStatus>,
+    /// Текущее ожидание недостающего TCP-пакета в буфере порядка (адаптивное, 3..=30 мс; 0 —
+    /// буфер порядка выключен, `REORDER_WAIT_MS=0`).
+    pub reorder_wait_ms: u32,
 }
 
 impl LinkRegistry {
@@ -438,7 +442,7 @@ impl Drop for ClearOnDrop {
 
 /// Запущенный менеджер.
 /// Сколько ждём недостающий TCP-пакет, прежде чем отдать накопленное дальше.
-pub const DEFAULT_REORDER_WAIT: Duration = Duration::from_millis(8);
+pub const DEFAULT_REORDER_WAIT: Duration = Duration::from_millis(30);
 
 /// Настройки `MultiLink`.
 #[derive(Debug, Clone, Copy)]
@@ -495,6 +499,8 @@ pub struct MultiLink {
     redrop_txs: Vec<mpsc::Sender<()>>,
     control_rx: Mutex<Option<mpsc::Receiver<Control>>>,
     state: Arc<StateTracker>,
+    /// Текущее ожидание буфера порядка (обновляется раз в 30 с из `control_loop`); см. `LinkStatus`.
+    reorder_wait_ms: Arc<AtomicU32>,
     /// Задачи набора: дроп `MultiLink` останавливает их, а с ними — дыры, сокеты и MQTT.
     _tasks: Vec<AbortOnDrop>,
 }
@@ -639,6 +645,7 @@ impl MultiLink {
             tasks.push(AbortOnDrop(tokio::spawn(demux(peer_rx, slot_txs.clone()))));
         }
         let redrop_for_api = redrop_txs.clone();
+        let reorder_wait_ms = Arc::new(AtomicU32::new(options.reorder_wait.as_millis() as u32));
         tasks.push(AbortOnDrop(tokio::spawn(keepalive_loop(registry.clone()))));
         tasks.push(AbortOnDrop(tokio::spawn(stats_loop(registry.clone()))));
         tasks.push(AbortOnDrop(tokio::spawn(control_loop(
@@ -649,6 +656,7 @@ impl MultiLink {
             SlotFeed { slot_txs, pair, peer_id },
             (incoming_tx, control_tx),
             options,
+            reorder_wait_ms.clone(),
         ))));
 
         let multilink = Self {
@@ -661,6 +669,7 @@ impl MultiLink {
             redrop_txs: redrop_for_api,
             control_rx: Mutex::new(Some(control_rx)),
             state,
+            reorder_wait_ms,
             _tasks: tasks,
         };
         Ok((multilink, incoming_rx))
@@ -756,7 +765,11 @@ impl MultiLink {
 
     /// Снимок состояния: общее состояние и живые дыры со счётчиками и потерями.
     pub fn status(&self) -> LinkStatus {
-        LinkStatus { state: self.state.current(), holes: self.registry.lock().unwrap().holes() }
+        LinkStatus {
+            state: self.state.current(),
+            holes: self.registry.lock().unwrap().holes(),
+            reorder_wait_ms: self.reorder_wait_ms.load(Ordering::Relaxed),
+        }
     }
 
     pub fn my_peer_id(&self) -> Uuid {
@@ -832,6 +845,7 @@ struct SlotFeed {
 
 /// Разбирает события с дыр: статистику пира, `DeleteLink`, `Rendezvous` пира. Данные пира
 /// проходят через буфер порядка (`reorder`), если `reorder_wait` не ноль.
+#[allow(clippy::too_many_arguments)]
 async fn control_loop(
     label: Label,
     mut events: mpsc::Receiver<LinkEvent>,
@@ -840,6 +854,7 @@ async fn control_loop(
     feed: SlotFeed,
     (incoming, control): (mpsc::Sender<Incoming>, mpsc::Sender<Control>),
     options: MultiLinkOptions,
+    reorder_wait_ms: Arc<AtomicU32>,
 ) {
     let MultiLinkOptions { reorder_wait, reorder_clients, .. } = options;
     let mut reorder = (!reorder_wait.is_zero()).then(|| Resequencer::adaptive(reorder_wait));
@@ -863,6 +878,7 @@ async fn control_loop(
             _ = stats_tick.tick() => {
                 if let Some(reorder) = reorder.as_ref() {
                     let now = reorder.stats();
+                    reorder_wait_ms.store(now.wait_ms as u32, Ordering::Relaxed);
                     if now != logged {
                         log::info!(
                             "{label}порядок пакетов: ожидание {} мс, по порядку {}, переставлено {}, по таймауту {}, опоздавших {}, принудительно {}, прочих {}, макс. придержано {}",
@@ -1484,6 +1500,7 @@ mod tests {
             SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: wait, ..MultiLinkOptions::default() },
+            Arc::new(AtomicU32::new(0)),
         ));
 
         for counter in [0u64, 2, 1, 3] {
@@ -1517,6 +1534,7 @@ mod tests {
             SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
+            Arc::new(AtomicU32::new(0)),
         ));
         for counter in [0u64, 2, 1] {
             events_tx.send(tcp_event(counter)).await.unwrap();
@@ -1550,6 +1568,7 @@ mod tests {
             SlotFeed { slot_txs: Vec::new(), pair: PairSecret::new(Uuid::new_v4(), Uuid::new_v4()), peer_id: Uuid::new_v4() },
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::from_millis(500), reorder_clients: false, ..MultiLinkOptions::default() },
+            Arc::new(AtomicU32::new(0)),
         ));
         events_tx.send(ordered_event(3, 0, None)).await.unwrap();
         events_tx.send(ordered_event(3, 2, None)).await.unwrap();

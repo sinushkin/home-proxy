@@ -2,9 +2,16 @@
 agp = "8.13.1"
 kotlin = "2.0.21"
 junit = "4.13.2"
+zxing = "4.3.0"
+androidxCore = "1.13.1"
 
 [libraries]
 junit = { group = "junit", name = "junit", version.ref = "junit" }
+# Сканер QR сопряжения (control/README.md): своя CaptureActivity, без Google Play Services.
+zxing-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxing" }
+# zxing-android-embedded использует ContextCompat, но не объявляет androidx.core в своём POM
+# (известный пробел пакета) — тянем сами, иначе NoClassDefFoundError в рантайме при сканировании.
+androidx-core = { group = "androidx.core", name = "core", version.ref = "androidxCore" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

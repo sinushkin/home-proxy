@@ -50,19 +50,22 @@ pub struct Status {
     pub to_peer: u32,
     pub from_peer: u32,
     pub dropped: u32,
+    /// Текущее ожидание буфера порядка (см. `connection::multilink::LinkStatus`), 0 — выключен.
+    pub reorder_wait_ms: u32,
 }
 
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "дыры {}/{TARGET_LINKS}, адрес {}, TUN {}, отправлено {}, получено {}, потеряно {}",
+            "дыры {}/{TARGET_LINKS}, адрес {}, TUN {}, отправлено {}, получено {}, потеряно {}, порядок {}",
             self.live_holes,
             self.address.map(|(a, p)| format!("{a}/{p}")).unwrap_or_else(|| "ещё нет".into()),
             if self.tun { "подключён" } else { "нет" },
             self.to_peer,
             self.from_peer,
-            self.dropped
+            self.dropped,
+            if self.reorder_wait_ms == 0 { "выкл".to_string() } else { format!("{} мс", self.reorder_wait_ms) }
         )
     }
 }
@@ -135,6 +138,7 @@ impl Client {
             to_peer,
             from_peer,
             dropped,
+            reorder_wait_ms: self.multilink.status().reorder_wait_ms,
         }
     }
 }
@@ -166,8 +170,15 @@ mod tests {
 
     #[test]
     fn status_line_is_readable() {
-        let status =
-            Status { live_holes: 7, address: Some((Ipv4Addr::new(10, 80, 1, 4), 16)), tun: true, to_peer: 12, from_peer: 10, dropped: 1 };
-        assert_eq!(status.to_string(), "дыры 7/10, адрес 10.80.1.4/16, TUN подключён, отправлено 12, получено 10, потеряно 1");
+        let status = Status {
+            live_holes: 7,
+            address: Some((Ipv4Addr::new(10, 80, 1, 4), 16)),
+            tun: true,
+            to_peer: 12,
+            from_peer: 10,
+            dropped: 1,
+            reorder_wait_ms: 8,
+        };
+        assert_eq!(status.to_string(), "дыры 7/10, адрес 10.80.1.4/16, TUN подключён, отправлено 12, получено 10, потеряно 1, порядок 8 мс");
     }
 }

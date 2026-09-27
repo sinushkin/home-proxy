@@ -28,14 +28,28 @@ class Settings(context: Context) {
         }
         set(value) = prefs.edit().putString("myId", value).apply()
 
-    /** CA брокера лежит в assets (build-native.sh копирует cert/out/ca.crt). */
-    private fun caPem(): String = appContext.assets.open("ca.crt").bufferedReader().use { it.readText() }
+    /** CA из пакета сопряжения (QR), если сканировали; иначе — из assets (сборка копирует cert/out/ca.crt). */
+    var caPemOverride: String?
+        get() = prefs.getString("caPem", null)
+        set(value) = prefs.edit().putString("caPem", value).apply()
+
+    private fun caPem(): String =
+        caPemOverride ?: appContext.assets.open("ca.crt").bufferedReader().use { it.readText() }
+
+    /** Пакет сопряжения (`Pairing.parse`) заменяет GUID'ы, рандеву и CA и сохраняет их. */
+    fun applyPairing(bundle: PairingBundle) {
+        myId = bundle.phoneGuid
+        peerId = bundle.pcGuid
+        stun = bundle.stun
+        mqtt = bundle.mqtt
+        caPemOverride = bundle.caPem
+    }
 
     /**
      * Принимает настройки из intent (для проверки из adb):
      * `am start -n ru.homeproxy/.MainActivity --es stun ip:порт --es mqtt ip:порт
      * --es peerId GUID [--es myId GUID]
-     * [--ei reorderMs 8] [--ei dataHoles 1] --ez autostart true [--ez vpn true]`.
+     * [--ei reorderMs 30] [--ei dataHoles 1] --ez autostart true [--ez vpn true]`.
      */
     fun applyExtras(intent: android.content.Intent) {
         intent.getStringExtra("stun")?.let { stun = it }
@@ -60,6 +74,8 @@ class Settings(context: Context) {
     )
 
     companion object {
-        const val DEFAULT_REORDER_MS = 8
+        // Предел буфера порядка (connection::reorder::MAX_WAIT) — не адаптивное начальное
+        // значение, а сразу максимум: меньше шанс отдать пакет не по порядку на неровной сети.
+        const val DEFAULT_REORDER_MS = 30
     }
 }

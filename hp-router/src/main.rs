@@ -391,6 +391,7 @@ fn peer_status(name: String, kind: &str, status: LinkStatus) -> proto::PeerStatu
             })
             .collect(),
         kind: kind.into(),
+        reorder_wait_ms: status.reorder_wait_ms,
         ..Default::default()
     }
 }

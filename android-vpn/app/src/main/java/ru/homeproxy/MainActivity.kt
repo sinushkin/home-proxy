@@ -15,6 +15,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.google.zxing.integration.android.IntentIntegrator
 import kotlin.concurrent.thread
 
 /**
@@ -24,6 +25,7 @@ import kotlin.concurrent.thread
  */
 class MainActivity : Activity() {
     private lateinit var settings: Settings
+    private lateinit var myIdView: TextView
     private lateinit var stun: EditText
     private lateinit var mqtt: EditText
     private lateinit var peerId: EditText
@@ -34,6 +36,7 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
 
     @Volatile private var vpnMessage: String? = null
+    @Volatile private var pairMessage: String? = null
 
     private val refresh = object : Runnable {
         override fun run() {
@@ -52,14 +55,16 @@ class MainActivity : Activity() {
             setPadding(32, 32, 32, 32)
         }
         column.addView(label("Мой GUID"))
-        column.addView(TextView(this).apply {
+        myIdView = TextView(this).apply {
             text = settings.myId
             setTextIsSelectable(true)
-        })
+        }
+        column.addView(myIdView)
         stun = field(column, "STUN (ip:порт)", settings.stun)
         mqtt = field(column, "MQTT, TLS (ip:порт)", settings.mqtt)
         peerId = field(column, "GUID пира (ПК или роутера)", settings.peerId)
 
+        button(column, "Сканировать QR (сопряжение)") { scanQr() }
         connectButton = button(column, "1. Подключить (дыры и keep-alive)") { connect() }
         vpnOnButton = button(column, "2. Включить VPN") { startVpn() }
         vpnOffButton = button(column, "Выключить VPN") { VpnController.stop(applicationContext) }
@@ -76,6 +81,15 @@ class MainActivity : Activity() {
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+
+        // Ссылку сопряжения могли открыть штатной камерой (deep link), а не сканером в приложении.
+        intent?.data?.toString()?.let { tryApplyPairingUri(it) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.data?.toString()?.let { tryApplyPairingUri(it) }
     }
 
     override fun onStart() {
@@ -113,6 +127,13 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        val scan = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
+        if (scan != null) {
+            scan.contents?.let {
+                if (!tryApplyPairingUri(it)) pairMessage = "QR не похож на пакет сопряжения Home Proxy"
+            }
+            return
+        }
         if (requestCode == REQUEST_VPN) {
             if (resultCode == RESULT_OK) launchVpn() else vpnMessage = "согласие на VPN не получено"
         }
@@ -124,6 +145,7 @@ class MainActivity : Activity() {
         status.text = buildString {
             append(if (error != null) "Ошибка: $error" else HomeProxy.status())
             append("\nVPN: ").append(if (VpnController.isUp) "включён" else "выключен")
+            pairMessage?.let { append("\n").append(it) }
             (vpnMessage ?: VpnController.lastMessage)?.let { append("\n").append(it) }
             if (holes < 1) append("\nVPN можно включить, когда появится хотя бы одна живая дыра")
             else if (HomeProxy.address() == null) append("\nЖдём адрес в туннеле от сервера")
@@ -141,6 +163,7 @@ class MainActivity : Activity() {
     private fun connect() {
         save()
         vpnMessage = null
+        pairMessage = null
         ProxyService.lastError = null
         ProxyService.start(this)
     }
@@ -153,6 +176,27 @@ class MainActivity : Activity() {
         }
         val consent = VpnService.prepare(this)
         if (consent != null) startActivityForResult(consent, REQUEST_VPN) else launchVpn()
+    }
+
+    /** Экран сканера (zxing-android-embedded, своя CaptureActivity, без Google Play Services). */
+    private fun scanQr() {
+        IntentIntegrator(this).apply {
+            setOrientationLocked(false)
+            setBeepEnabled(false)
+            setPrompt("Наведите камеру на QR-код в трее Home Proxy")
+        }.initiateScan()
+    }
+
+    /** Разбирает ссылку сопряжения и, если получилось, заполняет поля и настройки ей. */
+    private fun tryApplyPairingUri(uri: String): Boolean {
+        val bundle = Pairing.parse(uri) ?: return false
+        settings.applyPairing(bundle)
+        myIdView.text = settings.myId
+        stun.setText(bundle.stun)
+        mqtt.setText(bundle.mqtt)
+        peerId.setText(bundle.pcGuid)
+        pairMessage = "Сопряжено со службой ${bundle.pcGuid.take(8)} — нажмите «1. Подключить»"
+        return true
     }
 
     private fun launchVpn() {

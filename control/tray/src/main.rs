@@ -35,6 +35,10 @@ slint::include_modules!();
 const STATUS_INTERVAL_MS: u32 = 1000;
 /// Пауза перед повторным подключением к службе.
 const RECONNECT: Duration = Duration::from_secs(2);
+/// Если статус не пришёл столько — считаем соединение мёртвым и переподключаемся. TCP без
+/// keepalive не замечает part потерянный FIN/RST (например, роутер перезапустился в момент
+/// сетевой переналадки): чтение просто зависает навсегда на formально ещё «открытом» сокете.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Текущая строка подключения; её смена переподключает подписку на статус.
 type Connection = watch::Receiver<Option<String>>;
@@ -111,7 +115,10 @@ async fn subscribe(text: Option<String>, ui: &slint::Weak<MainWindow>, state: &A
     let (mut client, _) = Client::connect_string(&text).await?;
     client.send(Body::Subscribe(Subscribe { interval_ms: STATUS_INTERVAL_MS })).await?;
     loop {
-        if let Body::Status(status) = client.recv().await? {
+        let body = tokio::time::timeout(STATUS_TIMEOUT, client.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("служба молчит дольше {}с", STATUS_TIMEOUT.as_secs()))??;
+        if let Body::Status(status) = body {
             {
                 let mut state = state.lock().unwrap();
                 state.status = Some(status);

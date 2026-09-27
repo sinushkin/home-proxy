@@ -64,6 +64,9 @@ message PeerStatus {
   uint64 pending_expires_unix = 8;
   bool removable = 9;         // сопряжён из трея (заданный в файле настроек удаляется только там)
   string kind = 10;          // phone | vps
+  // Текущее ожидание недостающего TCP-пакета в буфере порядка (адаптивное, 3..=30 мс; 0 —
+  // буфер порядка выключен, REORDER_WAIT_MS=0).
+  uint32 reorder_wait_ms = 11;
 }
 
 message HoleStatus {

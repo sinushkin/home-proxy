@@ -263,6 +263,7 @@ impl<D: PacketDevice> Service<D> {
                     },
                     removable: e.origin != Origin::Settings,
                     kind: "phone".into(),
+                    reorder_wait_ms: status.reorder_wait_ms,
                 }
             })
             .collect();
