@@ -14,6 +14,10 @@ use hp_control::proto::control_message::Body;
 use hp_control::proto::{CreatePairing, GetStatus, RemovePeer};
 use hp_control::Client;
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 fn usage() -> ! {
     eprintln!("использование: hpctl [--connect строка | --addr ip:порт --key-file путь] status | pair | remove <имя>");
     std::process::exit(2);
@@ -53,6 +57,9 @@ async fn main() -> Result<()> {
                 let pending = if p.pending { " (ждёт первого подключения)" } else { "" };
                 let reorder = if p.reorder_wait_ms == 0 { "выкл".to_string() } else { format!("{} мс", p.reorder_wait_ms) };
                 println!("{} {}{pending}: {}/{} дыр, адреса [{}], порядок {reorder}", p.name, p.state, p.live, p.target, p.addresses.join(", "));
+                if let Some(text) = hp_control::registration_text(&p, now_unix_ms()) {
+                    println!("  {text}");
+                }
                 for h in p.holes {
                     let loss = |l: f32| if l < 0.0 { "—".to_string() } else { format!("{:.1}%", l * 100.0) };
                     println!("  #{} {} отправлено {} получено {} потери ↑{} ↓{}", h.slot, h.peer_addr, h.sent, h.received, loss(h.loss_out), loss(h.loss_in));

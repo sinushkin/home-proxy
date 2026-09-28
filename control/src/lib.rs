@@ -161,6 +161,24 @@ pub fn parse_pairing_uri(uri: &str) -> Result<PairingBundle> {
     Ok(PairingBundle::decode(base64url_decode(data)?.as_slice())?)
 }
 
+/// Последняя регистрация пира на MQTT-брокере для людей: «регистрация 3 мин назад с
+/// 203.0.113.7:40000»; `None` — поля пусты (не регистрировался или режим без MQTT). `now_unix_ms` —
+/// наши часы, время в записи — по часам пира: небольшое расхождение показывается как «только что».
+pub fn registration_text(peer: &proto::PeerStatus, now_unix_ms: u64) -> Option<String> {
+    if peer.registered_at_unix_ms == 0 && peer.registered_addr.is_empty() {
+        return None;
+    }
+    let age = now_unix_ms.saturating_sub(peer.registered_at_unix_ms) / 1000;
+    let when = match age {
+        0..5 => "только что".to_string(),
+        5..120 => format!("{age} с назад"),
+        120..7200 => format!("{} мин назад", age / 60),
+        7200..172_800 => format!("{} ч назад", age / 3600),
+        _ => format!("{} д назад", age / 86400),
+    };
+    Some(format!("регистрация {when} с {}", peer.registered_addr))
+}
+
 /// Соединение со службой после рукопожатия и `Hello`.
 pub struct Client {
     reader: secure::SealedReader<OwnedReadHalf>,
@@ -226,6 +244,17 @@ mod tests {
         }
         assert_eq!(base64url_encode(b"\xfb\xff"), "-_8");
         assert!(base64url_decode("a+b").is_err());
+    }
+
+    #[test]
+    fn registration_text_shows_age_and_address() {
+        let peer = |at, addr: &str| proto::PeerStatus { registered_at_unix_ms: at, registered_addr: addr.into(), ..Default::default() };
+        assert_eq!(registration_text(&peer(0, ""), 1_000_000), None);
+        let now = 1_700_000_000_000;
+        assert_eq!(registration_text(&peer(now + 2000, "203.0.113.7:40000"), now).unwrap(), "регистрация только что с 203.0.113.7:40000");
+        assert_eq!(registration_text(&peer(now - 42_000, "203.0.113.7:1"), now).unwrap(), "регистрация 42 с назад с 203.0.113.7:1");
+        assert_eq!(registration_text(&peer(now - 600_000, "203.0.113.7:1"), now).unwrap(), "регистрация 10 мин назад с 203.0.113.7:1");
+        assert_eq!(registration_text(&peer(now - 3 * 3_600_000, "203.0.113.7:1"), now).unwrap(), "регистрация 3 ч назад с 203.0.113.7:1");
     }
 
     #[test]

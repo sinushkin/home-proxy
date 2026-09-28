@@ -264,6 +264,8 @@ impl<D: PacketDevice> Service<D> {
                     removable: e.origin != Origin::Settings,
                     kind: "phone".into(),
                     reorder_wait_ms: status.reorder_wait_ms,
+                    registered_addr: status.peer_registration.map(|r| r.addr.to_string()).unwrap_or_default(),
+                    registered_at_unix_ms: status.peer_registration.map_or(0, |r| r.registered_at_unix_ms),
                 }
             })
             .collect();

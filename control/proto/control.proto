@@ -67,6 +67,10 @@ message PeerStatus {
   // Текущее ожидание недостающего TCP-пакета в буфере порядка (адаптивное, 3..=30 мс; 0 —
   // буфер порядка выключен, REORDER_WAIT_MS=0).
   uint32 reorder_wait_ms = 11;
+  // Последняя регистрация пира на MQTT-брокере: внешний адрес его bootstrap-слота (как его
+  // увидел STUN) и время по часам пира, мс Unix. Пусто/0 — записи не было (или режим без MQTT).
+  string registered_addr = 12;
+  uint64 registered_at_unix_ms = 13;
 }
 
 message HoleStatus {

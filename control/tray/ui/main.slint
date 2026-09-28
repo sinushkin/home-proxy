@@ -32,6 +32,7 @@ export struct PeerRow {
     addresses: string,
     loss: string,
     reorder: string,
+    registration: string,
     pending: bool,
     removable: bool,
     expanded: bool,
@@ -121,6 +122,7 @@ component PeerCard inherits Rectangle {
                     Rectangle { horizontal-stretch: 1; }
                     Text { text: peer.loss; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
                 }
+                if peer.registration != "": Text { text: peer.registration; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
             }
         }
         if peer.expanded: HoleTable { holes: peer.holes; }

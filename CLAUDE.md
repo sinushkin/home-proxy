@@ -148,7 +148,8 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       сендеры по слотам; хватает одной живой дыры, чтобы гонять трафик, пока
       остальные добираются. Потеря/плохая дыра → перерегистрация со свежей
       сессией. `MultiLink::status()` — снимок: общее состояние и живые дыры со счётчиками и
-      потерями в обе стороны (по последнему отчёту `Stats` пира). Задачи набора принадлежат
+      потерями в обе стороны (по последнему отчёту `Stats` пира), последняя регистрация пира на
+      брокере (`PeerRegistration`: адрес и `registered_at_unix_ms`; в статус управления и трей). Задачи набора принадлежат
       `MultiLink`: его дроп останавливает дыры, сокеты и MQTT. `stats_loop` раз в 10 c шлёт пиру статистику по всем дырам,
       `control_loop` разбирает статистику пира — если по дыре
       получено меньше половины отправленного (при выборке ≥ `MIN_STATS_SAMPLE`),
@@ -171,15 +172,21 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       отправителя: `Ordered`, `WrappedData` с корзиной — ключ ещё и по клиенту), адаптивное
       ожидание 3–30 мс по p99 отставания. Пакеты без номера идут сразу. (Раньше разбирал
       счётчик из заголовка WireGuard.)
-    - `src/vps.rs` — VPS-режим (белый IP сервера): порт знакомства вместо MQTT, случайные
-      порты слотов из диапазона, пассивный пробив на сервере; `MultiLink::start_discovery`
-      с `Discovery::{StunMqtt, VpsServer, VpsClient}`, `MultiLink::move_slot`.
+    - `src/p2p.rs` — стейт-машина P2P-слота (STUN → анонс в MQTT / виртуал-брокер → запись
+      пира → пробив в окне `PUNCH_WINDOW`) и раскладка записей пира по слотам.
+    - `src/vps.rs` — VPS-режим (белый IP сервера), свои стейт-машины сервера и клиента, с P2P
+      не смешиваются: порт знакомства без состояния (на запрос слота k — всегда текущая запись
+      слота k сервера, запись не снимается, только заменяется), все 10 слотов знакомятся через
+      него; слот сервера — случайный порт и сессия, ждёт последнюю сессию клиента без
+      тайм-аута; слот клиента — спрашивает и идёт на выданный порт. `MultiLink::start_discovery`
+      с `Discovery::{StunMqtt, VpsServer, VpsClient}`, `MultiLink::move_slot`. В `multilink.rs`
+      — только общее: реестр, keep-alive, статистика, приём, `SlotBase::hold` (держать дыру).
     - `src/bind.rs` — `udp(ip, port, ifindex)`: сокет слота на адресе и, на Linux, на интерфейсе
       (`SO_BINDTOIFINDEX`, без прав на ядре 5.7+): там маршрут выбирается по назначению, и сокет с
       адресом `eth0` без привязки к интерфейсу всё равно ушёл бы в VPN. На Windows хватает адреса.
       `MultiLinkOptions::{bind_ip, bind_ifindex}`.
     - `src/lib.rs` — подключает модули (`auth`, `bind`, `codec`, `label`, `link_id`,
-      `multilink`, `pool`, `port_utils`, `punch`, `reorder`, `rendezvous`, `stun`, `vps`,
+      `multilink`, `p2p`, `pool`, `port_utils`, `punch`, `reorder`, `rendezvous`, `stun`, `vps`,
       `wire`, `xor`, `proto`).
   - `client/` — крейт `hp-client`: клиент телефона (`MultiLink` + мост TUN ↔ дыры,
     `attach_tun`/`detach_tun`), ядро Android-библиотеки, проверяется на хосте. Раньше тут был
@@ -420,14 +427,18 @@ NAT/провайдерами.
   (`Win32_Process.Create`). Скрипты для PowerShell через ssh запускаем как `-File`
   (stdin-режим ломает многострочные блоки). На ней постоянно стоит полный туннель OpenVPN до
   `profit` с обфускацией equalizer (как у `test`, см. ниже).
-- `jump1` (SSH-алиас; Xiaomi 4C, OpenWrt 23.05, это **домашний шлюз**: весь LAN идёт в VPS через
-  `hp0`) — `hp-router` установлен во флеш: `/usr/bin/hp-router`, настройки `/etc/hp-router/`
-  (`router.env` с `CONTROL_ADDR=192.168.1.1:47001`, `ca.crt`, `control.key`, `phones.state`),
-  служба procd `/etc/init.d/hp-router` (автозапуск **не** включён), LuCI-страница
-  `luci-app-homeproxy`. Прежняя копия — `/tmp/hp` (для отката). После перезапуска `hp-router`
-  пропадает `default dev hp0 table 100` — вернуть `ip route replace default dev hp0 table 100` и
-  `fw4 reload`, иначе LAN пойдёт мимо VPN. LAN роутера с этого ПК не видна (ПК со стороны его
-  WAN): трей — через `ssh -N -L 47001:192.168.1.1:47001 jump1` и строку с `127.0.0.1:47001`.
+- `jump1` (SSH-алиас через `note`; Xiaomi 4C, OpenWrt 23.05) — **тестовый стенд** `hp-router`, не
+  домашний шлюз. Аплинк — Wi-Fi-клиент `phy0-sta1` к `jump` (192.168.17.1, OpenWrt, точка доступа
+  WRT-104, за ней провайдер). `hp-router` во флеше: `/usr/bin/hp-router`, настройки
+  `/etc/hp-router/` (`router.env` с `CONTROL_ADDR=192.168.1.1:47001`, `ca.crt`, `control.key`,
+  `phones.state`, проверочные хуки `on-tun-up.sh`/`on-tun-down.sh`), служба procd
+  `/etc/init.d/hp-router` (автозапуск **не** включён), LuCI-страница `luci-app-homeproxy`.
+  Маршруты ставит сама служба (`ROUTES=auto`, `hp-router/src/routes.rs`): /1 в `hp0`, /32 до VPS
+  и STUN/MQTT через аплинк. В `/etc/nftables.d/90-hp-notrack.nft` UDP с портов VPS 40000–40999
+  идёт мимо conntrack: ответы этих портов машинам из LAN не доходят (так и задумано — им VPS не
+  нужен), для проверок пути к VPS из LAN брать другие порты. LAN роутера с этого ПК не видна
+  (ПК со стороны его WAN): трей — через `ssh -N -L 47001:192.168.1.1:47001 jump1` и строку с
+  `127.0.0.1:47001`.
 - `test` (SSH-алиас, libvirt-ВМ на этом ПК, Debian 13, `sudo` без пароля) — Linux-машина для
   проверок с VPN на ПК. На `test` и `win` постоянно стоит полный туннель OpenVPN до `profit` через
   обфускацию equalizer (`server-rs` на `profit`, порты 51410–51419; голый OpenVPN из домашней

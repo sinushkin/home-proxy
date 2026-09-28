@@ -20,6 +20,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -86,6 +87,16 @@ impl PeerSession {
     }
 }
 
+/// Последняя регистрация пира на брокере: откуда (адрес, который пир увидел через STUN) и
+/// когда (`registered_at_unix_ms` записи, по часам пира). Обновляется на каждой публикации пира,
+/// в том числе повторной той же сессии, — видно, жив ли пир на брокере, даже если дыры не
+/// пробиваются.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerRegistration {
+    pub addr: SocketAddr,
+    pub registered_at_unix_ms: u64,
+}
+
 /// Публикатор наших слотов. Держит MQTT-клиент и фоновую задачу опроса; при
 /// дропе задача останавливается, соединение с брокером закрывается.
 pub struct Registrar {
@@ -93,6 +104,7 @@ pub struct Registrar {
     client: AsyncClient,
     my_peer_id: Uuid,
     pair: PairSecret,
+    last_peer: Arc<Mutex<Option<PeerRegistration>>>,
     _poll_task: AbortOnDrop,
 }
 
@@ -140,6 +152,8 @@ pub async fn connect(
 
     let (tx, rx) = mpsc::channel(PEER_SESSION_CHANNEL_CAPACITY);
 
+    let last_peer = Arc::new(Mutex::new(None));
+    let poll_last_peer = last_peer.clone();
     let poll_label = label.clone();
     let resubscribe_client = client.clone();
     let poll_task = tokio::spawn(async move {
@@ -184,7 +198,10 @@ pub async fn connect(
                 _ => continue,
             };
             let session = match decode_peer_session(publish.payload.as_ref(), peer_id, &poll_pair) {
-                Ok(Some(session)) => session,
+                Ok(Some((session, registered_at_unix_ms))) => {
+                    *poll_last_peer.lock().unwrap() = Some(PeerRegistration { addr: session.addr, registered_at_unix_ms });
+                    session
+                }
                 Ok(None) => continue,
                 Err(e) => {
                     log::warn!("{label}некорректная запись пира на брокере: {e:#}");
@@ -206,6 +223,7 @@ pub async fn connect(
         client,
         my_peer_id,
         pair,
+        last_peer,
         _poll_task: AbortOnDrop(poll_task),
     };
     Ok((registrar, rx))
@@ -303,16 +321,21 @@ pub fn peer_session_from(r: &Rendezvous, pair: &PairSecret, peer_id: Uuid) -> Re
 }
 
 /// Разбирает payload записи пира из MQTT. `Ok(None)` — запись не про этого
-/// пира (лишний топик), её просто пропускаем.
-fn decode_peer_session(payload: &[u8], peer_id: Uuid, pair: &PairSecret) -> Result<Option<PeerSession>> {
+/// пира (лишний топик), её просто пропускаем. Вместе с сессией — время регистрации из записи.
+fn decode_peer_session(payload: &[u8], peer_id: Uuid, pair: &PairSecret) -> Result<Option<(PeerSession, u64)>> {
     let r = Rendezvous::decode(payload).context("не удалось разобрать Rendezvous")?;
     if r.peer_id != peer_name(&peer_id) {
         return Ok(None);
     }
-    Ok(Some(peer_session_from(&r, pair, peer_id)?))
+    Ok(Some((peer_session_from(&r, pair, peer_id)?, r.registered_at_unix_ms)))
 }
 
 impl Registrar {
+    /// Последняя запись пира, пришедшая с брокера; `None` — ни одной не было.
+    pub fn last_peer_registration(&self) -> Option<PeerRegistration> {
+        *self.last_peer.lock().unwrap()
+    }
+
     /// Публикует (или обновляет) подписанную регистрацию нашего слота: адрес, `session_id` и
     /// TTL. Retained — чтобы пир, подписавшийся позже, тоже увидел.
     pub async fn publish_slot(&self, slot: u8, session_id: Uuid, endpoints: &[SocketAddr]) -> Result<()> {
@@ -360,12 +383,15 @@ mod tests {
     fn signed_record_decodes_for_the_pair_and_carries_only_the_name() {
         let (me, peer, pair) = ids();
         let session_id = Uuid::new_v4();
-        let record = our_record(&pair, peer, 3, session_id, &["203.0.113.7:40000".parse().unwrap()], 0);
+        let record = our_record(&pair, peer, 3, session_id, &["203.0.113.7:40000".parse().unwrap()], 1_700_000_000_000);
         assert_eq!(record.peer_id, peer_name(&peer));
         assert_eq!(record.peer_id.len(), 8);
 
         let got = decode_peer_session(&record.encode_to_vec(), peer, &PairSecret::new(peer, me)).unwrap().unwrap();
-        assert_eq!(got, PeerSession { slot: 3, session_id, addr: "203.0.113.7:40000".parse().unwrap(), extra: vec![] });
+        assert_eq!(
+            got,
+            (PeerSession { slot: 3, session_id, addr: "203.0.113.7:40000".parse().unwrap(), extra: vec![] }, 1_700_000_000_000)
+        );
     }
 
     #[test]

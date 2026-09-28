@@ -31,9 +31,11 @@
 //!   рядом с настройками;
 //!   REORDER_WAIT_MS, DATA_HOLES — как у `vps-client`; RUNTIME=multi — многопоточный tokio
 //!   (по умолчанию однопоточный: на одноядерном роутере так быстрее);
+//!   ROUTES — `auto` (по умолчанию): служба сама ставит маршруты — всё в `hp0`, кроме VPS, STUN
+//!   и MQTT, сокеты дыр привязаны к аплинку (`routes.rs`); `off` — маршруты вручную;
+//!   ON_TUN_UP (`on-tun-up.sh`), ON_TUN_DOWN (`on-tun-down.sh`) — скрипты после подъёма туннеля
+//!   и при остановке службы, рядом с настройками (`routes::Hooks`);
 //!   RUST_LOG, LOG_FILE — логи.
-//! Сокеты дыр телефонов, STUN и MQTT должны ходить мимо `hp0` (напрямую через WAN): маршрут по
-//! умолчанию в `hp0` — только для LAN (правило по источнику), см. `OpenWRT/Tun.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -52,7 +54,11 @@ use hp_server::Peer;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod routes;
+
 const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+/// Как часто сверять маршруты и аплинк (`routes.rs`).
+const ROUTES_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Phone {
@@ -84,6 +90,10 @@ struct Config {
     control: Option<SocketAddr>,
     key_file: PathBuf,
     phones_file: PathBuf,
+    /// `ROUTES=auto`: маршруты и привязку сокетов к аплинку ставит служба.
+    routes: bool,
+    on_tun_up: PathBuf,
+    on_tun_down: PathBuf,
 }
 
 impl Config {
@@ -119,6 +129,13 @@ impl Config {
             control: control_addr(&get)?,
             key_file: settings.resolve(get("CONTROL_KEY_FILE").as_deref().unwrap_or(hp_control::KEY_FILE).trim()),
             phones_file: settings.resolve(get("PHONES_FILE").as_deref().unwrap_or("phones.state").trim()),
+            routes: match get("ROUTES").as_deref().map(str::trim) {
+                None | Some("") | Some("auto") => true,
+                Some("off") => false,
+                Some(other) => anyhow::bail!("ROUTES: ожидается auto или off, а не {other}"),
+            },
+            on_tun_up: settings.resolve(get("ON_TUN_UP").as_deref().unwrap_or("on-tun-up.sh").trim()),
+            on_tun_down: settings.resolve(get("ON_TUN_DOWN").as_deref().unwrap_or("on-tun-down.sh").trim()),
         };
 
         let mut router_ids = HashSet::from([config.vps_my_id]);
@@ -130,6 +147,65 @@ impl Config {
             );
         }
         Ok(config)
+    }
+}
+
+/// Туннель снимается: маршруты /1 (`ROUTES=auto`), затем `on-tun-down.sh`; `result` — с чем
+/// выйти (ошибка — procd перезапустит службу).
+async fn shutdown(routes: Option<&mut routes::Routes>, hooks: &routes::Hooks, result: Result<()>) -> Result<()> {
+    if let Some(routes) = routes {
+        routes.tunnel_down().await;
+    }
+    hooks.down().await;
+    result
+}
+
+/// Переменные окружения хуков (описание — `routes::Hooks::env`).
+fn hook_env(config: &Config, tun: &str, assigned: &hp_tun::bridge::Assigned, routes: Option<&routes::Routes>) -> Vec<(&'static str, String)> {
+    let join = |ips: &[Ipv4Addr]| ips.iter().map(Ipv4Addr::to_string).collect::<Vec<_>>().join(" ");
+    let mut env = vec![
+        ("TUN_DEV", tun.to_string()),
+        ("TUN_ADDR", assigned.address.to_string()),
+        ("TUN_PREFIX", assigned.prefix.to_string()),
+        ("TUN_DNS", join(&assigned.dns)),
+        ("VPS_IP", config.vps_server.ip().to_string()),
+        ("BYPASS", join(&bypass_hosts(config))),
+        ("ROUTES", if routes.is_some() { "auto" } else { "off" }.to_string()),
+    ];
+    if let Some(up) = routes.map(|r| &r.uplink) {
+        env.push(("UPLINK_DEV", up.dev.clone()));
+        env.push(("UPLINK_GW", up.gateway.map(|g| g.to_string()).unwrap_or_default()));
+        env.push(("UPLINK_IFINDEX", up.ifindex.to_string()));
+    }
+    env
+}
+
+/// Адреса, которые идут мимо туннеля: VPS, STUN, MQTT (IPv4).
+fn bypass_hosts(config: &Config) -> Vec<Ipv4Addr> {
+    let mut addrs = vec![config.vps_server];
+    if let Some(d) = &config.phone_discovery {
+        addrs.extend(d.stun_addrs.iter().copied());
+        addrs.push(d.mqtt_addr);
+    }
+    addrs
+        .into_iter()
+        .filter_map(|a| match a.ip() {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .fold(Vec::new(), |mut unique, ip| {
+            // STUN и MQTT часто на одном хосте.
+            if !unique.contains(&ip) {
+                unique.push(ip);
+            }
+            unique
+        })
+}
+
+fn vps_probe(config: &Config) -> Result<Ipv4Addr> {
+    match config.vps_server.ip() {
+        std::net::IpAddr::V4(ip) => Ok(ip),
+        std::net::IpAddr::V6(_) => anyhow::bail!("ROUTES=auto: VPS_SERVER должен быть IPv4 (или ROUTES=off)"),
     }
 }
 
@@ -392,6 +468,8 @@ fn peer_status(name: String, kind: &str, status: LinkStatus) -> proto::PeerStatu
             .collect(),
         kind: kind.into(),
         reorder_wait_ms: status.reorder_wait_ms,
+        registered_addr: status.peer_registration.map(|r| r.addr.to_string()).unwrap_or_default(),
+        registered_at_unix_ms: status.peer_registration.map_or(0, |r| r.registered_at_unix_ms),
         ..Default::default()
     }
 }
@@ -479,11 +557,17 @@ impl hp_control::server::Controlled for Router {
 
 async fn run(config: Config) -> Result<()> {
     log::info!("hp-router: VPS {} (я {}), телефонов в настройках {}", config.vps_server, peer_name(&config.vps_my_id), config.phones.len());
+    let mut routes = match config.routes {
+        true => Some(routes::Routes::start(&config.tun_name, bypass_hosts(&config), vps_probe(&config)?).await?),
+        false => None,
+    };
+    let bind_ifindex = routes.as_ref().map(|r| r.uplink.ifindex);
     // Пакеты телефонов роутер перекладывает насквозь: порядок им вернёт VPS или сам телефон.
     let vps_options = MultiLinkOptions {
         reorder_wait: config.reorder_wait,
         data_holes: config.data_holes,
         reorder_clients: false,
+        bind_ifindex,
         ..MultiLinkOptions::default()
     };
     let (vps, mut vps_rx) = MultiLink::start_discovery(
@@ -507,16 +591,26 @@ async fn run(config: Config) -> Result<()> {
     };
     let tun = hp_tun::Tun::create(&tun_config).context("создание TUN (нужны права root)")?;
     log::info!("hp-router: TUN {} {}/{}", tun.name(), assigned.address, assigned.prefix);
+    if let Some(routes) = &mut routes {
+        routes.tunnel_up().await?;
+    }
+    let hooks = routes::Hooks { up: config.on_tun_up.clone(), down: config.on_tun_down.clone(), env: hook_env(&config, tun.name(), &assigned, routes.as_ref()) };
     let _refresh = AbortOnDrop(hp_tun::bridge::spawn_address_refresh(vps.clone(), AddressKind::Host, None));
     let (to_phones_tx, to_phones_rx) = mpsc::channel::<Incoming>(256);
     let bridge = hp_tun::bridge::Bridge::start_relay(tun, vps.clone(), vps_rx, to_phones_tx);
+    hooks.up().await;
 
     let router = Arc::new(Router {
         vps: vps.clone(),
         vps_address: assigned.address,
         phones: Arc::default(),
         discovery: config.phone_discovery.clone(),
-        phone_options: MultiLinkOptions { reorder_wait: Duration::ZERO, data_holes: config.data_holes, ..MultiLinkOptions::default() },
+        phone_options: MultiLinkOptions {
+            reorder_wait: Duration::ZERO,
+            data_holes: config.data_holes,
+            bind_ifindex,
+            ..MultiLinkOptions::default()
+        },
         stats: Arc::new(RelayStats::default()),
         bridge,
         phones_file: config.phones_file.clone(),
@@ -539,10 +633,31 @@ async fn run(config: Config) -> Result<()> {
 
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_log = Instant::now();
+    let mut last_routes = Instant::now();
     let mut last = None;
+    // procd останавливает службу SIGTERM: сначала снимаем туннель и зовём on-tun-down.sh.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = terminate.recv() => {
+                log::info!("hp-router: остановка (SIGTERM)");
+                return shutdown(routes.as_mut(), &hooks, Ok(())).await;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("hp-router: остановка (SIGINT)");
+                return shutdown(routes.as_mut(), &hooks, Ok(())).await;
+            }
+        }
         router.housekeeping();
+        if let Some(routes) = &mut routes
+            && last_routes.elapsed() >= ROUTES_INTERVAL
+        {
+            last_routes = Instant::now();
+            if let Err(e) = routes.check().await {
+                return shutdown(Some(routes), &hooks, Err(e)).await;
+            }
+        }
         if last_log.elapsed() < STATUS_INTERVAL {
             continue;
         }
