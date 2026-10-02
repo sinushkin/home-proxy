@@ -81,7 +81,7 @@ pub(crate) struct Pair {
 }
 
 impl Pair {
-    fn identity(&self, slot: u8, my_session: Uuid, peer_session: Uuid) -> PeerIdentity {
+    fn identity(&self, slot: crate::multilink::SlotId, my_session: Uuid, peer_session: Uuid) -> PeerIdentity {
         PeerIdentity {
             session_id: my_session,
             peer_session_id: peer_session,
@@ -93,7 +93,7 @@ impl Pair {
     }
 
     /// Наша подписанная запись слота.
-    fn record(&self, slot: u8, session: Uuid, endpoint: SocketAddr) -> Rendezvous {
+    fn record(&self, slot: crate::multilink::SlotId, session: Uuid, endpoint: SocketAddr) -> Rendezvous {
         rendezvous::our_record(&self.secret, self.my_peer_id, slot, session, &[endpoint], 0)
     }
 }
@@ -468,7 +468,7 @@ mod tests {
         let theirs = pair(peer, me);
         let (send, mut recv) = theirs.secret.bootstrap_keys();
         let endpoint = SocketAddr::from(([203, 0, 113, 10], 41234));
-        let packet = |p: &Pair, slot: u8| codec::encode(&wrap(p.record(slot, Uuid::new_v4(), endpoint)), &send);
+        let packet = |p: &Pair, slot: crate::multilink::SlotId| codec::encode(&wrap(p.record(slot, Uuid::new_v4(), endpoint)), &send);
 
         let ok = unwrap(&packet(&theirs, 3), &mut recv, &mine).expect("запись пира");
         assert_eq!((ok.slot, ok.addr), (3, endpoint));

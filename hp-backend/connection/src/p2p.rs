@@ -42,7 +42,7 @@ use crate::rendezvous::{self, PeerSession, Registrar};
 use crate::stun;
 
 /// Слот, о котором договариваемся через MQTT; остальные — через виртуал-брокер.
-const BOOTSTRAP_SLOT: u8 = 0;
+const BOOTSTRAP_SLOT: crate::multilink::SlotId = 0;
 
 /// Окно пробива одной попытки. Длиннее TTL регистрации (60 c) — с перекрытием.
 const PUNCH_WINDOW: Duration = Duration::from_secs(80);
@@ -117,8 +117,8 @@ pub(crate) async fn start(label: &Label, config: Config, bases: Vec<SlotBase>) -
 }
 
 /// Локальный порт слота: `base + slot`, или 0 (выберет ОС), если `base` не задан.
-fn slot_port(base: u16, slot: u8) -> u16 {
-    if base == 0 { 0 } else { base.saturating_add(u16::from(slot)) }
+fn slot_port(base: u16, slot: crate::multilink::SlotId) -> u16 {
+    if base == 0 { 0 } else { base.saturating_add(u16::try_from(slot).unwrap_or(u16::MAX)) }
 }
 
 /// Раскладывает записи пира по слотам: из MQTT (слот 0) и пришедшие по дырам (остальные;
@@ -292,7 +292,7 @@ impl Slot {
 }
 
 /// Периодически обновляет MQTT-регистрацию bootstrap-слота, пока хэндл жив.
-fn spawn_mqtt_republish(registrar: Arc<Registrar>, slot: u8, session_id: Uuid, endpoints: Vec<SocketAddr>) -> AbortOnDrop {
+fn spawn_mqtt_republish(registrar: Arc<Registrar>, slot: crate::multilink::SlotId, session_id: Uuid, endpoints: Vec<SocketAddr>) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(REPUBLISH_INTERVAL);
         ticker.tick().await; // первый тик сразу — публикацию уже сделали снаружи

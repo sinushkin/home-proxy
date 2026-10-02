@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod bind;
 pub mod codec;
+pub mod dedup;
+pub mod holes;
 pub mod label;
 pub mod link_id;
 pub mod multilink;

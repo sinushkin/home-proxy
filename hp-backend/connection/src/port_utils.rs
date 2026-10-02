@@ -64,16 +64,14 @@ pub fn zigzag_ports(center: u16, low: u16, high: u16) -> Vec<u16> {
     let mut ports = Vec::with_capacity(steps as usize * 2 + 1);
     ports.push(center);
     for d in 1..=steps {
-        if d <= up_steps {
-            if let Some(p) = center.checked_add(d) {
+        if d <= up_steps
+            && let Some(p) = center.checked_add(d) {
                 ports.push(p);
             }
-        }
-        if d <= down_steps {
-            if let Some(p) = center.checked_sub(d).filter(|&p| p != 0) {
+        if d <= down_steps
+            && let Some(p) = center.checked_sub(d).filter(|&p| p != 0) {
                 ports.push(p);
             }
-        }
     }
     ports
 }

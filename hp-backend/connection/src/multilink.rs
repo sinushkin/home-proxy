@@ -37,8 +37,14 @@ use crate::rendezvous::{PeerRegistration, Registrar};
 use crate::stats_feedback;
 use crate::{p2p, vps};
 
+/// Номер дыры (слота). `u32`, не `u8`: в динамическом наборе (PLAN-dynamic-holes-relay.md) номер
+/// монотонный и не переиспользуется — дыра «поработала — умерла», при частой ротации u8
+/// переполнился бы за несколько минут. P2P/VPS с фиксированным набором продолжают использовать
+/// значения `0..TARGET_LINKS`, тип общий.
+pub type SlotId = u32;
+
 /// Сколько дыр набираем.
-pub const TARGET_LINKS: u8 = 10;
+pub const TARGET_LINKS: SlotId = 10;
 
 /// Keep-alive шлём со случайным периодом в этих пределах (маскировка ритма).
 const KEEPALIVE_MIN: Duration = Duration::from_secs(2);
@@ -67,7 +73,7 @@ pub struct WrappedInfo {
 /// `wrapped` — `Some`, если пришла обёрнутая (`WrappedData`), иначе обычная `Data`.
 #[derive(Debug)]
 pub struct Incoming {
-    pub slot: u8,
+    pub slot: SlotId,
     /// Нагрузка в буфере из банка (`pool`): буфер вернётся в банк, когда пакет отправят дальше.
     pub payload: Packet,
     pub wrapped: Option<WrappedInfo>,
@@ -171,7 +177,7 @@ impl StateTracker {
         aggregate(&self.inner.lock().unwrap().phases)
     }
 
-    fn set(&self, slot: u8, phase: SlotPhase) {
+    fn set(&self, slot: SlotId, phase: SlotPhase) {
         let label = &self.label;
         let mut inner = self.inner.lock().unwrap();
         log::debug!("{label}слот {slot}: фаза {phase:?}");
@@ -194,7 +200,7 @@ impl StateTracker {
 /// выпадают; новые живые слоты попадают в него со следующего цикла.
 struct SlotPicker {
     /// Ещё не использованные в этом цикле слоты (без выделения памяти: слотов ≤ `TARGET_LINKS`).
-    remaining: [u8; TARGET_LINKS as usize],
+    remaining: [SlotId; TARGET_LINKS as usize],
     len: usize,
     rng: XorShift32,
 }
@@ -207,7 +213,7 @@ impl Default for SlotPicker {
 
 impl SlotPicker {
     /// `random_below(n)` — случайное число из `0..n`.
-    fn pick(&mut self, live: &[u8], mut random_below: impl FnMut(usize) -> usize) -> Option<u8> {
+    fn pick(&mut self, live: &[SlotId], mut random_below: impl FnMut(usize) -> usize) -> Option<SlotId> {
         let mut kept = 0;
         for i in 0..self.len {
             if live.contains(&self.remaining[i]) {
@@ -231,7 +237,7 @@ impl SlotPicker {
     }
 
     /// То же со своим генератором случайных чисел.
-    fn pick_random(&mut self, live: &[u8]) -> Option<u8> {
+    fn pick_random(&mut self, live: &[SlotId]) -> Option<SlotId> {
         let mut rng = self.rng;
         let slot = self.pick(live, |n| rng.below(n));
         self.rng = rng;
@@ -269,20 +275,20 @@ impl XorShift32 {
 /// Сендер одной живой дыры плюс её слот.
 #[derive(Clone)]
 pub(crate) struct LiveLink {
-    pub slot: u8,
+    pub slot: SlotId,
     pub sender: Arc<LinkSender>,
     /// hp-stats (фича `stats`): когда дыра встала в реестр — для `hole_age_ms` в записях.
     #[cfg(feature = "stats")]
     pub established_at: Instant,
 }
 
-/// Общий реестр живых дыр. `index` — тот самый `Map<PeerLinkId, u8>`.
+/// Общий реестр живых дыр. `index` — тот самый `Map<PeerLinkId, SlotId>`.
 #[derive(Default)]
 pub(crate) struct LinkRegistry {
-    by_slot: HashMap<u8, LiveLink>,
-    index: HashMap<PeerLinkId, u8>,
+    by_slot: HashMap<SlotId, LiveLink>,
+    index: HashMap<PeerLinkId, SlotId>,
     /// Последний отчёт пира по дыре и наши счётчики на момент его прихода — для потерь.
-    reports: HashMap<u8, SlotReport>,
+    reports: HashMap<SlotId, SlotReport>,
 }
 
 /// Отчёт пира о дыре (`Stats`) и наши счётчики той же дыры в момент его получения.
@@ -305,7 +311,7 @@ fn loss(sent: u64, received: u64) -> Option<f32> {
 /// Состояние одной живой дыры.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HoleStatus {
-    pub slot: u8,
+    pub slot: SlotId,
     /// Адрес пира на этой дыре.
     pub peer_addr: Option<SocketAddr>,
     /// Пакетов отправлено и получено по дыре с её открытия.
@@ -351,7 +357,7 @@ impl LinkRegistry {
         self.by_slot.values().cloned().collect()
     }
 
-    fn received_on(&self, slot: u8) -> u64 {
+    fn received_on(&self, slot: SlotId) -> u64 {
         self.by_slot.get(&slot).map(|l| l.sender.stats().1).unwrap_or(0)
     }
 
@@ -436,7 +442,7 @@ impl Default for MultiLinkOptions {
 
 /// Оставляет для отправки не больше `max` слотов с наименьшими номерами (0 — все); сортирует
 /// на месте, возвращает, сколько слотов оставить.
-fn limit_slots(slots: &mut [u8], max: u8) -> usize {
+fn limit_slots(slots: &mut [SlotId], max: u8) -> usize {
     slots.sort_unstable();
     if max > 0 { slots.len().min(usize::from(max)) } else { slots.len() }
 }
@@ -621,7 +627,7 @@ impl MultiLink {
         );
         // Без выделения памяти: живых дыр ≤ TARGET_LINKS, список — на стеке.
         let registry = self.registry.lock().unwrap();
-        let mut slots = [0u8; TARGET_LINKS as usize];
+        let mut slots = [0; TARGET_LINKS as usize];
         let mut count = 0;
         for &slot in registry.by_slot.keys() {
             if count < slots.len() {
@@ -639,7 +645,7 @@ impl MultiLink {
 
     /// Отправляет полезную нагрузку пиру по одной из живых дыр обычной `Data`.
     /// Возвращает номер дыры, по которой ушло.
-    pub async fn send_data(&self, payload: &[u8]) -> Result<u8> {
+    pub async fn send_data(&self, payload: &[u8]) -> Result<SlotId> {
         let link = self.choose_link(payload.len())?;
         let pid = self.next_pid();
         #[cfg(feature = "stats")]
@@ -654,7 +660,7 @@ impl MultiLink {
     /// ней, выставленные исходным отправителем (TUN-режим): их не меняем, порядок вернёт конечный
     /// получатель. Без `order` пакет идёт без порядка (номер — свой счётчик клиента). Возвращает
     /// номер дыры.
-    pub async fn send_client(&self, client_id: u8, order: Option<(u32, u64)>, payload: &[u8]) -> Result<u8> {
+    pub async fn send_client(&self, client_id: u8, order: Option<(u32, u64)>, payload: &[u8]) -> Result<SlotId> {
         let link = self.choose_link(payload.len())?;
         let (flow, seq) = match order {
             Some((flow, seq)) => (Some(flow), seq),
@@ -671,7 +677,7 @@ impl MultiLink {
 
     /// Отправляет IP-пакет с номером в потоке (`Ordered`, TUN-режим): получатель вернёт порядок
     /// внутри корзины `flow`. Возвращает номер дыры.
-    pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8]) -> Result<u8> {
+    pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8]) -> Result<SlotId> {
         let link = self.choose_link(payload.len())?;
         let pid = self.next_pid();
         #[cfg(feature = "stats")]
@@ -684,7 +690,7 @@ impl MultiLink {
 
     /// Отправляет пиру служебное сообщение по одной из живых дыр (без гарантии доставки:
     /// запросы повторяются вызывающим).
-    pub async fn send_control(&self, control: Control) -> Result<u8> {
+    pub async fn send_control(&self, control: Control) -> Result<SlotId> {
         let link = self.choose_link(0)?;
         link.sender.send_control(control).await;
         Ok(link.slot)
@@ -702,13 +708,13 @@ impl MultiLink {
 
     /// Перенести дыру `slot` на новые порты: слот регистрируется заново (в VPS-режиме —
     /// на новом порту сервера), пиру уходит `DeleteLink`, чтобы и он бросил старую.
-    pub async fn move_slot(&self, slot: u8) {
+    pub async fn move_slot(&self, slot: SlotId) {
         request_redrop(&self.redrop_txs, slot);
         broadcast_delete_link(&self.registry, slot).await;
     }
 
     /// Живые дыры: слот и текущий адрес пира.
-    pub fn live_links(&self) -> Vec<(u8, Option<SocketAddr>)> {
+    pub fn live_links(&self) -> Vec<(SlotId, Option<SocketAddr>)> {
         let mut links: Vec<_> =
             self.registry.lock().unwrap().links().into_iter().map(|l| (l.slot, l.sender.peer_addr())).collect();
         links.sort_by_key(|l| l.0);
@@ -808,7 +814,7 @@ async fn stats_loop(registry: Arc<Mutex<LinkRegistry>>) {
             .iter()
             .map(|l| {
                 let (sent, received) = l.sender.stats();
-                LinkStat { slot: l.slot as u32, sent, received }
+                LinkStat { slot: l.slot, sent, received }
             })
             .collect();
         for link in &links {
@@ -911,6 +917,10 @@ async fn control_loop(
     let MultiLinkOptions { reorder_wait, reorder_clients, .. } = options;
     let mut reorder = (!reorder_wait.is_zero()).then(|| Resequencer::adaptive(reorder_wait));
     let mut ready: Vec<Incoming> = Vec::with_capacity(64);
+    // Дедупликация по `pid` (PLAN-dynamic-holes-relay.md, раздел 5): активна только для
+    // пронумерованных пакетов — без включённого где-либо `pid` (hp-stats/будущий релей) никто не
+    // шлёт `Some(pid)`, окно простаивает без накладных расходов. До буфера порядка, как в плане.
+    let mut dedup = crate::dedup::DedupWindow::new();
     let mut stats_tick = tokio::time::interval(REORDER_STATS_INTERVAL);
     let mut logged = ReorderStats::default();
     loop {
@@ -964,14 +974,26 @@ async fn control_loop(
                 log::info!("{label}слот {slot}: пир просит удалить линк, пробиваем заново");
                 request_redrop(&redrop_txs, slot);
             }
+            // Динамический набор дыр (PLAN-dynamic-holes-relay.md, M5): пока только проводка —
+            // никто `Drain` не инициирует (нет политики, какая дыра и когда сливается) и реестр
+            // не умеет состояние `Draining`. Когда M5 появится, здесь будет: пометить дыру
+            // `Draining` (не выбирать для отправки, приём — как у любой живой), ответить `Drain`
+            // (идемпотентно), подождать `drain_grace` и закрыть. Сейчас — только лог.
+            LinkEvent::PeerDrain { slot } => {
+                log::info!("{label}слот {slot}: получен Drain (M5 ещё не реализован, без действия)");
+            }
             LinkEvent::PeerData { slot, payload, pid } => {
-                let _ = pid; // использован ниже только при фиче `stats`; `Option<u32>` — `Copy`
+                if !dedup.admit(pid) {
+                    continue; // дубликат (второй путь — релей, PLAN-dynamic-holes-relay.md M7)
+                }
                 #[cfg(feature = "stats")]
                 observe_pid(&pid_feedback, &time_sync, pid);
                 deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: None }, &mut ready).await;
             }
             LinkEvent::PeerWrapped { slot, seq, client_id, flow, payload, pid } => {
-                let _ = pid;
+                if !dedup.admit(pid) {
+                    continue;
+                }
                 #[cfg(feature = "stats")]
                 observe_pid(&pid_feedback, &time_sync, pid);
                 let Ok(client_id) = u8::try_from(client_id) else {
@@ -987,7 +1009,9 @@ async fn control_loop(
                 }
             }
             LinkEvent::PeerOrdered { slot, flow, seq, payload, pid } => {
-                let _ = pid;
+                if !dedup.admit(pid) {
+                    continue;
+                }
                 #[cfg(feature = "stats")]
                 observe_pid(&pid_feedback, &time_sync, pid);
                 deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: Some((flow, seq)) }, &mut ready).await;
@@ -1074,13 +1098,13 @@ fn link_is_bad(peer_sent: u64, my_received: u64) -> bool {
     peer_sent >= MIN_STATS_SAMPLE && my_received * 2 < peer_sent
 }
 
-fn request_redrop(redrop_txs: &[mpsc::Sender<()>], slot: u8) {
+fn request_redrop(redrop_txs: &[mpsc::Sender<()>], slot: SlotId) {
     if let Some(tx) = redrop_txs.get(slot as usize) {
         let _ = tx.try_send(());
     }
 }
 
-async fn broadcast_delete_link(registry: &Arc<Mutex<LinkRegistry>>, slot: u8) {
+async fn broadcast_delete_link(registry: &Arc<Mutex<LinkRegistry>>, slot: SlotId) {
     let links = registry.lock().unwrap().links();
     for link in links {
         link.sender.send_delete_link(slot).await;
@@ -1090,7 +1114,7 @@ async fn broadcast_delete_link(registry: &Arc<Mutex<LinkRegistry>>, slot: u8) {
 /// Общее для рабочей задачи слота любого режима: реестр живых дыр, события дыр, фазы слота и
 /// просьбы пробить дыру заново (плохая дыра, `DeleteLink` пира, `move_slot`).
 pub(crate) struct SlotBase {
-    pub slot: u8,
+    pub slot: SlotId,
     pub label: Label,
     pub registry: Arc<Mutex<LinkRegistry>>,
     pub events: mpsc::Sender<LinkEvent>,
@@ -1214,11 +1238,11 @@ mod tests {
 
     #[test]
     fn picker_uses_every_live_slot_once_per_cycle_then_starts_over() {
-        let live: Vec<u8> = (0..10).collect();
+        let live: Vec<SlotId> = (0..10).collect();
         let mut picker = SlotPicker::default();
         let mut rand = scripted(&[7, 3, 9, 0, 5, 5, 1, 2, 8, 4, 6]);
         for cycle in 0..3 {
-            let mut got: Vec<u8> = (0..10).map(|_| picker.pick(&live, &mut rand).unwrap()).collect();
+            let mut got: Vec<SlotId> = (0..10).map(|_| picker.pick(&live, &mut rand).unwrap()).collect();
             got.sort_unstable();
             assert_eq!(got, live, "цикл {cycle}: каждая дыра ровно один раз");
         }
@@ -1226,10 +1250,10 @@ mod tests {
 
     #[test]
     fn picker_order_follows_the_random_source_not_slot_order() {
-        let live = [0u8, 1, 2, 3];
+        let live: [SlotId; 4] = [0, 1, 2, 3];
         let mut picker = SlotPicker::default();
         // Всегда берём последний из оставшихся: 0,1,2,3 -> 3, потом 2 ...
-        let picked: Vec<u8> = (0..4).map(|_| picker.pick(&live, |n| n - 1).unwrap()).collect();
+        let picked: Vec<SlotId> = (0..4).map(|_| picker.pick(&live, |n| n - 1).unwrap()).collect();
         assert_eq!(picked, [3, 2, 1, 0]);
     }
 
@@ -1238,7 +1262,7 @@ mod tests {
         let mut picker = SlotPicker::default();
         assert!(picker.pick(&[1, 2, 3], |_| 0).is_some()); // убрали один из трёх
         // слот 2 умер, появился слот 9: 9 подключится только в следующем цикле
-        let live = [1u8, 3, 9];
+        let live: [SlotId; 3] = [1, 3, 9];
         let mut got = Vec::new();
         for _ in 0..2 {
             got.push(picker.pick(&live, |_| 0).unwrap());
@@ -1282,7 +1306,7 @@ mod tests {
 
     /// TCP-пакет корзины 7 с номером `counter`.
     fn tcp_event(counter: u64) -> LinkEvent {
-        LinkEvent::PeerOrdered { slot: (counter % 10) as u8, flow: 7, seq: counter, payload: Packet::copy_from(&[0x45u8; 48]).unwrap(), pid: None }
+        LinkEvent::PeerOrdered { slot: (counter % 10) as SlotId, flow: 7, seq: counter, payload: Packet::copy_from(&[0x45u8; 48]).unwrap(), pid: None }
     }
 
     fn counter_of(packet: &Incoming) -> u64 {
@@ -1329,6 +1353,49 @@ mod tests {
         let first = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv()).await.unwrap().unwrap();
         let second = tokio::time::timeout(Duration::from_millis(50), incoming_rx.recv()).await.unwrap().unwrap();
         assert_eq!((counter_of(&first), counter_of(&second)), (5, 6));
+    }
+
+    /// Пакет с уже виденным `pid` (второй путь — например, релей, PLAN-dynamic-holes-relay.md
+    /// M7) отбрасывается в `control_loop` до буфера порядка и до приложения; пакеты без `pid`
+    /// дедупликации не подлежат (нынешнее поведение, пока никто `pid` не ставит).
+    #[tokio::test]
+    async fn control_loop_drops_a_duplicate_pid_but_passes_packets_without_one() {
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        tokio::spawn(control_loop(
+            Label::new(""),
+            events_rx,
+            Arc::new(Mutex::new(LinkRegistry::default())),
+            Vec::new(),
+            None,
+            (incoming_tx, mpsc::channel(4).0),
+            MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
+            Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(None)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::TimeSync::new())),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::PidFeedbackBuilder::new())),
+        ));
+
+        let data_event = |pid: Option<u32>| LinkEvent::PeerData { slot: 0, payload: Packet::copy_from(b"x").unwrap(), pid };
+        events_tx.send(data_event(Some(42))).await.unwrap();
+        events_tx.send(data_event(Some(42))).await.unwrap(); // дубликат — не должен дойти
+        events_tx.send(data_event(Some(43))).await.unwrap();
+        events_tx.send(data_event(None)).await.unwrap(); // без номера — дедупликация не применяется
+        events_tx.send(data_event(None)).await.unwrap(); // тоже без номера — тоже проходит
+
+        let mut got = 0;
+        for _ in 0..4 {
+            tokio::time::timeout(Duration::from_millis(100), incoming_rx.recv()).await.unwrap().unwrap();
+            got += 1;
+        }
+        assert_eq!(got, 4, "4 пакета дошли (42, 43, None, None), дубликат 42 отброшен");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), incoming_rx.recv()).await.is_err(),
+            "лишних пакетов быть не должно"
+        );
     }
 
     /// `reorder_wait = 0` отключает буфер: пакеты идут как пришли.
@@ -1409,7 +1476,7 @@ mod tests {
 
     #[test]
     fn limit_slots_keeps_the_lowest_numbers_and_zero_means_all() {
-        let limited = |mut v: Vec<u8>, max: u8| {
+        let limited = |mut v: Vec<SlotId>, max: u8| {
             let n = limit_slots(&mut v, max);
             v.truncate(n);
             v
@@ -1418,7 +1485,7 @@ mod tests {
         assert_eq!(limited(vec![5, 1, 9, 3], 1), vec![1]);
         assert_eq!(limited(vec![5, 1, 9, 3], 2), vec![1, 3]);
         assert_eq!(limited(vec![4], 3), vec![4]);
-        assert_eq!(limited(vec![], 1), Vec::<u8>::new());
+        assert_eq!(limited(vec![], 1), Vec::<SlotId>::new());
     }
 
     async fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {

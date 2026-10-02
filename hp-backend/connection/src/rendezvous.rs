@@ -71,7 +71,7 @@ impl Drop for AbortOnDrop {
 /// Запись одного слота пира, полученная с брокера.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerSession {
-    pub slot: u8,
+    pub slot: crate::multilink::SlotId,
     pub session_id: Uuid,
     pub addr: SocketAddr,
     /// Другие внешние адреса того же сокета (их видели другие STUN-серверы).
@@ -108,7 +108,7 @@ pub struct Registrar {
     _poll_task: AbortOnDrop,
 }
 
-fn slot_topic(peer_id: Uuid, slot: u8) -> String {
+fn slot_topic(peer_id: Uuid, slot: crate::multilink::SlotId) -> String {
     format!("home-proxy/rendezvous/{}/{slot}", peer_name(&peer_id))
 }
 
@@ -158,7 +158,7 @@ pub async fn connect(
     let resubscribe_client = client.clone();
     let poll_task = tokio::spawn(async move {
         let label = poll_label;
-        let mut seen: HashSet<(u8, Uuid)> = HashSet::new();
+        let mut seen: HashSet<(crate::multilink::SlotId, Uuid)> = HashSet::new();
         let mut ever_connected = false;
         let mut failing = false;
         loop {
@@ -264,7 +264,7 @@ fn mqtt_options(
 pub fn our_record(
     pair: &PairSecret,
     my_peer_id: Uuid,
-    slot: u8,
+    slot: crate::multilink::SlotId,
     session_id: Uuid,
     endpoints: &[SocketAddr],
     registered_at_unix_ms: u64,
@@ -276,7 +276,7 @@ pub fn our_record(
         peer_id: peer_name(&my_peer_id),
         registered_at_unix_ms,
         session_id: session_id.to_string(),
-        slot: u32::from(slot),
+        slot,
         extra_endpoints: endpoints
             .iter()
             .skip(1)
@@ -303,7 +303,7 @@ pub fn peer_session_from(r: &Rendezvous, pair: &PairSecret, peer_id: Uuid) -> Re
     anyhow::ensure!(r.peer_id == peer_name(&peer_id), "запись другого пира ({})", r.peer_id);
     anyhow::ensure!(signature_is_valid(r, pair), "подпись записи неверна");
     Ok(PeerSession {
-        slot: u8::try_from(r.slot).context("slot вне диапазона u8")?,
+        slot: r.slot,
         session_id: r.session_id.parse().context("некорректный session_id")?,
         addr: SocketAddr::new(
             r.public_ip.parse().context("некорректный public_ip")?,
@@ -338,7 +338,7 @@ impl Registrar {
 
     /// Публикует (или обновляет) подписанную регистрацию нашего слота: адрес, `session_id` и
     /// TTL. Retained — чтобы пир, подписавшийся позже, тоже увидел.
-    pub async fn publish_slot(&self, slot: u8, session_id: Uuid, endpoints: &[SocketAddr]) -> Result<()> {
+    pub async fn publish_slot(&self, slot: crate::multilink::SlotId, session_id: Uuid, endpoints: &[SocketAddr]) -> Result<()> {
         anyhow::ensure!(!endpoints.is_empty(), "нет ни одного внешнего адреса для публикации");
         let payload =
             our_record(&self.pair, self.my_peer_id, slot, session_id, endpoints, unix_ms_now()).encode_to_vec();
@@ -362,7 +362,7 @@ impl Registrar {
     }
 
     /// Стирает retained-запись слота (пустой payload с retain).
-    pub async fn clear_slot(&self, slot: u8) -> Result<()> {
+    pub async fn clear_slot(&self, slot: crate::multilink::SlotId) -> Result<()> {
         self.client
             .publish(slot_topic(self.my_peer_id, slot), QoS::AtLeastOnce, true, Vec::new())
             .await

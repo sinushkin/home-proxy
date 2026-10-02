@@ -62,7 +62,7 @@ impl LinkStats {
 /// Статистика пира по одной его дыре (из пришедшего `Stats`).
 #[derive(Clone, Copy, Debug)]
 pub struct PeerLinkStat {
-    pub slot: u8,
+    pub slot: crate::multilink::SlotId,
     pub sent: u64,
     pub received: u64,
 }
@@ -73,25 +73,28 @@ pub enum LinkEvent {
     /// Пришла статистика пира по всем его дырам.
     PeerStats(Vec<PeerLinkStat>),
     /// Пир просит удалить линк по этому слоту (он пробивает дыру заново).
-    DeleteLink { slot: u8 },
+    DeleteLink { slot: crate::multilink::SlotId },
+    /// Динамический набор дыр (PLAN-dynamic-holes-relay.md, M5, пока без политики): пир просит
+    /// (или подтверждает) слив дыры — обе стороны перестают слать по ней, готовясь закрыть.
+    PeerDrain { slot: crate::multilink::SlotId },
     /// Виртуал-брокер: пир прислал по этой дыре запись `Rendezvous` о своём
     /// другом слоте (то, что иначе ушло бы в MQTT).
     PeerRendezvous(Rendezvous),
     /// Пир прислал полезную нагрузку (`Data`) по дыре `slot` (буфер из банка). `pid` — hp-stats
     /// (PLAN-ML.md), номер пакета вниз; `None`, если отправитель его не ставит.
-    PeerData { slot: u8, payload: Packet, pid: Option<u32> },
+    PeerData { slot: crate::multilink::SlotId, payload: Packet, pid: Option<u32> },
     /// Пир прислал обёрнутый пакет (`WrappedData`) по дыре `slot`; `flow` — корзина TCP-потока
     /// (TUN-режим, `seq` тогда — номер в ней).
-    PeerWrapped { slot: u8, seq: u64, client_id: u32, flow: Option<u32>, payload: Packet, pid: Option<u32> },
+    PeerWrapped { slot: crate::multilink::SlotId, seq: u64, client_id: u32, flow: Option<u32>, payload: Packet, pid: Option<u32> },
     /// Пир прислал IP-пакет с номером в потоке (`Ordered`, TUN-режим).
-    PeerOrdered { slot: u8, flow: u32, seq: u64, payload: Packet, pid: Option<u32> },
+    PeerOrdered { slot: crate::multilink::SlotId, flow: u32, seq: u64, payload: Packet, pid: Option<u32> },
     /// Служебное сообщение пира (адрес в туннеле).
     PeerControl(crate::multilink::Control),
     /// hp-stats (фича `stats`, см. PLAN-ML.md): пир (клиент) сообщил, какие наши `pid` он
     /// принял и когда, в часах сервера.
-    PeerPidReport { slot: u8, report: PidReport },
+    PeerPidReport { slot: crate::multilink::SlotId, report: PidReport },
     /// hp-stats: ответ сервера на нашу пробу синхронизации часов (`TimeProbe`).
-    PeerTimeEcho { slot: u8, echo: TimeEcho },
+    PeerTimeEcho { slot: crate::multilink::SlotId, echo: TimeEcho },
 }
 
 #[derive(Clone, Debug)]
@@ -123,7 +126,7 @@ pub struct PeerIdentity {
     pub peer_session_id: Uuid,
     pub my_peer_id: Uuid,
     pub peer_id: Uuid,
-    pub slot: u8,
+    pub slot: crate::multilink::SlotId,
     pub pair: PairSecret,
 }
 
@@ -145,7 +148,7 @@ impl PeerIdentity {
                 session_id: self.session_id.to_string(),
                 from_peer_id: peer_name(&self.my_peer_id),
                 to_peer_id: peer_name(&self.peer_id),
-                slot: self.slot as u32,
+                slot: self.slot,
                 payload: Some(payload),
             })),
         }
@@ -156,7 +159,7 @@ impl PeerIdentity {
     fn lite(&self, payload: lite::Payload) -> PeerMessage {
         PeerMessage {
             body: Some(peer_message::Body::Lite(Lite {
-                slot: self.slot as u32,
+                slot: self.slot,
                 payload: Some(payload),
                 pid: None,
             })),
@@ -192,7 +195,7 @@ pub struct LinkSender {
 
 impl LinkSender {
     /// Слот этой дыры.
-    pub fn slot(&self) -> u8 {
+    pub fn slot(&self) -> crate::multilink::SlotId {
         self.identity.slot
     }
 
@@ -245,7 +248,7 @@ impl LinkSender {
     pub async fn send_data(&self, payload: &[u8], pid: Option<u32>) {
         log::trace!("слот {}: отправлено {} байт данных", self.identity.slot, payload.len());
         let mut buf = [0u8; PACKET_CAP];
-        let Some(n) = wire::encode_data(u32::from(self.identity.slot), payload, pid, &self.keys, &mut buf) else {
+        let Some(n) = wire::encode_data(self.identity.slot, payload, pid, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
         };
@@ -256,7 +259,7 @@ impl LinkSender {
     pub async fn send_wrapped(&self, seq: u64, client_id: u32, flow: Option<u32>, payload: &[u8], pid: Option<u32>) {
         log::trace!("слот {}: отправлен WrappedData seq={seq} ({} байт)", self.identity.slot, payload.len());
         let mut buf = [0u8; PACKET_CAP];
-        let slot = u32::from(self.identity.slot);
+        let slot = self.identity.slot;
         let Some(n) = wire::encode_wrapped(slot, seq, payload, client_id, flow, pid, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
@@ -267,7 +270,7 @@ impl LinkSender {
     /// Отправить IP-пакет с номером в потоке (`Ordered`, TUN-режим) по этой дыре.
     pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8], pid: Option<u32>) {
         let mut buf = [0u8; PACKET_CAP];
-        let slot = u32::from(self.identity.slot);
+        let slot = self.identity.slot;
         let Some(n) = wire::encode_ordered(slot, flow, seq, payload, pid, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
@@ -288,13 +291,21 @@ impl LinkSender {
     }
 
     /// Попросить пира удалить линк по слоту `slot`.
-    pub async fn send_delete_link(&self, slot: u8) {
+    pub async fn send_delete_link(&self, slot: crate::multilink::SlotId) {
         log::debug!(
             "слот {}: отправлен DeleteLink слота {slot}",
             self.identity.slot
         );
-        self.send_lite(lite::Payload::DeleteLink(DeleteLink { slot: slot as u32 }))
+        self.send_lite(lite::Payload::DeleteLink(DeleteLink { slot }))
             .await;
+    }
+
+    /// Динамический набор дыр (PLAN-dynamic-holes-relay.md, M5): сообщить пиру «перестаю слать по
+    /// этой дыре» (или подтвердить его такую же просьбу, идемпотентно — повторная отправка не
+    /// вредит). Сама политика «когда сливать» сюда не входит — это просто отправка сообщения.
+    pub async fn send_drain(&self, slot: crate::multilink::SlotId) {
+        log::debug!("слот {}: отправлен Drain слота {slot}", self.identity.slot);
+        self.send_lite(lite::Payload::Drain(crate::proto::Drain { slot })).await;
     }
 
     /// Служебное сообщение (адрес в туннеле) по этой дыре.
@@ -331,7 +342,7 @@ impl LinkSender {
 /// Живая дыра: пробита, keep-alive гоняет менеджер снаружи. Дроп
 /// останавливает фоновую задачу приёма.
 pub struct PeerLink {
-    pub slot: u8,
+    pub slot: crate::multilink::SlotId,
     pub link_id: PeerLinkId,
     /// Адрес пира, с которого пришёл пакет, установивший дыру. Дальше эндпоинт может
     /// сменяться (см. `LinkSender::peer_addr`).
@@ -481,7 +492,7 @@ pub async fn establish(
 /// пир достижим с адреса `from`: считаем этот адрес текущим эндпоинтом, даже если он
 /// отличается от того, куда мы стучались или откуда пришёл прежний пакет.
 fn note_packet(
-    slot: u8,
+    slot: crate::multilink::SlotId,
     from: SocketAddr,
     endpoint: &watch::Sender<Option<SocketAddr>>,
     last_seen: &Mutex<Instant>,
@@ -537,7 +548,7 @@ async fn receive_loop(
                     Packet::copy_from(payload).map(|payload| LinkEvent::PeerOrdered { slot: identity.slot, flow, seq, payload, pid }),
                 ),
             };
-            if lite_slot != u32::from(identity.slot) {
+            if lite_slot != identity.slot {
                 continue;
             }
             note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
@@ -579,7 +590,7 @@ async fn receive_loop(
             Some(peer_message::Body::Lite(lite)) => {
                 // После установки: достаточно нашего слота (подпись проверена выше). Адрес
                 // отправителя не проверяем: он становится текущим эндпоинтом пира.
-                if lite.slot != u32::from(identity.slot) {
+                if lite.slot != identity.slot {
                     continue;
                 }
                 note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
@@ -611,7 +622,7 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
+async fn handle_lite(lite: Lite, slot: crate::multilink::SlotId, events: &mpsc::Sender<LinkEvent>) {
     // hp-stats: `pid` — сосед `payload` в `Lite`, читаем до разбора `match lite.payload`
     // (частичный момент ниже забирает поле `payload` по значению).
     let pid = lite.pid;
@@ -624,21 +635,17 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
             let peer_stats = s
                 .links
                 .into_iter()
-                .filter_map(|l| {
-                    u8::try_from(l.slot).ok().map(|slot| PeerLinkStat {
-                        slot,
-                        sent: l.sent,
-                        received: l.received,
-                    })
-                })
+                .map(|l| PeerLinkStat { slot: l.slot, sent: l.sent, received: l.received })
                 .collect();
             let _ = events.send(LinkEvent::PeerStats(peer_stats)).await;
         }
         Some(lite::Payload::DeleteLink(d)) => {
             log::debug!("слот {slot}: получен DeleteLink слота {}", d.slot);
-            if let Ok(slot) = u8::try_from(d.slot) {
-                let _ = events.send(LinkEvent::DeleteLink { slot }).await;
-            }
+            let _ = events.send(LinkEvent::DeleteLink { slot: d.slot }).await;
+        }
+        Some(lite::Payload::Drain(d)) => {
+            log::debug!("слот {slot}: получен Drain слота {}", d.slot);
+            let _ = events.send(LinkEvent::PeerDrain { slot: d.slot }).await;
         }
         Some(lite::Payload::Rendezvous(r)) => {
             log::debug!("слот {slot}: получен Rendezvous слота {}", r.slot);
@@ -1150,6 +1157,35 @@ mod tests {
             .await
             .expect("событие не пришло")
             .unwrap()
+    }
+
+    /// `send_drain`, отправленный по дыре, приходит пиру событием `PeerDrain` с номером слота
+    /// (PLAN-dynamic-holes-relay.md, M5 — пока только проводка, без политики, когда слать).
+    #[tokio::test]
+    async fn drain_arrives_as_peer_drain_event() {
+        let peer_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let a_socket = Arc::new(UdpSocket::bind((peer_ip, 0)).await.unwrap());
+        let b_socket = Arc::new(UdpSocket::bind((peer_ip, 0)).await.unwrap());
+        let a_port = a_socket.local_addr().unwrap().port();
+        let b_port = b_socket.local_addr().unwrap().port();
+
+        let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let (a_sess, b_sess) = (Uuid::new_v4(), Uuid::new_v4());
+        let (b_events_tx, mut b_events) = mpsc::channel(8);
+
+        let (link_a, link_b) = tokio::join!(
+            establish(a_socket, a_port, vec![SocketAddr::new(peer_ip, b_port)], identity(a_sess, b_sess, a_id, b_id), test_config(), null_events()),
+            establish(b_socket, b_port, vec![SocketAddr::new(peer_ip, a_port)], identity(b_sess, a_sess, b_id, a_id), test_config(), b_events_tx),
+        );
+        let link_a = link_a.unwrap();
+        let _link_b = link_b.unwrap();
+
+        link_a.sender.send_drain(0).await;
+
+        match next_event(&mut b_events).await {
+            LinkEvent::PeerDrain { slot } => assert_eq!(slot, 0),
+            other => panic!("ожидали PeerDrain, пришло {other:?}"),
+        }
     }
 
     /// Валидный пакет с нашего слота от другого порта пира делает этот адрес текущим

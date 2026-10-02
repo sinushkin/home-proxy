@@ -252,12 +252,12 @@ impl<D: PacketDevice> Service<D> {
                     }
                     .into(),
                     live: status.holes.len() as u32,
-                    target: u32::from(TARGET_LINKS),
+                    target: TARGET_LINKS,
                     holes: status
                         .holes
                         .iter()
                         .map(|h| proto::HoleStatus {
-                            slot: u32::from(h.slot),
+                            slot: h.slot,
                             peer_addr: h.peer_addr.map(|a| a.to_string()).unwrap_or_default(),
                             sent: h.sent,
                             received: h.received,

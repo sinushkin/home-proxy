@@ -413,7 +413,7 @@ mod tests {
     /// TCP-пакет корзины `flow` с номером `counter` (пришёл по дыре `counter % 10`).
     fn pkt(flow: u32, counter: u64) -> Incoming {
         let mut packet = ordered(flow, counter);
-        packet.slot = (counter % 10) as u8;
+        packet.slot = (counter % 10) as crate::multilink::SlotId;
         packet
     }
 
