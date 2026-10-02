@@ -1,0 +1,26 @@
+[Unit]
+Description=VPS Server - homeproxy tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vps-server --config /etc/hp-vps/server.env
+Restart=on-failure
+RestartSec=5
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vps-server
+
+# Права доступа
+User=root
+Group=root
+
+# Переменные окружения (опционально)
+# Environment="RUST_LOG=info"
+# Environment="RUNTIME=multi"
+
+[Install]
+WantedBy=multi-user.target

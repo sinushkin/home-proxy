@@ -1,0 +1,28 @@
+[Unit]
+Description=VPS Client - homeproxy tunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Замените значения на реальные
+ExecStart=/usr/local/bin/vps-client 203.0.113.10:40000 550e8400-e29b-41d4-a716-446655440001 550e8400-e29b-41d4-a716-446655440000
+Restart=on-failure
+RestartSec=5
+
+# TUN требует root
+User=root
+Group=root
+
+# Переменные окружения (опционально)
+Environment="TUN_NAME=hp0"
+# Environment="RUST_LOG=info"
+# Environment="RUNTIME=multi"
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vps-client
+
+[Install]
+WantedBy=multi-user.target
