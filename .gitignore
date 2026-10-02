@@ -38,3 +38,6 @@ peers.state
 phones.state
 control.key
 control.token
+
+# Описание тестового стенда и замеры (хосты, результаты)
+Infrastructure.md
