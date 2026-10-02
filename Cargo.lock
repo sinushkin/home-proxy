@@ -750,6 +750,7 @@ dependencies = [
  "anyhow",
  "chacha20poly1305",
  "hmac",
+ "hp-stats",
  "libc",
  "log",
  "prost",
@@ -1865,11 +1866,21 @@ dependencies = [
  "hp-control",
  "hp-logging",
  "hp-netstack",
+ "hp-stats",
  "hp-tun",
  "if-addrs",
  "log",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "hp-stats"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "tokio",
 ]
 
 [[package]]

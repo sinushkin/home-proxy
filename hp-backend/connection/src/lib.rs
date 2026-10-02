@@ -10,6 +10,8 @@ pub mod port_utils;
 pub mod punch;
 pub mod reorder;
 pub mod rendezvous;
+#[cfg(feature = "stats")]
+pub(crate) mod stats_feedback;
 pub mod stun;
 pub mod vps;
 pub mod wire;

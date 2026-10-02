@@ -33,6 +33,8 @@ use crate::proto::{LinkStat, Rendezvous};
 use crate::punch::{LinkEvent, LinkSender, PeerLink, PeerLinkStat};
 use crate::reorder::{ReorderStats, Resequencer};
 use crate::rendezvous::{PeerRegistration, Registrar};
+#[cfg(feature = "stats")]
+use crate::stats_feedback;
 use crate::{p2p, vps};
 
 /// Сколько дыр набираем.
@@ -269,6 +271,9 @@ impl XorShift32 {
 pub(crate) struct LiveLink {
     pub slot: u8,
     pub sender: Arc<LinkSender>,
+    /// hp-stats (фича `stats`): когда дыра встала в реестр — для `hole_age_ms` в записях.
+    #[cfg(feature = "stats")]
+    pub established_at: Instant,
 }
 
 /// Общий реестр живых дыр. `index` — тот самый `Map<PeerLinkId, u8>`.
@@ -450,6 +455,13 @@ pub struct MultiLink {
     reorder_wait_ms: Arc<AtomicU32>,
     /// MQTT-регистратор (только `Discovery::StunMqtt`) — для последней регистрации пира в статусе.
     registrar: Option<Arc<Registrar>>,
+    /// hp-stats (фича `stats`, PLAN-ML.md): хэндл сборщика, если сбор включён (`attach_stats`);
+    /// `None` — ничего не собираем, даже если бинарь собран с фичей.
+    #[cfg(feature = "stats")]
+    stats: Arc<Mutex<Option<hp_stats::StatsHandle>>>,
+    /// Счётчик номеров пакетов вниз (hp-stats); реально используется, только когда `stats` — `Some`.
+    #[cfg(feature = "stats")]
+    pid_counter: AtomicU32,
     /// Задачи набора: дроп `MultiLink` останавливает их, а с ними — дыры, сокеты и MQTT.
     _tasks: Vec<AbortOnDrop>,
 }
@@ -548,6 +560,20 @@ impl MultiLink {
         let reorder_wait_ms = Arc::new(AtomicU32::new(options.reorder_wait.as_millis() as u32));
         tasks.push(AbortOnDrop(tokio::spawn(keepalive_loop(registry.clone()))));
         tasks.push(AbortOnDrop(tokio::spawn(stats_loop(registry.clone()))));
+        // hp-stats (фича `stats`): `stats_cell` общая с `MultiLink.stats` — `attach_stats`,
+        // вызванный после возврата из этой функции, должен быть виден уже запущенному
+        // `control_loop`. `time_sync`/`pid_feedback` общие между `control_loop` (разбирает
+        // входящие `TimeEcho`/`pid`) и их собственными таймерными задачами.
+        #[cfg(feature = "stats")]
+        let stats_cell: Arc<Mutex<Option<hp_stats::StatsHandle>>> = Arc::new(Mutex::new(None));
+        #[cfg(feature = "stats")]
+        let time_sync = Arc::new(Mutex::new(stats_feedback::TimeSync::new()));
+        #[cfg(feature = "stats")]
+        let pid_feedback = Arc::new(Mutex::new(stats_feedback::PidFeedbackBuilder::new()));
+        #[cfg(feature = "stats")]
+        tasks.push(AbortOnDrop(tokio::spawn(time_probe_loop(registry.clone(), time_sync.clone()))));
+        #[cfg(feature = "stats")]
+        tasks.push(AbortOnDrop(tokio::spawn(pid_report_loop(registry.clone(), pid_feedback.clone()))));
         tasks.push(AbortOnDrop(tokio::spawn(control_loop(
             label.clone(),
             events_rx,
@@ -557,6 +583,12 @@ impl MultiLink {
             (incoming_tx, control_tx),
             options,
             reorder_wait_ms.clone(),
+            #[cfg(feature = "stats")]
+            stats_cell.clone(),
+            #[cfg(feature = "stats")]
+            time_sync,
+            #[cfg(feature = "stats")]
+            pid_feedback,
         ))));
 
         let multilink = Self {
@@ -571,6 +603,10 @@ impl MultiLink {
             state,
             reorder_wait_ms,
             registrar,
+            #[cfg(feature = "stats")]
+            stats: stats_cell,
+            #[cfg(feature = "stats")]
+            pid_counter: AtomicU32::new(0),
             _tasks: tasks,
         };
         Ok((multilink, incoming_rx))
@@ -605,7 +641,12 @@ impl MultiLink {
     /// Возвращает номер дыры, по которой ушло.
     pub async fn send_data(&self, payload: &[u8]) -> Result<u8> {
         let link = self.choose_link(payload.len())?;
-        link.sender.send_data(payload).await;
+        let pid = self.next_pid();
+        #[cfg(feature = "stats")]
+        if let Some(pid) = pid {
+            self.record_sent(pid, &link, payload, hp_stats::MsgKind::Data, None, None);
+        }
+        link.sender.send_data(payload, pid).await;
         Ok(link.slot)
     }
 
@@ -619,7 +660,12 @@ impl MultiLink {
             Some((flow, seq)) => (Some(flow), seq),
             None => (None, self.wrap_seq.lock().unwrap().next(client_id)),
         };
-        link.sender.send_wrapped(seq, u32::from(client_id), flow, payload).await;
+        let pid = self.next_pid();
+        #[cfg(feature = "stats")]
+        if let Some(pid) = pid {
+            self.record_sent(pid, &link, payload, hp_stats::MsgKind::Wrapped, Some(client_id), flow);
+        }
+        link.sender.send_wrapped(seq, u32::from(client_id), flow, payload, pid).await;
         Ok(link.slot)
     }
 
@@ -627,7 +673,12 @@ impl MultiLink {
     /// внутри корзины `flow`. Возвращает номер дыры.
     pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8]) -> Result<u8> {
         let link = self.choose_link(payload.len())?;
-        link.sender.send_ordered(flow, seq, payload).await;
+        let pid = self.next_pid();
+        #[cfg(feature = "stats")]
+        if let Some(pid) = pid {
+            self.record_sent(pid, &link, payload, hp_stats::MsgKind::Ordered, None, Some(flow));
+        }
+        link.sender.send_ordered(flow, seq, payload, pid).await;
         Ok(link.slot)
     }
 
@@ -681,6 +732,54 @@ impl MultiLink {
     pub fn peer_id(&self) -> Uuid {
         self.peer_id
     }
+
+    /// hp-stats (фича `stats`, PLAN-ML.md): включает сбор статистики пакетов вниз на этом наборе
+    /// дыр. Вызывается один раз сервером (`vps-server`) после `start_discovery`, когда задан
+    /// `STATS_FILE`; без вызова (даже если бинарь собран с фичей) ничего не собирается и `pid`
+    /// пакетам не ставится — нулевые накладные расходы на пути данных.
+    #[cfg(feature = "stats")]
+    pub fn attach_stats(&self, handle: hp_stats::StatsHandle) {
+        *self.stats.lock().unwrap() = Some(handle);
+    }
+
+    /// Следующий номер пакета вниз, если сбор статистики включён; иначе `None` (пакет не
+    /// нумеруется — ни на проводе, ни лишней работы здесь).
+    #[cfg(feature = "stats")]
+    fn next_pid(&self) -> Option<u32> {
+        self.stats.lock().unwrap().is_some().then(|| self.pid_counter.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[cfg(not(feature = "stats"))]
+    fn next_pid(&self) -> Option<u32> {
+        None
+    }
+
+    /// Строит и отправляет в сборщик запись об отправленном пакете (hp-stats).
+    #[cfg(feature = "stats")]
+    fn record_sent(&self, pid: u32, link: &LiveLink, payload: &[u8], kind: hp_stats::MsgKind, client_id: Option<u8>, flow: Option<u32>) {
+        let stats = self.stats.lock().unwrap().clone();
+        let Some(stats) = stats else { return };
+        // Приблизительная длина на проводе (подпись + protobuf-заголовки `Lite`): точная потребовала
+        // бы прокидывать её из `wire::encode_*` наружу — для целей ML (какие пакеты режутся, а не
+        // точный байт-каунтинг) оценки достаточно.
+        const OVERHEAD_ESTIMATE: usize = crate::auth::AUTH_LEN + 16;
+        let clamp_u16 = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+        stats.record_sent(hp_stats::SentRecord {
+            pid,
+            t_send_unix_ms: stats_feedback::unix_ms_now(),
+            slot: u32::from(link.slot),
+            via_relay: false, // релея пока нет (PLAN-dynamic-holes-relay.md, этап M7)
+            local_port: link.sender.local_port(),
+            dst_port: link.sender.peer_addr().map_or(0, |a| a.port()),
+            wire_len: clamp_u16(payload.len() + OVERHEAD_ESTIMATE),
+            payload_len: clamp_u16(payload.len()),
+            inner: hp_stats::InnerInfo::parse(payload),
+            kind,
+            client_id,
+            flow,
+            hole_age_ms: u32::try_from(link.established_at.elapsed().as_millis()).unwrap_or(u32::MAX),
+        });
+    }
 }
 
 /// Одна общая keep-alive-таска на все живые дыры. Период случайный в
@@ -719,6 +818,80 @@ async fn stats_loop(registry: Arc<Mutex<LinkRegistry>>) {
     }
 }
 
+/// hp-stats (фича `stats`, PLAN-ML.md §2.3): не больше стольких записей в одном `PidReport` —
+/// грубый запас, чтобы при растущих номерах (крупные дельты — больше байт на варинт) сообщение
+/// не вылезло за типичный MTU дыры (1500, из них часть уходит под подпись и заголовки `Lite`).
+#[cfg(feature = "stats")]
+const PID_REPORT_BATCH: usize = 64;
+/// Как часто проверяем, не накопилось ли что отправить (ниже `PID_REPORT_BATCH` тоже шлём, но не
+/// реже этого периода — PLAN-ML.md §2.3, «раз в ~50 мс»).
+#[cfg(feature = "stats")]
+const PID_REPORT_TICK: Duration = Duration::from_millis(50);
+/// hp-stats §2.2: период проверки, не пора ли слать пробу синхронизации часов.
+#[cfg(feature = "stats")]
+const TIME_PROBE_TICK: Duration = Duration::from_millis(500);
+/// Во сколько тиков `TIME_PROBE_TICK` укладывается ресинк после первого раунда (≈10 с, §2.2).
+#[cfg(feature = "stats")]
+const TIME_RESYNC_EVERY_N_TICKS: u32 = 20;
+
+/// hp-stats: разбирает `PidReport` пира (клиента) и кормит сборщик (сервер).
+#[cfg(feature = "stats")]
+fn handle_pid_report(stats_cell: &Mutex<Option<hp_stats::StatsHandle>>, report: crate::proto::PidReport) {
+    let Some(stats) = stats_cell.lock().unwrap().clone() else { return };
+    let report_arrival_unix_ms = stats_feedback::unix_ms_now();
+    let (ack_through, base) = (report.ack_through, report.recv_base_server_ms);
+    for e in report.entries {
+        stats.record_ack(hp_stats::RecvAck {
+            pid: ack_through.wrapping_add(e.pid_delta),
+            recv_server_ms: base.saturating_add(u64::from(e.recv_delta_ms)),
+            reorder_wait_ms: u16::try_from(e.reorder_wait_ms).unwrap_or(u16::MAX),
+            out_of_order: e.out_of_order,
+            report_arrival_unix_ms,
+        });
+    }
+}
+
+/// hp-stats (клиент): отдельная задача — раз в `TIME_PROBE_TICK` решает, не пора ли слать пробу
+/// синхронизации часов (часто в начале, пока не пройден раунд из `stats_feedback::INITIAL_PROBES`,
+/// дальше — раз в `TIME_RESYNC_EVERY_N_TICKS` тиков, против дрейфа). Разбор ответов (`TimeEcho`) —
+/// в `control_loop` (там приходят события с дыр), состояние — общее через `Mutex`.
+#[cfg(feature = "stats")]
+async fn time_probe_loop(registry: Arc<Mutex<LinkRegistry>>, time_sync: Arc<Mutex<stats_feedback::TimeSync>>) {
+    let mut ticker = tokio::time::interval(TIME_PROBE_TICK);
+    let mut ticks: u32 = 0;
+    loop {
+        ticker.tick().await;
+        ticks += 1;
+        let due = {
+            let ts = time_sync.lock().unwrap();
+            !ts.synced() || ticks.is_multiple_of(TIME_RESYNC_EVERY_N_TICKS)
+        };
+        if !due {
+            continue;
+        }
+        let links = registry.lock().unwrap().links();
+        let Some(link) = links.first() else { continue };
+        let (t0, seq) = time_sync.lock().unwrap().send_probe();
+        link.sender.send_time_probe(t0, seq).await;
+    }
+}
+
+/// hp-stats (клиент): отдельная задача — раз в `PID_REPORT_TICK` отправляет накопленный
+/// `PidReport`, если накопитель не пуст (досрочный сброс по `PID_REPORT_BATCH` — в `control_loop`,
+/// где записи добавляются). Общее состояние — через `Mutex`.
+#[cfg(feature = "stats")]
+async fn pid_report_loop(registry: Arc<Mutex<LinkRegistry>>, pid_feedback: Arc<Mutex<stats_feedback::PidFeedbackBuilder>>) {
+    let mut ticker = tokio::time::interval(PID_REPORT_TICK);
+    loop {
+        ticker.tick().await;
+        let Some(report) = pid_feedback.lock().unwrap().take() else { continue };
+        let links = registry.lock().unwrap().links();
+        if let Some(link) = links.first() {
+            link.sender.send_pid_report(report).await;
+        }
+    }
+}
+
 /// Разбирает события с дыр: статистику пира, `DeleteLink`, `Rendezvous` пира. Данные пира
 /// проходят через буфер порядка (`reorder`), если `reorder_wait` не ноль.
 #[allow(clippy::too_many_arguments)]
@@ -731,6 +904,9 @@ async fn control_loop(
     (incoming, control): (mpsc::Sender<Incoming>, mpsc::Sender<Control>),
     options: MultiLinkOptions,
     reorder_wait_ms: Arc<AtomicU32>,
+    #[cfg(feature = "stats")] stats_cell: Arc<Mutex<Option<hp_stats::StatsHandle>>>,
+    #[cfg(feature = "stats")] time_sync: Arc<Mutex<stats_feedback::TimeSync>>,
+    #[cfg(feature = "stats")] pid_feedback: Arc<Mutex<stats_feedback::PidFeedbackBuilder>>,
 ) {
     let MultiLinkOptions { reorder_wait, reorder_clients, .. } = options;
     let mut reorder = (!reorder_wait.is_zero()).then(|| Resequencer::adaptive(reorder_wait));
@@ -788,10 +964,16 @@ async fn control_loop(
                 log::info!("{label}слот {slot}: пир просит удалить линк, пробиваем заново");
                 request_redrop(&redrop_txs, slot);
             }
-            LinkEvent::PeerData { slot, payload } => {
+            LinkEvent::PeerData { slot, payload, pid } => {
+                let _ = pid; // использован ниже только при фиче `stats`; `Option<u32>` — `Copy`
+                #[cfg(feature = "stats")]
+                observe_pid(&pid_feedback, &time_sync, pid);
                 deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: None }, &mut ready).await;
             }
-            LinkEvent::PeerWrapped { slot, seq, client_id, flow, payload } => {
+            LinkEvent::PeerWrapped { slot, seq, client_id, flow, payload, pid } => {
+                let _ = pid;
+                #[cfg(feature = "stats")]
+                observe_pid(&pid_feedback, &time_sync, pid);
                 let Ok(client_id) = u8::try_from(client_id) else {
                     log::warn!("{label}слот {slot}: WrappedData с client_id {client_id} вне 0..=255");
                     continue;
@@ -804,7 +986,10 @@ async fn control_loop(
                     let _ = incoming.send(packet).await;
                 }
             }
-            LinkEvent::PeerOrdered { slot, flow, seq, payload } => {
+            LinkEvent::PeerOrdered { slot, flow, seq, payload, pid } => {
+                let _ = pid;
+                #[cfg(feature = "stats")]
+                observe_pid(&pid_feedback, &time_sync, pid);
                 deliver(&incoming, &mut reorder, Incoming { slot, payload, wrapped: None, order: Some((flow, seq)) }, &mut ready).await;
             }
             LinkEvent::PeerControl(message) => {
@@ -819,7 +1004,43 @@ async fn control_loop(
                 }
                 None => log::debug!("{label}Rendezvous по дыре в VPS-режиме пропущен"),
             },
+            // hp-stats (сервер): отчёт клиента о принятых номерах пакетов вниз.
+            LinkEvent::PeerPidReport { report, .. } => {
+                #[cfg(feature = "stats")]
+                handle_pid_report(&stats_cell, report);
+                #[cfg(not(feature = "stats"))]
+                let _ = report;
+            }
+            // hp-stats (клиент): ответ сервера на нашу пробу синхронизации часов.
+            LinkEvent::PeerTimeEcho { echo, .. } => {
+                #[cfg(feature = "stats")]
+                time_sync.lock().unwrap().on_echo(&echo);
+                #[cfg(not(feature = "stats"))]
+                let _ = echo;
+            }
         }
+        // hp-stats: партия PidReport выросла достаточно — не ждём таймер, шлём сейчас же (иначе
+        // при высоком темпе приёма сообщение растёт неограниченно между тиками `pid_report_loop`).
+        #[cfg(feature = "stats")]
+        if pid_feedback.lock().unwrap().len() >= PID_REPORT_BATCH {
+            let report = pid_feedback.lock().unwrap().take();
+            if let Some(report) = report {
+                let links = registry.lock().unwrap().links();
+                if let Some(link) = links.first() {
+                    link.sender.send_pid_report(report).await;
+                }
+            }
+        }
+    }
+}
+
+/// hp-stats: если пакет пронумерован (отправитель умеет и включил сбор), запоминает его в
+/// накопителе `PidReport` — время приёма переводим в часы сервера через текущую `ServerTime`.
+#[cfg(feature = "stats")]
+fn observe_pid(pid_feedback: &Mutex<stats_feedback::PidFeedbackBuilder>, time_sync: &Mutex<stats_feedback::TimeSync>, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let recv_server_ms = time_sync.lock().unwrap().server_time().to_server_ms(stats_feedback::unix_ms_now());
+        pid_feedback.lock().unwrap().observe(pid, recv_server_ms);
     }
 }
 
@@ -892,7 +1113,15 @@ impl SlotBase {
         let link_id = link.link_id;
         {
             let mut reg = self.registry.lock().unwrap();
-            reg.insert(link_id, LiveLink { slot, sender: link.sender.clone() });
+            reg.insert(
+                link_id,
+                LiveLink {
+                    slot,
+                    sender: link.sender.clone(),
+                    #[cfg(feature = "stats")]
+                    established_at: Instant::now(),
+                },
+            );
             log::info!("{label}слот {slot}: дыра открыта {} <-> {} (живых дыр: {})", link.local_addr, link.peer_addr, reg.live_count());
         }
         self.phase(SlotPhase::Connected);
@@ -1053,7 +1282,7 @@ mod tests {
 
     /// TCP-пакет корзины 7 с номером `counter`.
     fn tcp_event(counter: u64) -> LinkEvent {
-        LinkEvent::PeerOrdered { slot: (counter % 10) as u8, flow: 7, seq: counter, payload: Packet::copy_from(&[0x45u8; 48]).unwrap() }
+        LinkEvent::PeerOrdered { slot: (counter % 10) as u8, flow: 7, seq: counter, payload: Packet::copy_from(&[0x45u8; 48]).unwrap(), pid: None }
     }
 
     fn counter_of(packet: &Incoming) -> u64 {
@@ -1076,6 +1305,12 @@ mod tests {
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: wait, ..MultiLinkOptions::default() },
             Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(None)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::TimeSync::new())),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::PidFeedbackBuilder::new())),
         ));
 
         for counter in [0u64, 2, 1, 3] {
@@ -1110,6 +1345,12 @@ mod tests {
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
             Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(None)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::TimeSync::new())),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::PidFeedbackBuilder::new())),
         ));
         for counter in [0u64, 2, 1] {
             events_tx.send(tcp_event(counter)).await.unwrap();
@@ -1124,8 +1365,8 @@ mod tests {
     fn ordered_event(flow: u32, seq: u64, client_id: Option<u32>) -> LinkEvent {
         let payload = Packet::copy_from(&[0x45u8; 40]).unwrap();
         match client_id {
-            Some(client_id) => LinkEvent::PeerWrapped { slot: 0, seq, client_id, flow: Some(flow), payload },
-            None => LinkEvent::PeerOrdered { slot: 0, flow, seq, payload },
+            Some(client_id) => LinkEvent::PeerWrapped { slot: 0, seq, client_id, flow: Some(flow), payload, pid: None },
+            None => LinkEvent::PeerOrdered { slot: 0, flow, seq, payload, pid: None },
         }
     }
 
@@ -1144,6 +1385,12 @@ mod tests {
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::from_millis(500), reorder_clients: false, ..MultiLinkOptions::default() },
             Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(None)),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::TimeSync::new())),
+            #[cfg(feature = "stats")]
+            Arc::new(Mutex::new(stats_feedback::PidFeedbackBuilder::new())),
         ));
         events_tx.send(ordered_event(3, 0, None)).await.unwrap();
         events_tx.send(ordered_event(3, 2, None)).await.unwrap();
@@ -1265,5 +1512,84 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(2), second_rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.payload, b"hello");
 
+    }
+
+    /// hp-stats целиком на loopback (PLAN-ML.md): сервер нумерует пакеты вниз, клиент (сам
+    /// синхронизировавшись по часам через `TimeProbe`/`TimeEcho`) шлёт обратно `PidReport`,
+    /// сборщик сопоставляет и пишет в CSV строку `delivered=1` с разумным `flight_ms`. Проверяет
+    /// сквозную проводку всех частей модуля, а не только их по отдельности (остальные тесты).
+    #[cfg(feature = "stats")]
+    #[tokio::test]
+    async fn stats_pipeline_records_a_delivered_packet_end_to_end() {
+        let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let options = MultiLinkOptions::default();
+        let (server, _server_rx) = MultiLink::start_discovery(
+            "",
+            Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap_port, ports: 47600..=47799 },
+            server_id,
+            client_id,
+            options,
+        )
+        .await
+        .unwrap();
+        let (client, _client_rx) = MultiLink::start_discovery(
+            "",
+            Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)) },
+            client_id,
+            server_id,
+            options,
+        )
+        .await
+        .unwrap();
+        wait_until("10 дыр с обеих сторон", 40, || server.live_count() == 10 && client.live_count() == 10).await;
+
+        let dir = std::env::temp_dir().join(format!("hp-stats-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (handle, _collector_task) = hp_stats::spawn(hp_stats::CollectorConfig {
+            out_dir: dir.clone(),
+            loss_timeout: Duration::from_secs(2),
+            sweep_interval: Duration::from_millis(50),
+            ..hp_stats::CollectorConfig::default()
+        })
+        .unwrap();
+        server.attach_stats(handle);
+
+        // Несколько пакетов вниз — каждый получает номер и попадёт в CSV после PidReport клиента.
+        for i in 0..5u8 {
+            server.send_data(&[i; 10]).await.unwrap();
+        }
+
+        // PidReport клиента уходит раз в ~50 мс; даём время обратной связи дойти и записаться
+        // (плюс начальный раунд синхронизации часов клиента — восемь проб по 500 мс).
+        wait_until("CSV получил хотя бы одну доставленную строку", 15, || {
+            read_csv_rows(&dir).iter().any(|r| r.get(2).map(String::as_str) == Some("1"))
+        })
+        .await;
+
+        let rows = read_csv_rows(&dir);
+        let delivered: Vec<&Vec<String>> = rows.iter().filter(|r| r[2] == "1").collect();
+        assert!(!delivered.is_empty(), "хотя бы один пакет должен быть зафиксирован как доставленный");
+        for row in &delivered {
+            let flight_ms: i64 = row[3].parse().expect("flight_ms должен быть числом у доставленного пакета");
+            assert!(flight_ms.abs() < 2000, "задержка на loopback должна быть разумной: {flight_ms} мс, строка {row:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Читает все строки (без заголовка) из всех CSV в каталоге сборщика.
+    #[cfg(feature = "stats")]
+    fn read_csv_rows(dir: &std::path::Path) -> Vec<Vec<String>> {
+        let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+        let mut rows = Vec::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let Ok(content) = std::fs::read_to_string(entry.path()) else { continue };
+            for line in content.lines().skip(1) {
+                if !line.is_empty() {
+                    rows.push(line.split(',').map(str::to_string).collect());
+                }
+            }
+        }
+        rows
     }
 }

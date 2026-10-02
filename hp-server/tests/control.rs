@@ -23,7 +23,18 @@ async fn start() -> (std::net::SocketAddr, std::path::PathBuf) {
     });
     let hub = hp_tun::hub::Hub::start(device);
     let book = AddressBook::load(Ipv4Addr::new(10, 80, 0, 1), 16, None).unwrap();
-    let service = Arc::new(Service::new(hub, book, vec![Ipv4Addr::new(8, 8, 8, 8)], MultiLinkOptions::default(), None, None, Mode::Netstack, None));
+    let service = Arc::new(Service::new(
+        hub,
+        book,
+        vec![Ipv4Addr::new(8, 8, 8, 8)],
+        MultiLinkOptions::default(),
+        None,
+        None,
+        Mode::Netstack,
+        None,
+        #[cfg(feature = "stats")]
+        None,
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let key_file = std::env::temp_dir().join(format!("hp-control-test-{}.key", addr.port()));

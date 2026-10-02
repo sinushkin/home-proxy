@@ -107,6 +107,20 @@ pub struct Common {
     /// Способ встречи для телефонов из `peers.state` и новых сопряжений (STUN + MQTT); `None` —
     /// сопряжение не поддерживается (VPS).
     pub pairing: Option<Discovery>,
+    /// hp-stats (фича `stats`, PLAN-ML.md): настройки сбора статистики пакетов вниз; `None` —
+    /// `STATS_FILE` не задан, сбор выключен (даже если бинарь собран с фичей).
+    #[cfg(feature = "stats")]
+    pub stats: Option<StatsSettings>,
+}
+
+/// Настройки сбора статистики пакетов (hp-stats, `STATS_*`), см. PLAN-ML.md §5.
+#[cfg(feature = "stats")]
+#[derive(Debug, Clone)]
+pub struct StatsSettings {
+    pub out_dir: PathBuf,
+    pub loss_timeout: Duration,
+    pub max_file_bytes: u64,
+    pub channel_capacity: usize,
 }
 
 impl Common {
@@ -144,6 +158,25 @@ impl Common {
             key_file: settings.resolve(get("CONTROL_KEY_FILE").as_deref().unwrap_or(hp_control::KEY_FILE).trim()),
             peers_file: Some(settings.resolve(get("PEERS_FILE").as_deref().unwrap_or("peers.state").trim())),
             pairing: None,
+            #[cfg(feature = "stats")]
+            stats: match get("STATS_FILE").as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(dir) => Some(StatsSettings {
+                    out_dir: settings.resolve(dir),
+                    loss_timeout: match get("STATS_LOSS_MS") {
+                        Some(v) => Duration::from_millis(v.trim().parse().context("STATS_LOSS_MS: ожидается число миллисекунд")?),
+                        None => Duration::from_secs(3),
+                    },
+                    max_file_bytes: match get("STATS_MAX_MB") {
+                        Some(v) => v.trim().parse::<u64>().context("STATS_MAX_MB: ожидается число мегабайт")? * 1024 * 1024,
+                        None => 64 * 1024 * 1024,
+                    },
+                    channel_capacity: match get("STATS_CHAN_CAP") {
+                        Some(v) => v.trim().parse().context("STATS_CHAN_CAP: ожидается число")?,
+                        None => 4096,
+                    },
+                }),
+            },
         })
     }
 }
@@ -312,7 +345,36 @@ async fn run<D: hp_tun::device::PacketDevice>(hub: hp_tun::hub::Hub<D>, discover
         bind_ifindex: binding.ifindex,
         ..MultiLinkOptions::default()
     };
-    let service = Arc::new(Service::new(hub, book, common.dns.clone(), options, common.pairing.clone(), common.peers_file.clone(), common.mode, binding.ip));
+    // hp-stats (фича `stats`, PLAN-ML.md): сборщик запускается один раз на процесс; `_stats_task`
+    // держим живым до конца `run()` (сам `run()` не возвращается, пока жив процесс).
+    #[cfg(feature = "stats")]
+    let (stats_handle, _stats_task) = match &common.stats {
+        Some(s) => {
+            let (handle, task) = hp_stats::spawn(hp_stats::CollectorConfig {
+                out_dir: s.out_dir.clone(),
+                channel_capacity: s.channel_capacity,
+                loss_timeout: s.loss_timeout,
+                max_file_bytes: s.max_file_bytes,
+                ..hp_stats::CollectorConfig::default()
+            })
+            .with_context(|| format!("hp-stats: не удалось открыть каталог {}", s.out_dir.display()))?;
+            log::info!("hp-stats: сбор статистики пакетов включён, CSV в {}", s.out_dir.display());
+            (Some(handle), Some(task))
+        }
+        None => (None, None),
+    };
+    let service = Arc::new(Service::new(
+        hub,
+        book,
+        common.dns.clone(),
+        options,
+        common.pairing.clone(),
+        common.peers_file.clone(),
+        common.mode,
+        binding.ip,
+        #[cfg(feature = "stats")]
+        stats_handle,
+    ));
     for (peer, discovery) in common.peers.iter().zip(discoveries) {
         service.add_configured(*peer, discovery).await?;
     }

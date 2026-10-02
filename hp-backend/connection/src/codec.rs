@@ -80,6 +80,7 @@ mod tests {
             body: Some(peer_message::Body::Lite(Lite {
                 slot: 3,
                 payload: Some(lite::Payload::Data(Data { payload: (0..1392).map(|i| i as u8).collect() })),
+                pid: None,
             })),
         }
     }

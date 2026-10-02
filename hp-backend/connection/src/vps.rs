@@ -100,7 +100,7 @@ impl Pair {
 
 fn wrap(record: Rendezvous) -> PeerMessage {
     let slot = record.slot;
-    PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(lite::Payload::Rendezvous(record)) })) }
+    PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(lite::Payload::Rendezvous(record)), pid: None })) }
 }
 
 /// Достаёт запись слота пира (подпись пакета и записи проверены, слот в пределах набора); всё

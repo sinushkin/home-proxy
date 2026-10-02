@@ -37,7 +37,8 @@ use crate::wire::{self, Fast};
 use crate::link_id::PeerLinkId;
 use crate::port_utils::{sweep_bounds, zigzag_ports};
 use crate::proto::{
-    DeleteLink, InitMessage, KeepAlive, Lite, PeerMessage, Punch, PunchAck, Rendezvous, Stats,
+    DeleteLink, InitMessage, KeepAlive, Lite, PeerMessage, PidReport, Punch, PunchAck, Rendezvous,
+    Stats, TimeEcho, TimeProbe,
 };
 use crate::proto::{init_message, lite, peer_message};
 
@@ -76,15 +77,21 @@ pub enum LinkEvent {
     /// Виртуал-брокер: пир прислал по этой дыре запись `Rendezvous` о своём
     /// другом слоте (то, что иначе ушло бы в MQTT).
     PeerRendezvous(Rendezvous),
-    /// Пир прислал полезную нагрузку (`Data`) по дыре `slot` (буфер из банка).
-    PeerData { slot: u8, payload: Packet },
+    /// Пир прислал полезную нагрузку (`Data`) по дыре `slot` (буфер из банка). `pid` — hp-stats
+    /// (PLAN-ML.md), номер пакета вниз; `None`, если отправитель его не ставит.
+    PeerData { slot: u8, payload: Packet, pid: Option<u32> },
     /// Пир прислал обёрнутый пакет (`WrappedData`) по дыре `slot`; `flow` — корзина TCP-потока
     /// (TUN-режим, `seq` тогда — номер в ней).
-    PeerWrapped { slot: u8, seq: u64, client_id: u32, flow: Option<u32>, payload: Packet },
+    PeerWrapped { slot: u8, seq: u64, client_id: u32, flow: Option<u32>, payload: Packet, pid: Option<u32> },
     /// Пир прислал IP-пакет с номером в потоке (`Ordered`, TUN-режим).
-    PeerOrdered { slot: u8, flow: u32, seq: u64, payload: Packet },
+    PeerOrdered { slot: u8, flow: u32, seq: u64, payload: Packet, pid: Option<u32> },
     /// Служебное сообщение пира (адрес в туннеле).
     PeerControl(crate::multilink::Control),
+    /// hp-stats (фича `stats`, см. PLAN-ML.md): пир (клиент) сообщил, какие наши `pid` он
+    /// принял и когда, в часах сервера.
+    PeerPidReport { slot: u8, report: PidReport },
+    /// hp-stats: ответ сервера на нашу пробу синхронизации часов (`TimeProbe`).
+    PeerTimeEcho { slot: u8, echo: TimeEcho },
 }
 
 #[derive(Clone, Debug)]
@@ -144,12 +151,14 @@ impl PeerIdentity {
         }
     }
 
-    /// Конверт после установки: только слот.
+    /// Конверт после установки: только слот. Не несёт `pid` — нумеруются только `Data`/
+    /// `WrappedData`/`Ordered`, у них свой путь кодирования (`wire`, `LinkSender::send_raw`).
     fn lite(&self, payload: lite::Payload) -> PeerMessage {
         PeerMessage {
             body: Some(peer_message::Body::Lite(Lite {
                 slot: self.slot as u32,
                 payload: Some(payload),
+                pid: None,
             })),
         }
     }
@@ -197,6 +206,12 @@ impl LinkSender {
         *self.endpoint.borrow()
     }
 
+    /// Наш локальный UDP-порт этой дыры (hp-stats: что из нашего трафика видит ТСПУ).
+    #[cfg(feature = "stats")]
+    pub fn local_port(&self) -> u16 {
+        self.socket.local_addr().map_or(0, |a| a.port())
+    }
+
     async fn send_lite(&self, payload: lite::Payload) {
         let Some(peer_addr) = self.peer_addr() else { return };
         let msg = self.identity.lite(payload);
@@ -225,11 +240,12 @@ impl LinkSender {
     }
 
     /// Отправить полезную нагрузку (IP-пакет без номера) по этой дыре. Пакет собирается в буфере на
-    /// стеке (`wire`), без выделения памяти.
-    pub async fn send_data(&self, payload: &[u8]) {
+    /// стеке (`wire`), без выделения памяти. `pid` — номер пакета для hp-stats (фича `stats`,
+    /// `None`, если выключена); общий счётчик направления — в `MultiLink`.
+    pub async fn send_data(&self, payload: &[u8], pid: Option<u32>) {
         log::trace!("слот {}: отправлено {} байт данных", self.identity.slot, payload.len());
         let mut buf = [0u8; PACKET_CAP];
-        let Some(n) = wire::encode_data(u32::from(self.identity.slot), payload, &self.keys, &mut buf) else {
+        let Some(n) = wire::encode_data(u32::from(self.identity.slot), payload, pid, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
         };
@@ -237,11 +253,11 @@ impl LinkSender {
     }
 
     /// Отправить обёрнутый пакет (роутер ↔ сервер) по этой дыре; `flow` — корзина TCP-потока.
-    pub async fn send_wrapped(&self, seq: u64, client_id: u32, flow: Option<u32>, payload: &[u8]) {
+    pub async fn send_wrapped(&self, seq: u64, client_id: u32, flow: Option<u32>, payload: &[u8], pid: Option<u32>) {
         log::trace!("слот {}: отправлен WrappedData seq={seq} ({} байт)", self.identity.slot, payload.len());
         let mut buf = [0u8; PACKET_CAP];
         let slot = u32::from(self.identity.slot);
-        let Some(n) = wire::encode_wrapped(slot, seq, payload, client_id, flow, &self.keys, &mut buf) else {
+        let Some(n) = wire::encode_wrapped(slot, seq, payload, client_id, flow, pid, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
         };
@@ -249,10 +265,10 @@ impl LinkSender {
     }
 
     /// Отправить IP-пакет с номером в потоке (`Ordered`, TUN-режим) по этой дыре.
-    pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8]) {
+    pub async fn send_ordered(&self, flow: u32, seq: u64, payload: &[u8], pid: Option<u32>) {
         let mut buf = [0u8; PACKET_CAP];
         let slot = u32::from(self.identity.slot);
-        let Some(n) = wire::encode_ordered(slot, flow, seq, payload, &self.keys, &mut buf) else {
+        let Some(n) = wire::encode_ordered(slot, flow, seq, payload, pid, &self.keys, &mut buf) else {
             log::debug!("слот {}: {} байт не влезают в пакет", self.identity.slot, payload.len());
             return;
         };
@@ -299,6 +315,16 @@ impl LinkSender {
             rendezvous.slot
         );
         self.send_lite(lite::Payload::Rendezvous(rendezvous)).await;
+    }
+
+    /// hp-stats: проба синхронизации часов (клиент → сервер), см. PLAN-ML.md §2.2.
+    pub async fn send_time_probe(&self, client_send_ms: u64, seq: u32) {
+        self.send_lite(lite::Payload::TimeProbe(TimeProbe { client_send_ms, seq })).await;
+    }
+
+    /// hp-stats: наш отчёт о принятых номерах пакетов (клиент → сервер), см. PLAN-ML.md §2.3.
+    pub async fn send_pid_report(&self, report: PidReport) {
+        self.send_lite(lite::Payload::PidReport(report)).await;
     }
 }
 
@@ -501,14 +527,14 @@ async fn receive_loop(
         let message = &buf[AUTH_LEN..AUTH_LEN + len];
         if let Some(fast) = wire::parse(message) {
             let (lite_slot, event) = match fast {
-                Fast::Data { slot, payload } => (slot, Packet::copy_from(payload).map(|payload| LinkEvent::PeerData { slot: identity.slot, payload })),
-                Fast::Wrapped { slot, seq, payload, client_id, flow } => (
+                Fast::Data { slot, payload, pid } => (slot, Packet::copy_from(payload).map(|payload| LinkEvent::PeerData { slot: identity.slot, payload, pid })),
+                Fast::Wrapped { slot, seq, payload, client_id, flow, pid } => (
                     slot,
-                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerWrapped { slot: identity.slot, seq, client_id, flow, payload }),
+                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerWrapped { slot: identity.slot, seq, client_id, flow, payload, pid }),
                 ),
-                Fast::Ordered { slot, flow, seq, payload } => (
+                Fast::Ordered { slot, flow, seq, payload, pid } => (
                     slot,
-                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerOrdered { slot: identity.slot, flow, seq, payload }),
+                    Packet::copy_from(payload).map(|payload| LinkEvent::PeerOrdered { slot: identity.slot, flow, seq, payload, pid }),
                 ),
             };
             if lite_slot != u32::from(identity.slot) {
@@ -557,6 +583,19 @@ async fn receive_loop(
                     continue;
                 }
                 note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
+                // hp-stats: на пробу синхронизации часов отвечаем сразу с этого сокета (клиенту
+                // для точной оценки RTT важна короткая задержка ответа, лишний шаг через
+                // events-канал её бы увеличил непредсказуемо).
+                if let Some(lite::Payload::TimeProbe(probe)) = &lite.payload {
+                    let server_ms = unix_ms_now();
+                    let echo = identity.lite(lite::Payload::TimeEcho(TimeEcho {
+                        client_send_ms: probe.client_send_ms,
+                        server_ms,
+                        seq: probe.seq,
+                    }));
+                    let _ = socket.send_to(&codec::encode(&echo, &send_keys), from).await;
+                    continue;
+                }
                 handle_lite(lite, identity.slot, &events).await;
             }
             None => {}
@@ -564,7 +603,18 @@ async fn receive_loop(
     }
 }
 
+/// Часы в unix-мс (hp-stats: метка сервера в `TimeEcho`, обычная арифметика `u64` — не атомик).
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
+    // hp-stats: `pid` — сосед `payload` в `Lite`, читаем до разбора `match lite.payload`
+    // (частичный момент ниже забирает поле `payload` по значению).
+    let pid = lite.pid;
     match lite.payload {
         Some(lite::Payload::Stats(s)) => {
             log::debug!(
@@ -598,17 +648,17 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
         // закодированы необычно (например, с повторными полями).
         Some(lite::Payload::Data(d)) => {
             if let Some(payload) = Packet::copy_from(&d.payload) {
-                let _ = events.send(LinkEvent::PeerData { slot, payload }).await;
+                let _ = events.send(LinkEvent::PeerData { slot, payload, pid }).await;
             }
         }
         Some(lite::Payload::Wrapped(w)) => {
             if let Some(payload) = Packet::copy_from(&w.payload) {
-                let _ = events.send(LinkEvent::PeerWrapped { slot, seq: w.seq, client_id: w.client_id, flow: w.flow, payload }).await;
+                let _ = events.send(LinkEvent::PeerWrapped { slot, seq: w.seq, client_id: w.client_id, flow: w.flow, payload, pid }).await;
             }
         }
         Some(lite::Payload::Ordered(o)) => {
             if let Some(payload) = Packet::copy_from(&o.payload) {
-                let _ = events.send(LinkEvent::PeerOrdered { slot, flow: o.flow, seq: o.seq, payload }).await;
+                let _ = events.send(LinkEvent::PeerOrdered { slot, flow: o.flow, seq: o.seq, payload, pid }).await;
             }
         }
         // last_seen/received уже обновлены выше.
@@ -621,6 +671,15 @@ async fn handle_lite(lite: Lite, slot: u8, events: &mpsc::Sender<LinkEvent>) {
         Some(lite::Payload::AddressAssign(a)) => {
             let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::AddressAssign(a))).await;
         }
+        Some(lite::Payload::PidReport(report)) => {
+            let _ = events.send(LinkEvent::PeerPidReport { slot, report }).await;
+        }
+        Some(lite::Payload::TimeEcho(echo)) => {
+            let _ = events.send(LinkEvent::PeerTimeEcho { slot, echo }).await;
+        }
+        // Перехватывается раньше, в `receive_loop` (нужен прямой доступ к сокету для быстрого
+        // ответа); сюда дойти не должен, но матч должен быть исчерпывающим.
+        Some(lite::Payload::TimeProbe(_)) => {}
         None => {}
     }
 }
@@ -813,16 +872,17 @@ mod tests {
         let link_a = link_a.unwrap();
         let _link_b = link_b.unwrap();
 
-        link_a.sender.send_data(b"hello").await;
+        link_a.sender.send_data(b"hello", Some(7)).await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), b_events.recv())
             .await
             .expect("событие с данными не пришло")
             .unwrap();
         match event {
-            LinkEvent::PeerData { slot, payload } => {
+            LinkEvent::PeerData { slot, payload, pid } => {
                 assert_eq!(slot, 0);
                 assert_eq!(payload, b"hello");
+                assert_eq!(pid, Some(7), "hp-stats: номер пакета доходит до получателя");
             }
             other => panic!("ожидали PeerData, пришло {other:?}"),
         }
@@ -851,7 +911,7 @@ mod tests {
 
         link_a
             .sender
-            .send_wrapped(42, 5, Some(3), b"ip-packet")
+            .send_wrapped(42, 5, Some(3), b"ip-packet", None)
             .await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), b_events.recv())
@@ -859,12 +919,13 @@ mod tests {
             .expect("событие с обёрнутым пакетом не пришло")
             .unwrap();
         match event {
-            LinkEvent::PeerWrapped { slot, seq, client_id, flow, payload } => {
+            LinkEvent::PeerWrapped { slot, seq, client_id, flow, payload, pid } => {
                 assert_eq!(slot, 0);
                 assert_eq!(seq, 42);
                 assert_eq!(client_id, 5);
                 assert_eq!(flow, Some(3));
                 assert_eq!(payload, b"ip-packet");
+                assert_eq!(pid, None);
             }
             other => panic!("ожидали PeerWrapped, пришло {other:?}"),
         }
@@ -1067,7 +1128,7 @@ mod tests {
     }
 
     fn lite_packet(slot: u32, payload: lite::Payload, key: &SendKeys) -> Vec<u8> {
-        let msg = PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(payload) })) };
+        let msg = PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(payload), pid: None })) };
         codec::encode(&msg, key)
     }
 

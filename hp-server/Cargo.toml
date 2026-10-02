@@ -15,9 +15,14 @@ hp-tun = { path = "../hp-backend/tun" }
 hp-control = { path = "../control" }
 hp-netstack = { path = "../hp-backend/netstack", optional = true }
 if-addrs = { workspace = true }
+# Модуль статистики пакетов (hp-stats, PLAN-ML.md), опционально (фича `stats`).
+hp-stats = { path = "../hp-backend/stats", optional = true }
 
 [features]
 default = ["netstack"]
 # Свой сетевой стек (MODE=netstack): Windows и ПК без root. На роутер не нужен (hp-router — без него).
 netstack = ["dep:hp-netstack"]
+# Сбор по-пакетной статистики вниз (vps-server → клиент), см. PLAN-ML.md; не по умолчанию —
+# в частности, не попадает в сборку hp-router под OpenWrt/MIPS32.
+stats = ["dep:hp-stats", "connection/stats"]
 

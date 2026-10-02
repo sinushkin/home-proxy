@@ -66,6 +66,7 @@ fn codec_bench(iterations: u32, payload_len: usize) {
         body: Some(peer_message::Body::Lite(Lite {
             slot: 3,
             payload: Some(lite::Payload::Data(Data { payload: vec![0xa5; payload_len] })),
+            pid: None,
         })),
     };
     let encoded = codec::encode(&message, &send);
@@ -121,10 +122,10 @@ fn codec_bench(iterations: u32, payload_len: usize) {
     let mut out = [0u8; connection::pool::PACKET_CAP];
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(connection::wire::encode_data(3, std::hint::black_box(&payload), &send, &mut out));
+        std::hint::black_box(connection::wire::encode_data(3, std::hint::black_box(&payload), None, &send, &mut out));
     }
     let fast_encode = per_op(start);
-    let n = connection::wire::encode_data(3, &payload, &send, &mut out).unwrap();
+    let n = connection::wire::encode_data(3, &payload, None, &send, &mut out).unwrap();
     let start = Instant::now();
     for _ in 0..iterations {
         let mut rx = out;

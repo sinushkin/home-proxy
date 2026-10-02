@@ -11,3 +11,7 @@ anyhow = { workspace = true }
 connection = { path = "../hp-backend/connection" }
 hp-server = { path = "../hp-server" }
 hp-tun = { path = "../hp-backend/tun" }
+
+[features]
+# Сбор по-пакетной статистики вниз (hp-stats, PLAN-ML.md): cargo build -p vps-server --features stats.
+stats = ["hp-server/stats"]

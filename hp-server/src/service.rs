@@ -68,6 +68,9 @@ pub struct Service<D: PacketDevice> {
     started: Instant,
     mode: Mode,
     bind: Option<IpAddr>,
+    /// hp-stats (фича `stats`, PLAN-ML.md): прикрепляется к каждому новому набору дыр (`add`).
+    #[cfg(feature = "stats")]
+    stats: Option<hp_stats::StatsHandle>,
 }
 
 pub fn now_unix() -> u64 {
@@ -85,6 +88,7 @@ impl<D: PacketDevice> Service<D> {
         peers_file: Option<PathBuf>,
         mode: Mode,
         bind: Option<IpAddr>,
+        #[cfg(feature = "stats")] stats: Option<hp_stats::StatsHandle>,
     ) -> Self {
         Self {
             hub: Arc::new(hub),
@@ -97,6 +101,8 @@ impl<D: PacketDevice> Service<D> {
             started: Instant::now(),
             mode,
             bind,
+            #[cfg(feature = "stats")]
+            stats,
         }
     }
 
@@ -136,6 +142,10 @@ impl<D: PacketDevice> Service<D> {
         let name = peer_name(&peer.peer_id);
         log::info!("сервер: я {} ищу пира {name}", peer_name(&peer.my_id));
         let (link, incoming) = MultiLink::start_discovery(&name, discovery, peer.my_id, peer.peer_id, self.options).await?;
+        #[cfg(feature = "stats")]
+        if let Some(stats) = &self.stats {
+            link.attach_stats(stats.clone());
+        }
         let link = Arc::new(link);
         self.hub.add_link(&link, incoming);
         let control = link.take_control().expect("приёмник служебных сообщений забираем один раз");

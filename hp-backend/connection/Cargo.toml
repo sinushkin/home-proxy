@@ -14,6 +14,12 @@ anyhow = { workspace = true }
 chacha20poly1305 = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+# Модуль статистики пакетов (hp-stats, PLAN-ML.md), опционально (фича `stats`): по умолчанию не
+# собирается вовсе — в частности, в сборке `hp-router` под OpenWrt/MIPS32.
+hp-stats = { path = "../stats", optional = true }
+
+[features]
+stats = ["dep:hp-stats"]
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { workspace = true }

@@ -12,3 +12,9 @@ anyhow = { workspace = true }
 connection = { path = "../hp-backend/connection" }
 hp-logging = { path = "../hp-backend/logging" }
 hp-tun = { path = "../hp-backend/tun" }
+
+[features]
+# hp-stats (PLAN-ML.md): клиент участвует в по-пакетной статистике (TimeProbe/PidReport), сам
+# ничего не пишет — собирает и пишет CSV только vps-server (--features stats, с attach_stats).
+# Нужна на обеих сторонах: без неё у сервера delivered/задержки останутся пустыми.
+stats = ["connection/stats"]
