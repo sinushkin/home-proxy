@@ -162,9 +162,9 @@ async fn run(settings: Settings) -> Result<()> {
         .context("MY_ID: некорректный GUID")?;
     let (public_ip, bootstrap_port, ports) = public_settings(&settings)?;
     let common = hp_server::Common::from_settings_without_peers(&settings)?;
-    let bootstrap = vps::Bootstrap::bind(bootstrap_port).await?;
+    let bootstrap = vps::Bootstrap::bind(bootstrap_port, ports.clone()).await?;
     log::info!("vps-server: белый IP {public_ip}, порт знакомства {bootstrap_port}, порты слотов {}-{}", ports.start(), ports.end());
-    let discovery = Discovery::VpsServer { public_ip, ports, bootstrap };
+    let discovery = Discovery::VpsServer { public_ip, bootstrap };
     let path = clients_file(&settings);
     log::info!("vps-server: клиенты из {}", path.display());
     let (changes_tx, changes_rx) = mpsc::channel(64);

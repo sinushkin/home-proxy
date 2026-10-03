@@ -54,6 +54,7 @@ use uuid::Uuid;
 use crate::auth::{peer_name, PairSecret, RecvKeys, SendKeys};
 use crate::codec;
 use crate::multilink::{AbortOnDrop, SlotBase, SlotId, SlotPhase, TARGET_LINKS};
+use crate::port_pool::{PortLease, PortPool};
 use crate::proto::{lite, peer_message, Lite, PeerMessage, Rendezvous};
 use crate::punch::{self, PeerIdentity, PunchConfig};
 use crate::rendezvous::{self, PeerSession};
@@ -125,22 +126,16 @@ fn unwrap(data: &[u8], keys: &mut RecvKeys, pair: &Pair) -> Option<PeerSession> 
     (session.slot < TARGET_LINKS).then_some(session)
 }
 
-/// Случайный свободный порт из диапазона (кроме `exclude`).
-pub async fn bind_random_port(ports: &RangeInclusive<u16>, exclude: u16) -> Result<UdpSocket> {
-    let (low, high) = (*ports.start(), *ports.end());
-    anyhow::ensure!(low <= high, "пустой диапазон портов {low}..={high}");
-    let span = u64::from(high - low) + 1;
+/// Занимает порт из банка и привязывает к нему сокет. Если привязка не удалась (порт занят
+/// чужой службой), порт возвращается в банк и берётся следующий.
+async fn lease_and_bind(ports: &Arc<PortPool>) -> Result<(PortLease, UdpSocket)> {
     for _ in 0..BIND_ATTEMPTS {
-        let random = u64::from_le_bytes(Uuid::new_v4().into_bytes()[..8].try_into().expect("8 байт"));
-        let port = low + (random % span) as u16;
-        if port == exclude {
-            continue;
-        }
-        if let Ok(socket) = UdpSocket::bind(("0.0.0.0", port)).await {
-            return Ok(socket);
+        let lease = ports.lease().context("банк портов слотов исчерпан")?;
+        if let Ok(socket) = UdpSocket::bind(("0.0.0.0", lease.port())).await {
+            return Ok((lease, socket));
         }
     }
-    anyhow::bail!("не нашёл свободный порт в {low}..={high} за {BIND_ATTEMPTS} попыток")
+    anyhow::bail!("не удалось занять порт из банка за {BIND_ATTEMPTS} попыток")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -153,6 +148,7 @@ pub async fn bind_random_port(ports: &RangeInclusive<u16>, exclude: u16) -> Resu
 pub struct Bootstrap {
     commands: mpsc::Sender<Command>,
     socket: Arc<UdpSocket>,
+    ports: Arc<PortPool>,
 }
 
 impl std::fmt::Debug for Bootstrap {
@@ -187,15 +183,22 @@ impl Drop for Unregistration {
 }
 
 impl Bootstrap {
-    /// Занимает порт знакомства и запускает листенер (один на процесс).
-    pub async fn bind(port: u16) -> Result<Self> {
+    /// Занимает порт знакомства и запускает листенер (один на процесс). `ports` — банк портов
+    /// слотов, общий для всех клиентов; порт знакомства в него входить не может.
+    pub async fn bind(port: u16, ports: RangeInclusive<u16>) -> Result<Self> {
+        anyhow::ensure!(!ports.contains(&port), "порт знакомства {port} внутри диапазона слотов");
         let socket = Arc::new(
             UdpSocket::bind(("0.0.0.0", port)).await.with_context(|| format!("не удалось занять порт знакомства {port}"))?,
         );
         let (commands, commands_rx) = mpsc::channel(COMMAND_QUEUE);
         log::info!("VPS-сервер: порт знакомства {port}");
         tokio::spawn(listen(socket.clone(), commands_rx));
-        Ok(Self { commands, socket })
+        Ok(Self { commands, socket, ports: PortPool::new(ports) })
+    }
+
+    /// Банк портов слотов процесса.
+    pub fn ports(&self) -> Arc<PortPool> {
+        self.ports.clone()
     }
 
     /// Порт, на котором слушает процесс.
@@ -218,7 +221,6 @@ impl Bootstrap {
 /// Настройки сервера одного клиента.
 pub(crate) struct ServerConfig {
     pub public_ip: IpAddr,
-    pub ports: RangeInclusive<u16>,
     pub pair: Pair,
     pub bootstrap: Bootstrap,
 }
@@ -250,8 +252,7 @@ pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConf
         sessions.push(client_tx);
         let slot = ServerSlot {
             public_ip: config.public_ip,
-            ports: config.ports.clone(),
-            bootstrap_port: config.bootstrap.port(),
+            ports: config.bootstrap.ports(),
             pair: config.pair.clone(),
             offers: offer_tx.clone(),
             client_rx,
@@ -346,8 +347,7 @@ impl ClientActor {
 /// Рабочая задача одного слота сервера.
 struct ServerSlot {
     public_ip: IpAddr,
-    ports: RangeInclusive<u16>,
-    bootstrap_port: u16,
+    ports: Arc<PortPool>,
     pair: Pair,
     offers: mpsc::Sender<OfferUpdate>,
     client_rx: watch::Receiver<Option<Uuid>>,
@@ -363,15 +363,16 @@ impl ServerSlot {
         loop {
             // Listening: новый порт и сессия, запись сразу в таблице порта знакомства.
             self.base.phase(SlotPhase::Rendezvous);
-            let socket = match bind_random_port(&self.ports, self.bootstrap_port).await {
-                Ok(socket) => Arc::new(socket),
+            // Порт остаётся в банке, пока жива эта дыра (`port_lease`): вернётся, когда слот начнёт заново.
+            let (port_lease, socket) = match lease_and_bind(&self.ports).await {
+                Ok((lease, socket)) => (lease, Arc::new(socket)),
                 Err(e) => {
                     log::warn!("{label}слот {slot}: не удалось занять порт: {e:#}; повтор");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             };
-            let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+            let port = port_lease.port();
             let my_session = Uuid::new_v4();
             let record = self.pair.record(slot, my_session, SocketAddr::new(self.public_ip, port));
             let _ = self.offers.send(OfferUpdate { slot, record }).await;
@@ -625,19 +626,6 @@ mod tests {
         let (foreign_send, _) = stranger.secret.bootstrap_keys();
         let foreign = codec::encode(&wrap(theirs.record(0, Uuid::new_v4(), endpoint)), &foreign_send);
         assert!(unwrap(&foreign, &mut recv, &mine).is_none(), "пакет чужих ключей знакомства");
-    }
-
-    #[tokio::test]
-    async fn random_ports_stay_in_range_and_skip_the_excluded_one() {
-        let range = 45000..=45003;
-        let mut held = Vec::new();
-        for _ in 0..3 {
-            let socket = bind_random_port(&range, 45001).await.unwrap();
-            let port = socket.local_addr().unwrap().port();
-            assert!(range.contains(&port) && port != 45001);
-            held.push(socket);
-        }
-        assert!(bind_random_port(&range, 45001).await.is_err(), "свободных портов не осталось");
     }
 
     #[tokio::test]

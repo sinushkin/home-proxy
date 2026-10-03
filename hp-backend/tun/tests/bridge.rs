@@ -42,10 +42,10 @@ fn ip_packet(proto: u8, src: [u8; 4], dst: [u8; 4], marker: u8) -> Vec<u8> {
 async fn vps_pair(ports: std::ops::RangeInclusive<u16>, client_options: MultiLinkOptions) -> (Arc<MultiLink>, Rx, Arc<MultiLink>, Rx) {
     let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
     let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let bootstrap = connection::vps::Bootstrap::bind(bootstrap_port).await.unwrap();
+    let bootstrap = connection::vps::Bootstrap::bind(bootstrap_port, ports.clone()).await.unwrap();
     let (server, server_rx) = MultiLink::start_discovery(
         "",
-        Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), ports, bootstrap },
+        Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap },
         server_id,
         client_id,
         MultiLinkOptions::default(),

@@ -39,12 +39,9 @@ async fn discovery(a: &[String]) -> Result<Discovery> {
     if let Ok(ip) = std::env::var("VPS_PUBLIC_IP") {
         let ports = std::env::var("VPS_PORTS").unwrap_or_else(|_| "40001-49999".into());
         let (low, high) = ports.split_once('-').context("VPS_PORTS: a-b")?;
-        let bootstrap = connection::vps::Bootstrap::bind(env_num("VPS_BOOTSTRAP_PORT", connection::vps::DEFAULT_BOOTSTRAP_PORT)).await?;
-        return Ok(Discovery::VpsServer {
-            public_ip: ip.parse().context("VPS_PUBLIC_IP")?,
-            ports: low.parse()?..=high.parse()?,
-            bootstrap,
-        });
+        let ports: std::ops::RangeInclusive<u16> = low.parse()?..=high.parse()?;
+        let bootstrap = connection::vps::Bootstrap::bind(env_num("VPS_BOOTSTRAP_PORT", connection::vps::DEFAULT_BOOTSTRAP_PORT), ports).await?;
+        return Ok(Discovery::VpsServer { public_ip: ip.parse().context("VPS_PUBLIC_IP")?, bootstrap });
     }
     Ok(Discovery::StunMqtt {
         stun_addrs: connection::stun::parse_servers(&a[0])?,

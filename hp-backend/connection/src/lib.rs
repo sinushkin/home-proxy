@@ -12,6 +12,7 @@ pub mod port_pool;
 pub mod port_utils;
 pub mod punch;
 pub mod reorder;
+pub mod rotation;
 pub mod rendezvous;
 #[cfg(feature = "stats")]
 pub(crate) mod stats_feedback;
