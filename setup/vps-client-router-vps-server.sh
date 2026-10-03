@@ -175,6 +175,9 @@ start_service() {
 	procd_close_instance
 }
 EOF
+# TUN клиента — в зону firewall wan: иначе трафик от сервера до роутера отбивается (reject).
+ssh_rtr "zone=\$(uci show firewall | sed -n \"s/^firewall\\.\\(@zone\\[[0-9]*\\]\\)\\.name='wan'\$/\\1/p\"); [ -n \"\$zone\" ] || { echo 'нет зоны wan' >&2; exit 1; }; if uci show firewall | grep -q \"'$CLIENT_TUN'\"; then echo 'зона wan: $CLIENT_TUN уже есть'; else uci add_list firewall.\$zone.device=$CLIENT_TUN && uci commit firewall && /etc/init.d/firewall reload && echo 'зона wan: добавлен $CLIENT_TUN'; fi" || die "не удалось добавить $CLIENT_TUN в зону wan роутера"
+
 ssh_rtr '/etc/init.d/vps-client enable && /etc/init.d/vps-client restart'
 echo "служба vps-client: включена (автозапуск), перезапущена"
 
@@ -194,12 +197,7 @@ fi
 ssh_srv 'journalctl -u hp-vps-server --no-pager -n 40 | grep -o "дыры [^,]*" | tail -n 1' || true
 
 # ---------------------------------------------------------------- фаервол: только проверка
-step "Фаервол (скрипт его не меняет)"
-if ! ssh_rtr "uci show firewall | grep -q \"'$CLIENT_TUN'\""; then
-  warn "на роутере TUN $CLIENT_TUN не входит в зону firewall (wan). Без этого трафик от сервера до роутера
-  отбрасывается (ICMP/TCP отвечает reject). Добавить вручную:
-    ssh $RTR 'uci add_list firewall.@zone[1].device=$CLIENT_TUN && uci commit firewall && /etc/init.d/firewall reload'"
-fi
+step "Фаервол сервера (скрипт его не меняет)"
 if ! ssh_srv "ufw status 2>/dev/null | grep -qE '40000:40999/udp|$SERVER_PORT/udp'"; then
   warn "на сервере, похоже, не открыт UDP $SERVER_PORT и $SERVER_SLOTS (ufw). Откройте вручную, например:
     ssh $SRV 'ufw allow $SERVER_PORT/udp && ufw allow ${SERVER_SLOTS/-/:}/udp'"
