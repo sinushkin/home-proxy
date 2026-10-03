@@ -41,3 +41,6 @@ control.token
 
 # Описание тестового стенда и замеры (хосты, результаты)
 Infrastructure.md
+
+# Настройки и GUID связок (setup/state), не коммитятся
+setup/state/
