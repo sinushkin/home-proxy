@@ -75,7 +75,7 @@ pub struct PoolPolicy {
 impl Default for PoolPolicy {
     fn default() -> Self {
         Self {
-            min_active: 5,
+            min_active: 4,
             max_total: 10,
             add_interval: Duration::from_secs(10),
             bad_loss: 0.5,
@@ -186,28 +186,28 @@ mod tests {
     #[test]
     fn empty_pool_opens_min_active_at_once() {
         let actions = plan(&[], Duration::ZERO, &PoolPolicy::default());
-        assert_eq!(actions, vec![Action::Open; 5]);
+        assert_eq!(actions, vec![Action::Open; 4]);
     }
 
     #[test]
     fn below_minimum_tops_up_and_does_nothing_else_this_cycle() {
         let holes: Vec<_> = (0..3).map(|i| active(i, 20)).collect();
         let actions = plan(&holes, Duration::from_secs(999), &PoolPolicy::default());
-        assert_eq!(actions, vec![Action::Open, Action::Open], "3 живых, нужно 5 — добираем 2");
+        assert_eq!(actions, vec![Action::Open], "3 живых, нужно 4 — добираем 1");
     }
 
     #[test]
     fn never_drops_below_min_active_even_with_an_expired_hole() {
-        // Ровно 5 дыр (= min_active), одна просрочена: запаса («slack») нет вообще, значит слить
+        // Ровно 4 дыры (= min_active), одна просрочена: запаса («slack») нет вообще, значит слить
         // просроченную сейчас нельзя — это уронило бы живых ниже минимума.
-        let mut holes: Vec<_> = (0..5).map(|i| active(i, 10)).collect();
+        let mut holes: Vec<_> = (0..4).map(|i| active(i, 10)).collect();
         holes[0].age = Duration::from_secs(200);
         holes[0].max_age = Duration::from_secs(120);
         let actions = plan(&holes, Duration::from_secs(999), &PoolPolicy::default());
         assert!(
             !actions.contains(&Action::Retire(0)),
             "слив единственной просроченной дыры на самом минимуме уронил бы набор ниже {min}: {actions:?}",
-            min = 5
+            min = 4
         );
     }
 
@@ -258,7 +258,7 @@ mod tests {
         let policy = PoolPolicy::default();
         // Ровно min_active дыр, все просрочены одновременно (например, одновременно открыты
         // давным-давно) — ни у одной нет небросившей замены среди остальных.
-        let mut holes: Vec<_> = (0..5).map(|i| active(i, 200)).collect();
+        let mut holes: Vec<_> = (0..4).map(|i| active(i, 200)).collect();
         for h in &mut holes {
             h.max_age = Duration::from_secs(120);
         }
@@ -287,12 +287,12 @@ mod tests {
     #[test]
     fn warming_holes_count_toward_the_minimum() {
         // Прогреваемая (Warming) дыра уже считается «живой» для правила 1 (и для slack правила 3):
-        // 4 Active + 1 Warming = 5 живых, ровно минимум — не хватает, чтобы запускать рост/чистку,
-        // раз интервал роста ещё не прошёл (since_last_open = 0).
-        let mut holes: Vec<_> = (0..4).map(|i| active(i, 20)).collect();
-        holes.push(hole(4, HoleState::Warming, 1, 120, None, None));
+        // 3 Active + 1 Warming = 4 живых, ровно минимум — расти ещё рано, интервал роста не прошёл
+        // (since_last_open = 0).
+        let mut holes: Vec<_> = (0..3).map(|i| active(i, 20)).collect();
+        holes.push(hole(3, HoleState::Warming, 1, 120, None, None));
         let actions = plan(&holes, Duration::ZERO, &PoolPolicy::default());
-        assert_eq!(actions, Vec::new(), "4 Active + 1 Warming = 5 живых — ровно минимум, расти ещё рано");
+        assert_eq!(actions, Vec::new(), "3 Active + 1 Warming = 4 живых — ровно минимум, расти ещё рано");
     }
 
     #[test]
@@ -300,6 +300,6 @@ mod tests {
         let mut holes: Vec<_> = (0..5).map(|i| active(i, 20)).collect();
         holes.push(hole(5, HoleState::Draining, 50, 120, Some(0.9), None)); // сливается, плохая, но уже не трогаем
         let actions = plan(&holes, Duration::from_secs(999), &PoolPolicy::default());
-        assert_eq!(actions, vec![Action::Open], "Draining не считается живой — нас только 5, добираем рост по интервалу");
+        assert_eq!(actions, vec![Action::Open], "Draining не считается живой — живых 5, растём по интервалу");
     }
 }

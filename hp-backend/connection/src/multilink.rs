@@ -140,49 +140,54 @@ impl fmt::Display for ConnState {
     }
 }
 
-fn aggregate(phases: &[SlotPhase]) -> ConnState {
-    let connected = phases.iter().filter(|p| **p == SlotPhase::Connected).count();
+fn aggregate<'a>(phases: impl IntoIterator<Item = &'a SlotPhase>) -> ConnState {
+    let (mut connected, mut punching) = (0, false);
+    for phase in phases {
+        match phase {
+            SlotPhase::Connected => connected += 1,
+            SlotPhase::Punching => punching = true,
+            _ => {}
+        }
+    }
     if connected > 0 {
         ConnState::Connected(connected)
-    } else if phases.contains(&SlotPhase::Punching) {
+    } else if punching {
         ConnState::Punching
     } else {
         ConnState::Rendezvous
     }
 }
 
-/// Фазы всех слотов; при каждой смене общего состояния пишет его в лог.
+/// Фазы слотов (по номеру, карта — номера динамических дыр не ограничены сверху); при каждой смене
+/// общего состояния пишет его в лог. Слот без записи — ещё не начал работу.
 struct StateTracker {
     inner: Mutex<TrackerInner>,
     label: Label,
 }
 
 struct TrackerInner {
-    phases: Vec<SlotPhase>,
+    phases: HashMap<SlotId, SlotPhase>,
     last: Option<ConnState>,
 }
 
 impl StateTracker {
-    fn new(slots: usize, label: Label) -> Self {
+    fn new(label: Label) -> Self {
         Self {
-            inner: Mutex::new(TrackerInner {
-                phases: vec![SlotPhase::Starting; slots],
-                last: None,
-            }),
+            inner: Mutex::new(TrackerInner { phases: HashMap::new(), last: None }),
             label,
         }
     }
 
     fn current(&self) -> ConnState {
-        aggregate(&self.inner.lock().unwrap().phases)
+        aggregate(self.inner.lock().unwrap().phases.values())
     }
 
     fn set(&self, slot: SlotId, phase: SlotPhase) {
         let label = &self.label;
         let mut inner = self.inner.lock().unwrap();
         log::debug!("{label}слот {slot}: фаза {phase:?}");
-        inner.phases[slot as usize] = phase;
-        let now = aggregate(&inner.phases);
+        inner.phases.insert(slot, phase);
+        let now = aggregate(inner.phases.values());
         if inner.last != Some(now) {
             match inner.last {
                 Some(prev) => log::info!("{label}состояние соединения: {prev} -> {now}"),
@@ -454,7 +459,7 @@ pub struct MultiLink {
     picker: Mutex<SlotPicker>,
     wrap_seq: Mutex<SeqCounters>,
     data_holes: u8,
-    redrop_txs: Vec<mpsc::Sender<()>>,
+    redrop_txs: HashMap<SlotId, mpsc::Sender<()>>,
     control_rx: Mutex<Option<mpsc::Receiver<Control>>>,
     state: Arc<StateTracker>,
     /// Текущее ожидание буфера порядка (обновляется раз в 30 с из `control_loop`); см. `LinkStatus`.
@@ -518,13 +523,13 @@ impl MultiLink {
         let (events_tx, events_rx) = mpsc::channel::<LinkEvent>(64);
         let (incoming_tx, incoming_rx) = mpsc::channel::<Incoming>(64);
         let (control_tx, control_rx) = mpsc::channel::<Control>(CONTROL_CHANNEL_CAPACITY);
-        let state = Arc::new(StateTracker::new(TARGET_LINKS as usize, label.clone()));
+        let state = Arc::new(StateTracker::new(label.clone()));
 
-        let mut redrop_txs = Vec::new();
+        let mut redrop_txs = HashMap::new();
         let mut bases = Vec::new();
         for slot in 0..TARGET_LINKS {
             let (redrop_tx, redrop_rx) = mpsc::channel::<()>(1);
-            redrop_txs.push(redrop_tx);
+            redrop_txs.insert(slot, redrop_tx);
             bases.push(SlotBase {
                 slot,
                 label: label.clone(),
@@ -905,8 +910,8 @@ async fn control_loop(
     label: Label,
     mut events: mpsc::Receiver<LinkEvent>,
     registry: Arc<Mutex<LinkRegistry>>,
-    redrop_txs: Vec<mpsc::Sender<()>>,
-    hole_records: Option<mpsc::Sender<Rendezvous>>,
+    redrop_txs: HashMap<SlotId, mpsc::Sender<()>>,
+hole_records: Option<mpsc::Sender<Rendezvous>>,
     (incoming, control): (mpsc::Sender<Incoming>, mpsc::Sender<Control>),
     options: MultiLinkOptions,
     reorder_wait_ms: Arc<AtomicU32>,
@@ -1098,8 +1103,8 @@ fn link_is_bad(peer_sent: u64, my_received: u64) -> bool {
     peer_sent >= MIN_STATS_SAMPLE && my_received * 2 < peer_sent
 }
 
-fn request_redrop(redrop_txs: &[mpsc::Sender<()>], slot: SlotId) {
-    if let Some(tx) = redrop_txs.get(slot as usize) {
+fn request_redrop(redrop_txs: &HashMap<SlotId, mpsc::Sender<()>>, slot: SlotId) {
+    if let Some(tx) = redrop_txs.get(&slot) {
         let _ = tx.try_send(());
     }
 }
@@ -1324,7 +1329,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            Vec::new(),
+            HashMap::new(),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: wait, ..MultiLinkOptions::default() },
@@ -1366,7 +1371,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            Vec::new(),
+            HashMap::new(),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
@@ -1407,7 +1412,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            Vec::new(),
+            HashMap::new(),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
@@ -1447,7 +1452,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            Vec::new(),
+            HashMap::new(),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::from_millis(500), reorder_clients: false, ..MultiLinkOptions::default() },

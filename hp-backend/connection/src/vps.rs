@@ -3,10 +3,11 @@
 //! Клиент заранее знает `ip:порт знакомства` сервера. Никаких STUN, MQTT и окон пробива: клиент
 //! спрашивает, сервер отвечает «твой слот k — мой порт P, сессия S», клиент идёт на этот порт.
 //!
-//! **Порт знакомства** — без состояния: на каждый подписанный запрос клиента по слоту k (его
-//! запись `Rendezvous` с сессией) сервер отвечает текущей записью своего слота k. Запись у слота
-//! есть всегда — с момента, как он занял порт, — и не снимается никогда, только заменяется новой.
-//! Поэтому сервер не может «замолчать».
+//! **Порт знакомства**: запрос начинается с открытого имени клиента (`auth::peer_name`); чужое имя
+//! сервер молча отбрасывает. На подписанный запрос клиента по слоту k (его запись `Rendezvous` с
+//! сессией) сервер отвечает текущей записью своего слота k. Запись у слота есть всегда — с момента,
+//! как он занял порт, — и не снимается никогда, только заменяется новой. Состояние знакомства
+//! (записи и сессии по слотам) держит актор клиента `ClientActor`; слоты обновляют его через канал.
 //!
 //! Стейт-машина **слота сервера** (инициатор всего — клиент):
 //!
@@ -41,17 +42,17 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-use crate::auth::{PairSecret, RecvKeys, SendKeys};
+use crate::auth::{peer_name, PairSecret, RecvKeys, SendKeys};
 use crate::codec;
-use crate::multilink::{AbortOnDrop, SlotBase, SlotPhase, TARGET_LINKS};
+use crate::multilink::{AbortOnDrop, SlotBase, SlotId, SlotPhase, TARGET_LINKS};
 use crate::proto::{lite, peer_message, Lite, PeerMessage, Rendezvous};
 use crate::punch::{self, PeerIdentity, PunchConfig};
 use crate::rendezvous::{self, PeerSession};
@@ -62,6 +63,12 @@ pub const DEFAULT_SLOT_PORTS: RangeInclusive<u16> = 40001..=49999;
 
 /// Как часто клиент повторяет запрос, пока слот не залинкован.
 const ASK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Длина открытого имени клиента перед запросом знакомства (`auth::peer_name`).
+const NAME_LEN: usize = 8;
+
+/// Очередь запросов знакомства к актору клиента: запросов ~по одному в секунду на слот.
+const KNOCK_QUEUE: usize = 64;
 
 /// Сколько раз пробуем занять случайный порт из диапазона, прежде чем сдаться.
 const BIND_ATTEMPTS: usize = 64;
@@ -144,60 +151,108 @@ pub(crate) struct ServerConfig {
     pub pair: Pair,
 }
 
-/// Занимает порт знакомства и запускает слоты сервера.
+/// Запрос знакомства, уже отделённый от открытого имени клиента.
+struct Knock {
+    packet: Vec<u8>,
+    from: SocketAddr,
+}
+
+/// Новая запись слота сервера: слот сообщает актору клиента, что отвечать на знакомство.
+struct OfferUpdate {
+    slot: SlotId,
+    record: Rendezvous,
+}
+
+/// Занимает порт знакомства и запускает слоты сервера и актор клиента.
 pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConfig, bases: Vec<SlotBase>) -> Result<Vec<AbortOnDrop>> {
-    let socket = UdpSocket::bind(("0.0.0.0", config.bootstrap_port))
-        .await
-        .with_context(|| format!("не удалось занять порт знакомства {}", config.bootstrap_port))?;
+    let socket = Arc::new(
+        UdpSocket::bind(("0.0.0.0", config.bootstrap_port))
+            .await
+            .with_context(|| format!("не удалось занять порт знакомства {}", config.bootstrap_port))?,
+    );
     log::info!("{label}VPS-сервер: порт знакомства {}", config.bootstrap_port);
 
-    // Таблица порта знакомства: текущая запись каждого слота. Пишет только сам слот.
-    let offers: Arc<Mutex<Vec<Option<Rendezvous>>>> = Arc::new(Mutex::new(vec![None; TARGET_LINKS as usize]));
-    let mut clients = Vec::new();
+    let (knock_tx, knock_rx) = mpsc::channel(KNOCK_QUEUE);
+    let (offer_tx, offer_rx) = mpsc::channel(TARGET_LINKS as usize);
+    let mut sessions = Vec::new();
     let mut tasks = Vec::new();
     for base in bases {
         // Последняя сессия клиента для этого слота (с порта знакомства).
         let (client_tx, client_rx) = watch::channel(None);
-        clients.push(client_tx);
+        sessions.push(client_tx);
         let slot = ServerSlot {
             public_ip: config.public_ip,
             ports: config.ports.clone(),
             bootstrap_port: config.bootstrap_port,
             pair: config.pair.clone(),
-            offers: offers.clone(),
+            offers: offer_tx.clone(),
             client_rx,
             base,
         };
         tasks.push(AbortOnDrop(tokio::spawn(slot.run())));
     }
-    tasks.push(AbortOnDrop(tokio::spawn(serve_bootstrap(socket, config.pair, offers, clients))));
+    let (send, recv) = config.pair.secret.bootstrap_keys();
+    let actor = ClientActor {
+        socket: socket.clone(),
+        pair: config.pair.clone(),
+        send,
+        recv,
+        offers: vec![None; TARGET_LINKS as usize],
+        sessions,
+    };
+    tasks.push(AbortOnDrop(tokio::spawn(actor.run(knock_rx, offer_rx))));
+    tasks.push(AbortOnDrop(tokio::spawn(listen(socket, peer_name(&config.pair.peer_id), knock_tx))));
     Ok(tasks)
 }
 
-/// Порт знакомства: запрос клиента по слоту k → его сессию слоту k, в ответ — запись слота k.
-async fn serve_bootstrap(
-    socket: UdpSocket,
-    pair: Pair,
-    offers: Arc<Mutex<Vec<Option<Rendezvous>>>>,
-    clients: Vec<watch::Sender<Option<Uuid>>>,
-) {
-    let (send, mut recv) = pair.secret.bootstrap_keys();
+/// Порт знакомства: передаёт актору запросы с открытым именем ожидаемого клиента, остальное — мимо.
+async fn listen(socket: Arc<UdpSocket>, name: String, knocks: mpsc::Sender<Knock>) {
     let mut buf = [0u8; 1500];
     loop {
         let Ok((n, from)) = socket.recv_from(&mut buf).await else { continue };
-        let Some(request) = unwrap(&buf[..n], &mut recv, &pair) else { continue };
+        if n <= NAME_LEN || buf[..NAME_LEN] != *name.as_bytes() {
+            continue;
+        }
+        let _ = knocks.try_send(Knock { packet: buf[NAME_LEN..n].to_vec(), from });
+    }
+}
+
+/// Владелец состояния клиента на сервере: записи слотов для знакомства и сессии клиента по слотам.
+/// Блокировок нет: состояние меняет только эта задача, слоты пишут через канал.
+struct ClientActor {
+    socket: Arc<UdpSocket>,
+    pair: Pair,
+    send: SendKeys,
+    recv: RecvKeys,
+    offers: Vec<Option<Rendezvous>>,
+    sessions: Vec<watch::Sender<Option<Uuid>>>,
+}
+
+impl ClientActor {
+    async fn run(mut self, mut knocks: mpsc::Receiver<Knock>, mut updates: mpsc::Receiver<OfferUpdate>) {
+        loop {
+            tokio::select! {
+                Some(knock) = knocks.recv() => self.knock(knock).await,
+                Some(update) = updates.recv() => self.offers[update.slot as usize] = Some(update.record),
+                else => return,
+            }
+        }
+    }
+
+    /// Запрос клиента по слоту k → его сессия слоту k, в ответ — запись слота k.
+    async fn knock(&mut self, knock: Knock) {
+        let Some(request) = unwrap(&knock.packet, &mut self.recv, &self.pair) else { return };
         let slot = request.slot as usize;
-        clients[slot].send_if_modified(|current| {
+        self.sessions[slot].send_if_modified(|current| {
             let changed = *current != Some(request.session_id);
             if changed {
-                log::debug!("знакомство: слот {slot}, клиент {from}, сессия {}", request.session_id);
+                log::debug!("знакомство: слот {slot}, клиент {}, сессия {}", knock.from, request.session_id);
                 *current = Some(request.session_id);
             }
             changed
         });
-        let offer = offers.lock().unwrap()[slot].clone();
-        if let Some(offer) = offer {
-            let _ = socket.send_to(&codec::encode(&wrap(offer), &send), from).await;
+        if let Some(offer) = self.offers[slot].clone() {
+            let _ = self.socket.send_to(&codec::encode(&wrap(offer), &self.send), knock.from).await;
         }
     }
 }
@@ -208,7 +263,7 @@ struct ServerSlot {
     ports: RangeInclusive<u16>,
     bootstrap_port: u16,
     pair: Pair,
-    offers: Arc<Mutex<Vec<Option<Rendezvous>>>>,
+    offers: mpsc::Sender<OfferUpdate>,
     client_rx: watch::Receiver<Option<Uuid>>,
     base: SlotBase,
 }
@@ -232,7 +287,8 @@ impl ServerSlot {
             };
             let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
             let my_session = Uuid::new_v4();
-            self.offers.lock().unwrap()[slot as usize] = Some(self.pair.record(slot, my_session, SocketAddr::new(self.public_ip, port)));
+            let record = self.pair.record(slot, my_session, SocketAddr::new(self.public_ip, port));
+            let _ = self.offers.send(OfferUpdate { slot, record }).await;
             log::debug!("{label}слот {slot}: порт {port}");
 
             // Accepting: ждём пакет клиента на порту; сессия клиента сменилась — ждём уже её.
@@ -305,6 +361,7 @@ struct ClientBootstrap {
     socket: UdpSocket,
     server: SocketAddr,
     send: SendKeys,
+    name: String,
 }
 
 impl ClientBootstrap {
@@ -316,7 +373,8 @@ impl ClientBootstrap {
             loop {
                 ticker.tick().await;
                 // Каждый раз заново: у каждого пакета свой счётчик в подписи.
-                let packet = codec::encode(&wrap(record.clone()), &this.send);
+                let mut packet = this.name.clone().into_bytes();
+                packet.extend_from_slice(&codec::encode(&wrap(record.clone()), &this.send));
                 let _ = this.socket.send_to(&packet, this.server).await;
             }
         }))
@@ -344,7 +402,8 @@ async fn receive_offers(boot: Arc<ClientBootstrap>, mut recv: RecvKeys, pair: Pa
 pub(crate) async fn start_client(label: &crate::label::Label, config: ClientConfig, bases: Vec<SlotBase>) -> Result<Vec<AbortOnDrop>> {
     let socket = crate::bind::udp(config.bind_ip, 0, config.bind_ifindex).await.context("сокет знакомства")?;
     let (send, recv) = config.pair.secret.bootstrap_keys();
-    let boot = Arc::new(ClientBootstrap { socket, server: config.server, send });
+    let name = peer_name(&config.pair.my_peer_id);
+    let boot = Arc::new(ClientBootstrap { socket, server: config.server, send, name });
     log::info!("{label}VPS-клиент: сервер {}", config.server);
 
     let mut offers = Vec::new();
@@ -493,6 +552,20 @@ mod tests {
             held.push(socket);
         }
         assert!(bind_random_port(&range, 45001).await.is_err(), "свободных портов не осталось");
+    }
+
+    #[tokio::test]
+    async fn listener_passes_only_the_expected_name() {
+        let server = Arc::new(UdpSocket::bind(("127.0.0.1", 0)).await.unwrap());
+        let addr = server.local_addr().unwrap();
+        let (knocks_tx, mut knocks) = mpsc::channel(8);
+        tokio::spawn(listen(server, "0a1b2c3d".into(), knocks_tx));
+        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        client.send_to(b"ffffffffpayload", addr).await.unwrap();
+        client.send_to(b"0a1b2c3dpayload", addr).await.unwrap();
+        let knock = tokio::time::timeout(Duration::from_secs(1), knocks.recv()).await.unwrap().unwrap();
+        assert_eq!(knock.packet, b"payload");
+        assert!(knocks.try_recv().is_err(), "чужое имя должно отбрасываться молча");
     }
 
     #[tokio::test]
