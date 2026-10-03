@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use connection::multilink::{Discovery, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use tokio::sync::mpsc;
 use settings::Settings;
 use uuid::Uuid;
 
@@ -125,10 +126,20 @@ pub struct StatsSettings {
 
 impl Common {
     pub fn from_settings(settings: &Settings) -> Result<Self> {
+        Self::build(settings, true)
+    }
+
+    /// Настройки без пиров из `MY_ID`/`PEER_ID`/`PEER_<n>_*`: пиры придут из другого источника
+    /// (файл клиентов `vps-server`).
+    pub fn from_settings_without_peers(settings: &Settings) -> Result<Self> {
+        Self::build(settings, false)
+    }
+
+    fn build(settings: &Settings, with_peers: bool) -> Result<Self> {
         let get = |name: &str| settings.get(name);
         let tun_addr = get("TUN_ADDR").unwrap_or_else(|| DEFAULT_TUN_ADDR.to_string());
         Ok(Self {
-            peers: parse_peers(&get)?,
+            peers: if with_peers { parse_peers(&get)? } else { Vec::new() },
             mode: Mode::parse(get("MODE").as_deref())?,
             bind: bypass::BindSetting::parse(get("BIND_ADDR").as_deref())?,
             address_file: Some(settings.resolve(get("ADDRESS_FILE").as_deref().unwrap_or("addresses.state").trim())),
@@ -286,9 +297,20 @@ pub fn main() -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve(discoveries, common))
 }
 
+/// Изменение набора пиров во время работы (файл клиентов `vps-server`).
+pub enum PeerChange {
+    Add(Peer, Discovery),
+    Remove(Uuid),
+}
+
 /// Сервер на TUN: поднимает интерфейс и по набору дыр на каждого пира (`discoveries[i]` — способ
 /// встречи с `common.peers[i]`), раздаёт адреса и гоняет мост TUN ↔ дыры, пока жив процесс.
 pub async fn serve(discoveries: Vec<Discovery>, common: Common) -> Result<()> {
+    serve_with_changes(discoveries, common, None).await
+}
+
+/// То же, что `serve`, плюс канал изменений пиров: пиры добавляются и удаляются без перезапуска.
+pub async fn serve_with_changes(discoveries: Vec<Discovery>, common: Common, changes: Option<mpsc::Receiver<PeerChange>>) -> Result<()> {
     anyhow::ensure!(discoveries.len() == common.peers.len(), "способов встречи {} на {} пиров", discoveries.len(), common.peers.len());
     let (server_addr, prefix) = common.tun.address.context("у сервера нет адреса в туннеле (TUN_ADDR)")?;
     // Адаптер мимо VPN ищем до того, как появится свой TUN: его адрес не кандидат.
@@ -307,7 +329,7 @@ pub async fn serve(discoveries: Vec<Discovery>, common: Common) -> Result<()> {
         Mode::Tun => {
             let tun = hp_tun::Tun::create(&common.tun).context("создание TUN (нужны права root)")?;
             log::info!("сервер: TUN {} {server_addr}/{prefix}", tun.name());
-            run(hp_tun::hub::Hub::start(tun), discoveries, common, binding).await
+            run(hp_tun::hub::Hub::start(tun), discoveries, common, binding, changes).await
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         Mode::Tun => anyhow::bail!("MODE=tun есть только на Linux; здесь — MODE=netstack"),
@@ -317,7 +339,7 @@ pub async fn serve(discoveries: Vec<Discovery>, common: Common) -> Result<()> {
                 let (device, stack_end) = hp_tun::device::channel_pair();
                 let stack = hp_netstack::start(stack_end);
                 log::info!("сервер: свой сетевой стек, адрес {server_addr}/{prefix} (соединения телефонов открывает этот процесс)");
-                let result = run(hp_tun::hub::Hub::start(device), discoveries, common, binding).await;
+                let result = run(hp_tun::hub::Hub::start(device), discoveries, common, binding, changes).await;
                 stack.abort();
                 result
             }
@@ -328,7 +350,13 @@ pub async fn serve(discoveries: Vec<Discovery>, common: Common) -> Result<()> {
 }
 
 /// Раздаёт адреса, поднимает наборы дыр к пирам и гоняет мост, пока жив процесс.
-async fn run<D: hp_tun::device::PacketDevice>(hub: hp_tun::hub::Hub<D>, discoveries: Vec<Discovery>, common: Common, binding: bypass::Binding) -> Result<()> {
+async fn run<D: hp_tun::device::PacketDevice>(
+    hub: hp_tun::hub::Hub<D>,
+    discoveries: Vec<Discovery>,
+    common: Common,
+    binding: bypass::Binding,
+    changes: Option<mpsc::Receiver<PeerChange>>,
+) -> Result<()> {
     let (server_addr, prefix) = common.tun.address.context("у сервера нет адреса в туннеле")?;
     let book = AddressBook::load(server_addr, prefix, common.address_file.clone())?;
     log::info!(
@@ -379,6 +407,21 @@ async fn run<D: hp_tun::device::PacketDevice>(hub: hp_tun::hub::Hub<D>, discover
         service.add_configured(*peer, discovery).await?;
     }
     service.add_paired_from_file().await?;
+    let dynamic = changes.is_some();
+    if let Some(mut changes) = changes {
+        let service = service.clone();
+        tokio::spawn(async move {
+            while let Some(change) = changes.recv().await {
+                let result = match change {
+                    PeerChange::Add(peer, discovery) => service.add_from_file(peer, discovery).await,
+                    PeerChange::Remove(peer_id) => service.remove_peer(&connection::auth::peer_name(&peer_id)),
+                };
+                if let Err(e) = result {
+                    log::warn!("клиенты: {e:#}");
+                }
+            }
+        });
+    }
 
     match common.control {
         Some(addr) => {
@@ -387,7 +430,7 @@ async fn run<D: hp_tun::device::PacketDevice>(hub: hp_tun::hub::Hub<D>, discover
             log::info!("управление: {addr}; строка подключения для трея — hp-server --connection-string");
             tokio::spawn(hp_control::server::serve(listener, common.key_file.clone(), service.clone()));
         }
-        None if service.live_counts().is_empty() => anyhow::bail!("нет ни одного пира (MY_ID/PEER_ID) и выключено управление (CONTROL_ADDR)"),
+        None if !dynamic && service.live_counts().is_empty() => anyhow::bail!("нет ни одного пира (MY_ID/PEER_ID) и выключено управление (CONTROL_ADDR)"),
         None => {}
     }
 

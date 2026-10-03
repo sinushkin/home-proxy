@@ -32,17 +32,18 @@ fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
-fn discovery(a: &[String]) -> Result<Discovery> {
+async fn discovery(a: &[String]) -> Result<Discovery> {
     if let Ok(server) = std::env::var("VPS_SERVER") {
         return Ok(Discovery::VpsClient { server: server.parse().context("VPS_SERVER: ip:порт")? });
     }
     if let Ok(ip) = std::env::var("VPS_PUBLIC_IP") {
         let ports = std::env::var("VPS_PORTS").unwrap_or_else(|_| "40001-49999".into());
         let (low, high) = ports.split_once('-').context("VPS_PORTS: a-b")?;
+        let bootstrap = connection::vps::Bootstrap::bind(env_num("VPS_BOOTSTRAP_PORT", connection::vps::DEFAULT_BOOTSTRAP_PORT)).await?;
         return Ok(Discovery::VpsServer {
             public_ip: ip.parse().context("VPS_PUBLIC_IP")?,
-            bootstrap_port: env_num("VPS_BOOTSTRAP_PORT", connection::vps::DEFAULT_BOOTSTRAP_PORT),
             ports: low.parse()?..=high.parse()?,
+            bootstrap,
         });
     }
     Ok(Discovery::StunMqtt {
@@ -178,7 +179,7 @@ async fn run() -> Result<()> {
         ..MultiLinkOptions::default()
     };
     let (link, mut incoming) =
-        MultiLink::start_discovery("", discovery(&a)?, a[3].parse::<Uuid>()?, a[4].parse::<Uuid>()?, options).await?;
+        MultiLink::start_discovery("", discovery(&a).await?, a[3].parse::<Uuid>()?, a[4].parse::<Uuid>()?, options).await?;
     let secs: u64 = a[6].parse().context("секунд")?;
     let payload_len: usize = env_num("PAYLOAD", 1392usize).max(16);
 

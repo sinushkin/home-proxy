@@ -40,6 +40,7 @@
 //! (`auth::PairSecret::bootstrap_keys`); сама запись тоже подписана. Без полного GUID обеих
 //! сторон такой пакет не подделать.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -66,6 +67,9 @@ const ASK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Длина открытого имени клиента перед запросом знакомства (`auth::peer_name`).
 const NAME_LEN: usize = 8;
+
+/// Очередь команд листенера (регистрация и снятие клиентов).
+const COMMAND_QUEUE: usize = 16;
 
 /// Очередь запросов знакомства к актору клиента: запросов ~по одному в секунду на слот.
 const KNOCK_QUEUE: usize = 64;
@@ -143,12 +147,80 @@ pub async fn bind_random_port(ports: &RangeInclusive<u16>, exclude: u16) -> Resu
 // Сервер
 // ---------------------------------------------------------------------------------------------
 
-/// Настройки сервера.
+/// Порт знакомства процесса: один сокет на всех клиентов. Актор-листенер раздаёт запросы по
+/// открытому имени клиента; таблица «имя → канал» живёт только в его задаче, блокировок нет.
+#[derive(Clone)]
+pub struct Bootstrap {
+    commands: mpsc::Sender<Command>,
+    socket: Arc<UdpSocket>,
+}
+
+impl std::fmt::Debug for Bootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bootstrap(порт {})", self.port())
+    }
+}
+
+enum Command {
+    Register { name: String, token: Uuid, knocks: mpsc::Sender<Knock> },
+    Unregister { name: String, token: Uuid },
+}
+
+/// Регистрация клиента: общий сокет для ответов, канал его запросов и страж, который снимает
+/// клиента с порта знакомства при дропе.
+pub(crate) struct Registration {
+    socket: Arc<UdpSocket>,
+    knocks: mpsc::Receiver<Knock>,
+    guard: Unregistration,
+}
+
+pub(crate) struct Unregistration {
+    commands: mpsc::Sender<Command>,
+    name: String,
+    token: Uuid,
+}
+
+impl Drop for Unregistration {
+    fn drop(&mut self) {
+        let _ = self.commands.try_send(Command::Unregister { name: std::mem::take(&mut self.name), token: self.token });
+    }
+}
+
+impl Bootstrap {
+    /// Занимает порт знакомства и запускает листенер (один на процесс).
+    pub async fn bind(port: u16) -> Result<Self> {
+        let socket = Arc::new(
+            UdpSocket::bind(("0.0.0.0", port)).await.with_context(|| format!("не удалось занять порт знакомства {port}"))?,
+        );
+        let (commands, commands_rx) = mpsc::channel(COMMAND_QUEUE);
+        log::info!("VPS-сервер: порт знакомства {port}");
+        tokio::spawn(listen(socket.clone(), commands_rx));
+        Ok(Self { commands, socket })
+    }
+
+    /// Порт, на котором слушает процесс.
+    pub fn port(&self) -> u16 {
+        self.socket.local_addr().map(|a| a.port()).unwrap_or(0)
+    }
+
+    async fn register(&self, name: String) -> Registration {
+        let (knocks_tx, knocks) = mpsc::channel(KNOCK_QUEUE);
+        let token = Uuid::new_v4();
+        let _ = self.commands.send(Command::Register { name: name.clone(), token, knocks: knocks_tx }).await;
+        Registration {
+            socket: self.socket.clone(),
+            knocks,
+            guard: Unregistration { commands: self.commands.clone(), name, token },
+        }
+    }
+}
+
+/// Настройки сервера одного клиента.
 pub(crate) struct ServerConfig {
     pub public_ip: IpAddr,
-    pub bootstrap_port: u16,
     pub ports: RangeInclusive<u16>,
     pub pair: Pair,
+    pub bootstrap: Bootstrap,
 }
 
 /// Запрос знакомства, уже отделённый от открытого имени клиента.
@@ -163,16 +235,12 @@ struct OfferUpdate {
     record: Rendezvous,
 }
 
-/// Занимает порт знакомства и запускает слоты сервера и актор клиента.
+/// Регистрирует клиента на общем порту знакомства и запускает его слоты и актор.
 pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConfig, bases: Vec<SlotBase>) -> Result<Vec<AbortOnDrop>> {
-    let socket = Arc::new(
-        UdpSocket::bind(("0.0.0.0", config.bootstrap_port))
-            .await
-            .with_context(|| format!("не удалось занять порт знакомства {}", config.bootstrap_port))?,
-    );
-    log::info!("{label}VPS-сервер: порт знакомства {}", config.bootstrap_port);
+    let name = peer_name(&config.pair.peer_id);
+    let Registration { socket, knocks, guard } = config.bootstrap.register(name.clone()).await;
+    log::info!("{label}VPS-сервер: клиент {name} на порту знакомства {}", config.bootstrap.port());
 
-    let (knock_tx, knock_rx) = mpsc::channel(KNOCK_QUEUE);
     let (offer_tx, offer_rx) = mpsc::channel(TARGET_LINKS as usize);
     let mut sessions = Vec::new();
     let mut tasks = Vec::new();
@@ -183,7 +251,7 @@ pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConf
         let slot = ServerSlot {
             public_ip: config.public_ip,
             ports: config.ports.clone(),
-            bootstrap_port: config.bootstrap_port,
+            bootstrap_port: config.bootstrap.port(),
             pair: config.pair.clone(),
             offers: offer_tx.clone(),
             client_rx,
@@ -193,27 +261,45 @@ pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConf
     }
     let (send, recv) = config.pair.secret.bootstrap_keys();
     let actor = ClientActor {
-        socket: socket.clone(),
+        socket,
         pair: config.pair.clone(),
         send,
         recv,
         offers: vec![None; TARGET_LINKS as usize],
         sessions,
     };
-    tasks.push(AbortOnDrop(tokio::spawn(actor.run(knock_rx, offer_rx))));
-    tasks.push(AbortOnDrop(tokio::spawn(listen(socket, peer_name(&config.pair.peer_id), knock_tx))));
+    tasks.push(AbortOnDrop(tokio::spawn(actor.run(knocks, offer_rx, guard))));
     Ok(tasks)
 }
 
-/// Порт знакомства: передаёт актору запросы с открытым именем ожидаемого клиента, остальное — мимо.
-async fn listen(socket: Arc<UdpSocket>, name: String, knocks: mpsc::Sender<Knock>) {
+/// Листенер порта знакомства: команды регистрации и раздача запросов по открытому имени.
+async fn listen(socket: Arc<UdpSocket>, mut commands: mpsc::Receiver<Command>) {
+    let mut clients: HashMap<String, (Uuid, mpsc::Sender<Knock>)> = HashMap::new();
     let mut buf = [0u8; 1500];
     loop {
-        let Ok((n, from)) = socket.recv_from(&mut buf).await else { continue };
-        if n <= NAME_LEN || buf[..NAME_LEN] != *name.as_bytes() {
-            continue;
+        tokio::select! {
+            received = socket.recv_from(&mut buf) => {
+                let Ok((n, from)) = received else { continue };
+                if n <= NAME_LEN {
+                    continue;
+                }
+                let Ok(name) = std::str::from_utf8(&buf[..NAME_LEN]) else { continue };
+                if let Some((_, knocks)) = clients.get(name) {
+                    let _ = knocks.try_send(Knock { packet: buf[NAME_LEN..n].to_vec(), from });
+                }
+            }
+            command = commands.recv() => match command {
+                Some(Command::Register { name, token, knocks }) => {
+                    clients.insert(name, (token, knocks));
+                }
+                Some(Command::Unregister { name, token }) => {
+                    if clients.get(&name).is_some_and(|(current, _)| *current == token) {
+                        clients.remove(&name);
+                    }
+                }
+                None => return,
+            }
         }
-        let _ = knocks.try_send(Knock { packet: buf[NAME_LEN..n].to_vec(), from });
     }
 }
 
@@ -229,7 +315,7 @@ struct ClientActor {
 }
 
 impl ClientActor {
-    async fn run(mut self, mut knocks: mpsc::Receiver<Knock>, mut updates: mpsc::Receiver<OfferUpdate>) {
+    async fn run(mut self, mut knocks: mpsc::Receiver<Knock>, mut updates: mpsc::Receiver<OfferUpdate>, _registration: Unregistration) {
         loop {
             tokio::select! {
                 Some(knock) = knocks.recv() => self.knock(knock).await,
@@ -558,8 +644,10 @@ mod tests {
     async fn listener_passes_only_the_expected_name() {
         let server = Arc::new(UdpSocket::bind(("127.0.0.1", 0)).await.unwrap());
         let addr = server.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel(8);
+        tokio::spawn(listen(server, commands_rx));
         let (knocks_tx, mut knocks) = mpsc::channel(8);
-        tokio::spawn(listen(server, "0a1b2c3d".into(), knocks_tx));
+        commands_tx.send(Command::Register { name: "0a1b2c3d".into(), token: Uuid::new_v4(), knocks: knocks_tx }).await.unwrap();
         let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         client.send_to(b"ffffffffpayload", addr).await.unwrap();
         client.send_to(b"0a1b2c3dpayload", addr).await.unwrap();

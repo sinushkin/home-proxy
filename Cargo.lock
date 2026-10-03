@@ -5375,6 +5375,7 @@ dependencies = [
  "hp-tun",
  "log",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

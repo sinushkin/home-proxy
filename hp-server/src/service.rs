@@ -33,6 +33,9 @@ pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 enum Origin {
     /// Из файла настроек: удалить можно только там.
     Settings,
+    /// Из файла клиентов, который следит за собой на ходу (`vps-server`, `clients.txt`): удаляется
+    /// вместе со строкой в файле.
+    File,
     /// Сопряжён через трей, хранится в `peers.state`.
     Paired,
     /// Ждёт первого подключения до этого момента (unix-время).
@@ -113,6 +116,11 @@ impl<D: PacketDevice> Service<D> {
     /// Пиры из настроек (с их способом встречи).
     pub async fn add_configured(&self, peer: Peer, discovery: Discovery) -> Result<()> {
         self.add(peer, discovery, Origin::Settings).await
+    }
+
+    /// Пир из файла клиентов, добавленный во время работы.
+    pub async fn add_from_file(&self, peer: Peer, discovery: Discovery) -> Result<()> {
+        self.add(peer, discovery, Origin::File).await
     }
 
     /// Сопряжённые раньше пиры из `peers.state` (нужен способ встречи для сопряжения).
@@ -271,7 +279,7 @@ impl<D: PacketDevice> Service<D> {
                         Origin::Pending(t) => t,
                         _ => 0,
                     },
-                    removable: e.origin != Origin::Settings,
+                    removable: !matches!(e.origin, Origin::Settings | Origin::File),
                     kind: "phone".into(),
                     reorder_wait_ms: status.reorder_wait_ms,
                     registered_addr: status.peer_registration.map(|r| r.addr.to_string()).unwrap_or_default(),

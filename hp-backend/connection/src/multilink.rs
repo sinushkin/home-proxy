@@ -403,7 +403,8 @@ pub enum Discovery {
     StunMqtt { stun_addrs: Vec<SocketAddr>, mqtt_addr: SocketAddr, mqtt_ca_pem: Vec<u8> },
     /// Сервер с белым IP: слушает порт знакомства, слоты занимают случайные порты из
     /// `ports`, пробив пассивный (ждём клиента).
-    VpsServer { public_ip: IpAddr, bootstrap_port: u16, ports: RangeInclusive<u16> },
+    /// `bootstrap` — общий порт знакомства процесса (`vps::Bootstrap`), один на всех клиентов.
+    VpsServer { public_ip: IpAddr, ports: RangeInclusive<u16>, bootstrap: vps::Bootstrap },
     /// Клиент VPS-сервера: знает `ip:порт знакомства`, ни STUN, ни MQTT не нужен.
     VpsClient { server: SocketAddr },
 }
@@ -558,8 +559,8 @@ impl MultiLink {
                 let started = p2p::start(&label, config, bases).await?;
                 (started.tasks, Some(started.hole_records), Some(started.registrar))
             }
-            Discovery::VpsServer { public_ip, bootstrap_port, ports } => {
-                let config = vps::ServerConfig { public_ip, bootstrap_port, ports, pair: vps_pair() };
+            Discovery::VpsServer { public_ip, ports, bootstrap } => {
+                let config = vps::ServerConfig { public_ip, ports, pair: vps_pair(), bootstrap };
                 (vps::start_server(&label, config, bases).await?, None, None)
             }
             Discovery::VpsClient { server } => {
@@ -1507,10 +1508,11 @@ mod tests {
     async fn vps_server_and_client_link_all_slots_and_move_a_slot() {
         let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
         let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bootstrap = vps::Bootstrap::bind(bootstrap_port).await.unwrap();
         let options = MultiLinkOptions::default();
         let (server, mut server_rx) = MultiLink::start_discovery(
             "",
-            Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap_port, ports: 47100..=47299 },
+            Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), ports: 47100..=47299, bootstrap: bootstrap.clone() },
             server_id,
             client_id,
             options,
@@ -1561,6 +1563,38 @@ mod tests {
         .await;
     }
 
+    /// Два клиента на одном порту знакомства (один `Bootstrap` на процесс, общий GUID сервера):
+    /// оба поднимают по 10 дыр, а остановка одного не трогает другого и освобождает его имя.
+    #[tokio::test]
+    async fn vps_server_serves_two_clients_on_one_port() {
+        let server_id = Uuid::new_v4();
+        let (client_a, client_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bootstrap = vps::Bootstrap::bind(bootstrap_port).await.unwrap();
+        let server_discovery = || Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), ports: 47700..=47899, bootstrap: bootstrap.clone() };
+        let client_discovery = || Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)) };
+        let options = MultiLinkOptions::default();
+
+        let (server_a, _rx_a) = MultiLink::start_discovery("", server_discovery(), server_id, client_a, options).await.unwrap();
+        let (server_b, _rx_b) = MultiLink::start_discovery("", server_discovery(), server_id, client_b, options).await.unwrap();
+        let (peer_a, _peer_a_rx) = MultiLink::start_discovery("", client_discovery(), client_a, server_id, options).await.unwrap();
+        let (peer_b, _peer_b_rx) = MultiLink::start_discovery("", client_discovery(), client_b, server_id, options).await.unwrap();
+        wait_until("оба клиента: по 10 дыр", 40, || {
+            server_a.live_count() == 10 && server_b.live_count() == 10 && peer_a.live_count() == 10 && peer_b.live_count() == 10
+        })
+        .await;
+
+        // Остановили клиента B: его наборы дыр уходят, клиент A продолжает работать.
+        drop(peer_b);
+        drop(server_b);
+        wait_until("A остался с 10 дырами", 20, || server_a.live_count() == 10 && peer_a.live_count() == 10).await;
+
+        // Клиент B вернулся: его имя снова занято только им, знакомство проходит.
+        let (server_b, _rx_b) = MultiLink::start_discovery("", server_discovery(), server_id, client_b, options).await.unwrap();
+        let (peer_b, _peer_b_rx) = MultiLink::start_discovery("", client_discovery(), client_b, server_id, options).await.unwrap();
+        wait_until("B снова с 10 дырами", 40, || server_b.live_count() == 10 && peer_b.live_count() == 10).await;
+    }
+
     /// Клиент пропал (процесс убит) и пришёл снова с новыми сессиями, а сервер своих дыр ещё не
     /// потерял: сервер обязан отвечать на порту знакомства и принять нового клиента сразу, а не
     /// после тайм-аутов (раньше на этом сервер замолкал навсегда).
@@ -1568,7 +1602,8 @@ mod tests {
     async fn vps_server_accepts_a_restarted_client_at_once() {
         let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
         let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let server_discovery = || Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap_port, ports: 47300..=47499 };
+        let bootstrap = vps::Bootstrap::bind(bootstrap_port).await.unwrap();
+        let server_discovery = || Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), ports: 47300..=47499, bootstrap: bootstrap.clone() };
         let client_discovery = || Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)) };
         let options = MultiLinkOptions::default();
         let (server, _server_rx) = MultiLink::start_discovery("", server_discovery(), server_id, client_id, options).await.unwrap();
@@ -1595,10 +1630,11 @@ mod tests {
     async fn stats_pipeline_records_a_delivered_packet_end_to_end() {
         let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
         let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bootstrap = vps::Bootstrap::bind(bootstrap_port).await.unwrap();
         let options = MultiLinkOptions::default();
         let (server, _server_rx) = MultiLink::start_discovery(
             "",
-            Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap_port, ports: 47600..=47799 },
+            Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), ports: 47600..=47799, bootstrap: bootstrap.clone() },
             server_id,
             client_id,
             options,
