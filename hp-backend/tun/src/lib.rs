@@ -59,6 +59,7 @@ mod tests {
 pub mod bridge;
 pub mod device;
 pub mod hub;
+pub mod routes;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp;

@@ -54,7 +54,7 @@ use hp_server::Peer;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-mod routes;
+use hp_tun::routes;
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 /// Как часто сверять маршруты и аплинк (`routes.rs`).
@@ -160,24 +160,10 @@ async fn shutdown(routes: Option<&mut routes::Routes>, hooks: &routes::Hooks, re
     result
 }
 
-/// Переменные окружения хуков (описание — `routes::Hooks::env`).
-fn hook_env(config: &Config, tun: &str, assigned: &hp_tun::bridge::Assigned, routes: Option<&routes::Routes>) -> Vec<(&'static str, String)> {
-    let join = |ips: &[Ipv4Addr]| ips.iter().map(Ipv4Addr::to_string).collect::<Vec<_>>().join(" ");
-    let mut env = vec![
-        ("TUN_DEV", tun.to_string()),
-        ("TUN_ADDR", assigned.address.to_string()),
-        ("TUN_PREFIX", assigned.prefix.to_string()),
-        ("TUN_DNS", join(&assigned.dns)),
-        ("VPS_IP", config.vps_server.ip().to_string()),
-        ("BYPASS", join(&bypass_hosts(config))),
-        ("ROUTES", if routes.is_some() { "auto" } else { "off" }.to_string()),
-    ];
-    if let Some(up) = routes.map(|r| &r.uplink) {
-        env.push(("UPLINK_DEV", up.dev.clone()));
-        env.push(("UPLINK_GW", up.gateway.map(|g| g.to_string()).unwrap_or_default()));
-        env.push(("UPLINK_IFINDEX", up.ifindex.to_string()));
-    }
-    env
+/// Переменные окружения хуков (описание — `hp_tun::routes::hook_env`).
+fn hook_env_for(config: &Config, tun: &str, assigned: &hp_tun::bridge::Assigned, routes: Option<&routes::Routes>) -> Vec<(&'static str, String)> {
+    let std::net::IpAddr::V4(vps_ip) = config.vps_server.ip() else { return Vec::new() };
+    routes::hook_env(tun, (assigned.address, assigned.prefix), &assigned.dns, vps_ip, &bypass_hosts(config), routes)
 }
 
 /// Адреса, которые идут мимо туннеля: VPS, STUN, MQTT (IPv4).
@@ -594,7 +580,7 @@ async fn run(config: Config) -> Result<()> {
     if let Some(routes) = &mut routes {
         routes.tunnel_up().await?;
     }
-    let hooks = routes::Hooks { up: config.on_tun_up.clone(), down: config.on_tun_down.clone(), env: hook_env(&config, tun.name(), &assigned, routes.as_ref()) };
+    let hooks = routes::Hooks { up: config.on_tun_up.clone(), down: config.on_tun_down.clone(), env: hook_env_for(&config, tun.name(), &assigned, routes.as_ref()) };
     let _refresh = AbortOnDrop(hp_tun::bridge::spawn_address_refresh(vps.clone(), AddressKind::Host, None));
     let (to_phones_tx, to_phones_rx) = mpsc::channel::<Incoming>(256);
     let bridge = hp_tun::bridge::Bridge::start_relay(tun, vps.clone(), vps_rx, to_phones_tx);

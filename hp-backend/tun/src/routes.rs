@@ -1,5 +1,5 @@
-//! Маршруты роутера (`ROUTES=auto`, по умолчанию): весь трафик — в туннель, кроме того, на чём
-//! туннель держится.
+//! Маршруты клиента туннеля (`ROUTES=auto`, по умолчанию): весь трафик — в туннель, кроме того, на
+//! чём туннель держится. Общий модуль `hp-router` и `vps-client`.
 //!
 //! - `0.0.0.0/1` и `128.0.0.0/1` в TUN перекрывают маршрут по умолчанию аплинка, но не заменяют
 //!   его: default от netifd (DHCP) остаётся на месте, а когда служба останавливается и TUN
@@ -169,6 +169,36 @@ pub struct Hooks {
     /// - `ROUTES` — `auto` или `off`; при `auto` ещё `UPLINK_DEV`, `UPLINK_GW` (пусто — без
     ///   шлюза), `UPLINK_IFINDEX` — аплинк, через который идут дыры.
     pub env: Vec<(&'static str, String)>,
+}
+
+/// Переменные хуков туннеля — общие для `vps-client` и `hp-router`: адрес и DNS из туннеля,
+/// адрес VPS, адреса мимо туннеля и (если маршруты ведём) аплинк. `DNS` — через запятую, `TUN_DNS` —
+/// через пробел (для скриптов, которым удобнее список).
+pub fn hook_env(
+    tun: &str,
+    address: (Ipv4Addr, u8),
+    dns: &[Ipv4Addr],
+    vps_ip: Ipv4Addr,
+    bypass: &[Ipv4Addr],
+    routes: Option<&Routes>,
+) -> Vec<(&'static str, String)> {
+    let list = |ips: &[Ipv4Addr], sep: &str| ips.iter().map(Ipv4Addr::to_string).collect::<Vec<_>>().join(sep);
+    let mut env = vec![
+        ("DNS", list(dns, ",")),
+        ("TUN_DNS", list(dns, " ")),
+        ("TUN_DEV", tun.to_string()),
+        ("TUN_ADDR", address.0.to_string()),
+        ("TUN_PREFIX", address.1.to_string()),
+        ("VPS_IP", vps_ip.to_string()),
+        ("BYPASS", list(bypass, " ")),
+        ("ROUTES", if routes.is_some() { "auto" } else { "off" }.to_string()),
+    ];
+    if let Some(up) = routes.map(|r| &r.uplink) {
+        env.push(("UPLINK_DEV", up.dev.clone()));
+        env.push(("UPLINK_GW", up.gateway.map(|g| g.to_string()).unwrap_or_default()));
+        env.push(("UPLINK_IFINDEX", up.ifindex.to_string()));
+    }
+    env
 }
 
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);

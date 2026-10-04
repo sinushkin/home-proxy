@@ -11,7 +11,7 @@
 #   SERVER_PORT       порт знакомства на сервере (40600)
 #   SERVER_SLOTS      диапазон портов слотов на сервере (40601-40699)
 #   SERVER_TUN        имя TUN на сервере (hp-vps), адрес 10.94.0.1/24
-#   CLIENT_TUN        имя TUN на роутере (hpvps)
+#   CLIENT_TUN        имя TUN на роутере (hp0)
 #
 # GUID хранятся в setup/state/ (в .gitignore, права 600). Повторный запуск их переиспользует.
 set -euo pipefail
@@ -24,7 +24,7 @@ SERVER_PORT="${SERVER_PORT:-40600}"
 SERVER_SLOTS="${SERVER_SLOTS:-40601-40699}"
 SERVER_TUN="${SERVER_TUN:-hp-vps}"
 SERVER_ADDR="10.94.0.1/24"
-CLIENT_TUN="${CLIENT_TUN:-hpvps}"
+CLIENT_TUN="${CLIENT_TUN:-hp0}"
 TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$HOME/owrt/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl}"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR)
@@ -155,7 +155,8 @@ EOF
 
 ssh_rtr "cat > /etc/init.d/vps-client.new && chmod 755 /etc/init.d/vps-client.new && mv /etc/init.d/vps-client.new /etc/init.d/vps-client" <<'EOF'
 #!/bin/sh /etc/rc.common
-# vps-client (home-proxy): клиент VPS-сервера с белым IP. Настройки — /etc/vps-client/vps-client.conf
+# vps-client (home-proxy): клиент VPS-сервера с белым IP. Настройки — /etc/vps-client/vps-client.conf.
+# Маршруты туннеля ставит сам vps-client; DNS — хук /etc/vps-client/on-tun-up.sh (см. hp_tun::routes).
 START=96
 STOP=10
 USE_PROCD=1
@@ -168,7 +169,7 @@ start_service() {
 	. "$CONF"
 	procd_open_instance
 	procd_set_param command "$PROG" "$VPS_SERVER" "$VPS_MY_ID" "$VPS_PEER_ID"
-	procd_set_param env TUN_NAME="$TUN_NAME" RUST_LOG="$RUST_LOG"
+	procd_set_param env TUN_NAME="$TUN_NAME" RUST_LOG="$RUST_LOG" ON_TUN_UP=/etc/vps-client/on-tun-up.sh ON_TUN_DOWN=/etc/vps-client/on-tun-down.sh
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -177,7 +178,11 @@ start_service() {
 EOF
 # TUN клиента — в зону firewall wan: иначе трафик от сервера до роутера отбивается (reject).
 ssh_rtr "zone=\$(uci show firewall | sed -n \"s/^firewall\\.\\(@zone\\[[0-9]*\\]\\)\\.name='wan'\$/\\1/p\"); [ -n \"\$zone\" ] || { echo 'нет зоны wan' >&2; exit 1; }; if uci show firewall | grep -q \"'$CLIENT_TUN'\"; then echo 'зона wan: $CLIENT_TUN уже есть'; else uci add_list firewall.\$zone.device=$CLIENT_TUN && uci commit firewall && /etc/init.d/firewall reload && echo 'зона wan: добавлен $CLIENT_TUN'; fi" || die "не удалось добавить $CLIENT_TUN в зону wan роутера"
+ssh_rtr "nft list table inet fw4 | grep -q '\"$CLIENT_TUN\"'" || die "$CLIENT_TUN нет в правилах fw4: пересылка из LAN в туннель не заработает (проверьте зону wan и firewall reload)"
 
+for hook in on-tun-up.sh on-tun-down.sh; do
+  ssh_rtr "cat > /etc/vps-client/$hook.new && chmod 755 /etc/vps-client/$hook.new && mv /etc/vps-client/$hook.new /etc/vps-client/$hook" < "$ROOT/setup/vps-client-hooks/$hook"
+done
 ssh_rtr '/etc/init.d/vps-client enable && /etc/init.d/vps-client restart'
 echo "служба vps-client: включена (автозапуск), перезапущена"
 
@@ -197,6 +202,19 @@ fi
 ssh_srv 'journalctl -u hp-vps-server --no-pager -n 40 | grep -o "дыры [^,]*" | tail -n 1' || true
 
 # ---------------------------------------------------------------- фаервол: только проверка
+step "Маршруты туннеля на роутере"
+route_line=""
+for _ in $(seq 1 12); do
+  route_line="$(ssh_rtr "ip route show 0.0.0.0/1 | head -1" 2>/dev/null || true)"
+  [[ "$route_line" == *"dev $CLIENT_TUN"* ]] && break
+  sleep 5
+done
+if [[ "$route_line" == *"dev $CLIENT_TUN"* ]]; then
+  echo "весь трафик в $CLIENT_TUN (0.0.0.0/1): default аплинка не тронут"
+else
+  warn "0.0.0.0/1 не ушёл в $CLIENT_TUN (сейчас: ${route_line:-пусто}). Проверьте logread | grep vps-client."
+fi
+
 step "Фаервол сервера (скрипт его не меняет)"
 if ! ssh_srv "ufw status 2>/dev/null | grep -qE '40000:40999/udp|$SERVER_PORT/udp'"; then
   warn "на сервере, похоже, не открыт UDP $SERVER_PORT и $SERVER_SLOTS (ufw). Откройте вручную, например:
