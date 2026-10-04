@@ -18,4 +18,7 @@ elif command -v resolvectl >/dev/null 2>&1; then
 else
 	echo "on-tun-up: окружение без uci и resolvectl, DNS не настроен" >&2
 fi
+# Обвязка openwrt-k-router (если установлена): UDP напрямую, затем раздельное туннелирование.
+[ -x /etc/vps-client/udp-direct/up.sh ] && /etc/vps-client/udp-direct/up.sh
+[ -x /etc/vps-client/direct/up.sh ] && /etc/vps-client/direct/up.sh
 exit 0
