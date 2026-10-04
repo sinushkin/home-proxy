@@ -9,8 +9,9 @@ LAN_IF="${LAN_IF:-br-lan}"
 LIST="${DIRECT_LIST:-/etc/vps-client/direct-list.txt}"
 [ -f "$LIST" ] || { echo "direct: нет $LIST" >&2; exit 1; }
 
-ips="$(grep -vE '^#|^[[:space:]]*$|/' "$LIST" | paste -sd, -)"
-nets="$(grep -vE '^#|^[[:space:]]*$' "$LIST" | grep '/' | paste -sd, -)"
+# busybox без paste: строки в список через запятую (tr), хвостовую запятую убираем (sed)
+ips="$(grep -vE '^#|^[[:space:]]*$|/' "$LIST" | tr '\n' ',' | sed 's/,$//')"
+nets="$(grep -vE '^#|^[[:space:]]*$' "$LIST" | grep '/' | tr '\n' ',' | sed 's/,$//')"
 
 ips_block=""; [ -n "$ips" ] && ips_block="elements = { $ips }"
 nets_block=""; [ -n "$nets" ] && nets_block="elements = { $nets }"
