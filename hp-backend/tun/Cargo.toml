@@ -11,3 +11,6 @@ anyhow = { workspace = true }
 log = { workspace = true }
 connection = { path = "../connection" }
 uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+wintun = { workspace = true }

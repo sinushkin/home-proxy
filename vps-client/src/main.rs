@@ -9,7 +9,8 @@
 //! `DATA_HOLES` (0 — данные через все живые дыры), `ROUTES` (`auto` — маршруты туннеля; `off` —
 //! не трогать маршруты), `ON_TUN_UP` / `ON_TUN_DOWN` (скрипты хуков, по умолчанию
 //! `/etc/vps-client/on-tun-up.sh` и `on-tun-down.sh`, если файлов нет — ничего не делается),
-//! `RUNTIME=multi`, `RUST_LOG`, `LOG_TARGET=syslog` (OpenWrt). Нужны права root.
+//! `RUNTIME=multi`, `RUST_LOG`, `LOG_TARGET=syslog` (OpenWrt). Нужны права root (Windows — администратор
+//! и `wintun.dll`, см. README; хуки по умолчанию — `HookLauncher::default_scripts`).
 //!
 //! Переменные хуков — см. `hp_tun::routes::Hooks`; дополнительно `DNS` — адреса DNS от сервера
 //! через запятую (`8.8.8.8,77.8.8.8`).
@@ -22,6 +23,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use connection::multilink::{Discovery, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
 use connection::proto::AddressKind;
+use hp_tun::platform::{HookLauncher, NativeHooks, NativeShutdown, NativeTun};
 use hp_tun::routes::{hook_env, Hooks, Routes};
 use uuid::Uuid;
 
@@ -75,7 +77,7 @@ async fn run() -> Result<()> {
         mtu: Some(env_number("TUN_MTU", 1400u16)?),
         up: true,
     };
-    let tun = hp_tun::Tun::create(&config).context("создание TUN (нужны права root)")?;
+    let tun = NativeTun::create(&config).context("создание TUN (нужны права root)")?;
     let tun_name = tun.name().to_string();
     log::info!("vps-client: сервер {server}, TUN {tun_name} {}/{}", assigned.address, assigned.prefix);
 
@@ -88,9 +90,11 @@ async fn run() -> Result<()> {
     if let Some(routes) = routes.as_mut() {
         routes.tunnel_up().await?;
     }
+    let (default_up, default_down) = NativeHooks::default_scripts();
+    let (default_up, default_down) = (default_up.to_string_lossy().into_owned(), default_down.to_string_lossy().into_owned());
     let hooks = Hooks {
-        up: env_path("ON_TUN_UP", "/etc/vps-client/on-tun-up.sh"),
-        down: env_path("ON_TUN_DOWN", "/etc/vps-client/on-tun-down.sh"),
+        up: env_path("ON_TUN_UP", &default_up),
+        down: env_path("ON_TUN_DOWN", &default_down),
         env: hook_env(&tun_name, (assigned.address, assigned.prefix), &assigned.dns, server_v4, &[server_v4], routes.as_ref()),
     };
     hooks.up().await;
@@ -100,7 +104,7 @@ async fn run() -> Result<()> {
     let mut last = None;
     let mut status = tokio::time::interval(STATUS_INTERVAL);
     let mut check = tokio::time::interval(ROUTES_CHECK);
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut shutdown = NativeShutdown::new()?;
     loop {
         tokio::select! {
             _ = status.tick() => {
@@ -117,8 +121,8 @@ async fn run() -> Result<()> {
                     routes.check().await?;
                 }
             }
-            _ = term.recv() => {
-                log::info!("vps-client: остановка, снимаю маршруты");
+            signal = shutdown.wait() => {
+                log::info!("vps-client: остановка ({signal}), снимаю маршруты");
                 if let Some(routes) = routes.as_mut() {
                     routes.tunnel_down().await;
                 }

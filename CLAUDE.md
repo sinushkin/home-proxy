@@ -194,7 +194,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   - `android-lib/` — крейт `homeproxy-android`: JNI-обёртка над `hp-client`
     (`libhomeproxy.so`, `Java_ru_homeproxy_HomeProxy_*`); собирается под NDK
     скриптом `android-vpn/build-native.sh`.
-  - `tun/` — крейт `hp-tun`: свой TUN (`libc` + `AsyncFd`, без сторонних tun-крейтов): `Tun::create`
+  - `tun/` — крейт `hp-tun` (всё ОС-зависимое — в `src/platform/`: трейты `TunDevice`, `RouteBackend`, `HookLauncher`, `NativeShutdown`; реализации по `cfg`: `linux/` (ioctl, `ip`, `sh`) и `windows/` (Wintun, PowerShell; `vps-client` на Windows — `vps-client/README.md`); политика маршрутов, `Hooks` и `hook_env` общие в `routes.rs`): свой TUN (`libc` + `AsyncFd`, без сторонних tun-крейтов): `Tun::create`
     (Linux, OpenWrt — нужен `kmod-tun`, WSL2), `Tun::from_fd` (Android `VpnService`), `packet` —
     разбор IPv4/IPv6 (протокол, порты, `flow_hash`). Кроссплатформенно: `device::PacketDevice`
     (TUN или канал в памяти `channel_pair()`), `bridge::Bridge` (клиент: запрос адреса и DNS),
@@ -273,6 +273,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   /etc/hp-router/router.env --connection-string|--new-connection-string`, права — ACL rpcd),
   плюс `/etc/init.d/hp-router` (procd; бинарник `/usr/bin`, настройки `/etc/hp-router`).
   Полные GUID — секрет пары: в статус и в логи идут только имена (`peer_name`). `control/README.md`.
+- `setup/win/` — `.bat`-аналоги `setup/*.sh` для Windows: `vps-server.bat` (Linux-сервер по ssh, GUID уже работающего сервера не меняет), `vps-client.bat` (этот ПК как клиент: задача планировщика, Wintun, хуки `.ps1`), `vps-client-remove.bat`, `vps-prepare.bat` (через bash из Git for Windows), `DRY_RUN=1`; `.bat` только ASCII, CRLF (`.gitattributes`). `setup/win/README.md`.
 - `wsl/` — образ для WSL2 (Alpine + `iptables` + статический `hp-server`): `Dockerfile`,
   `build.sh` (→ `wsl/out/homeproxy-wsl.tar.gz`, в git нет), `rootfs/` (`wsl.conf` с `[boot] command`,
   `homeproxy-start` — пересылка, `MASQUERADE` подсети туннеля, запуск службы в цикле;
@@ -425,8 +426,8 @@ NAT/провайдерами.
   (`MODE=netstack`) проверен здесь с эмулятором телефона и с полным туннелем OpenVPN (`BIND_ADDR`).
   Процесс, запущенный из ssh, умирает вместе с сессией — долгие прогоны через WMI
   (`Win32_Process.Create`). Скрипты для PowerShell через ssh запускаем как `-File`
-  (stdin-режим ломает многострочные блоки). На ней постоянно стоит полный туннель OpenVPN до
-  `profit` с обфускацией equalizer (как у `test`, см. ниже).
+  (stdin-режим ломает многострочные блоки). OpenVPN и WireGuard с неё удалены (2026-10-08) —
+  выход напрямую; `vps-client.exe` проверен здесь с Wintun (`wintun.dll` в `C:\Users\user\`).
 - `jump1` (SSH-алиас через `note`; Xiaomi 4C, OpenWrt 23.05) — **тестовый стенд** `hp-router`, не
   домашний шлюз. Аплинк — Wi-Fi-клиент `phy0-sta1` к `jump` (192.168.17.1, OpenWrt, точка доступа
   WRT-104, за ней провайдер). `hp-router` во флеше: `/usr/bin/hp-router`, настройки
@@ -440,11 +441,11 @@ NAT/провайдерами.
   (ПК со стороны его WAN): трей — через `ssh -N -L 47001:192.168.1.1:47001 jump1` и строку с
   `127.0.0.1:47001`.
 - `test` (SSH-алиас, libvirt-ВМ на этом ПК, Debian 13, `sudo` без пароля) — Linux-машина для
-  проверок с VPN на ПК. На `test` и `win` постоянно стоит полный туннель OpenVPN до `profit` через
+  проверок с VPN на ПК. На `test` постоянно стоит полный туннель OpenVPN до `profit` через
   обфускацию equalizer (`server-rs` на `profit`, порты 51410–51419; голый OpenVPN из домашней
   сети ТСПУ режет после рукопожатия, `1194/udp` на `profit` закрыт). Установщики, клиент и
   сборка комплектов — в отдельном проекте equalizer2 (`installer/README.md`): на машине лежат
-  `~/hptest-linux` и `C:\Users\user\hpwin-windows` с `install`/`uninstall`. SSH из LAN при
+  `~/hptest-linux` с `install`/`uninstall`. SSH из LAN при
   включённом VPN работает.
 - Тестовые прогоны — только со свежими одноразовыми GUID
   (`cat /proc/sys/kernel/random/uuid`): `exchange()` публикует retained-запись

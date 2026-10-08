@@ -153,6 +153,16 @@ impl Tun {
     }
 }
 
+impl crate::platform::TunDevice for Tun {
+    fn create(config: &TunConfig) -> io::Result<Self> {
+        Tun::create(config)
+    }
+
+    fn name(&self) -> &str {
+        Tun::name(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

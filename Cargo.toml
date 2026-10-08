@@ -56,3 +56,5 @@ slint-build = "1.18"
 qrcode = { version = "0.14", default-features = false }
 ksni = "0.3"
 tray-icon = { version = "0.25", default-features = false }
+# TUN на Windows (hp-tun): обёртка над wintun.dll, подгружается в рантайме (рядом с .exe).
+wintun = "0.5"

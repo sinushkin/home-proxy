@@ -152,7 +152,7 @@ impl Config {
 
 /// Туннель снимается: маршруты /1 (`ROUTES=auto`), затем `on-tun-down.sh`; `result` — с чем
 /// выйти (ошибка — procd перезапустит службу).
-async fn shutdown(routes: Option<&mut routes::Routes>, hooks: &routes::Hooks, result: Result<()>) -> Result<()> {
+async fn shutdown_tunnel(routes: Option<&mut routes::Routes>, hooks: &routes::Hooks, result: Result<()>) -> Result<()> {
     if let Some(routes) = routes {
         routes.tunnel_down().await;
     }
@@ -622,17 +622,13 @@ async fn run(config: Config) -> Result<()> {
     let mut last_routes = Instant::now();
     let mut last = None;
     // procd останавливает службу SIGTERM: сначала снимаем туннель и зовём on-tun-down.sh.
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut shutdown = hp_tun::platform::NativeShutdown::new()?;
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = terminate.recv() => {
-                log::info!("hp-router: остановка (SIGTERM)");
-                return shutdown(routes.as_mut(), &hooks, Ok(())).await;
-            }
-            _ = tokio::signal::ctrl_c() => {
-                log::info!("hp-router: остановка (SIGINT)");
-                return shutdown(routes.as_mut(), &hooks, Ok(())).await;
+            signal = shutdown.wait() => {
+                log::info!("hp-router: остановка ({signal})");
+                return shutdown_tunnel(routes.as_mut(), &hooks, Ok(())).await;
             }
         }
         router.housekeeping();
@@ -641,7 +637,7 @@ async fn run(config: Config) -> Result<()> {
         {
             last_routes = Instant::now();
             if let Err(e) = routes.check().await {
-                return shutdown(Some(routes), &hooks, Err(e)).await;
+                return shutdown_tunnel(Some(routes), &hooks, Err(e)).await;
             }
         }
         if last_log.elapsed() < STATUS_INTERVAL {

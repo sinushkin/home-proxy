@@ -5,7 +5,7 @@
 //! TUN создаёт система (`VpnService`), нам нужен только готовый дескриптор. Так нет лишних
 //! зависимостей, которые пришлось бы проверять на MIPS32 (роутеры): 64-битных атомиков здесь нет.
 //!
-//! - [`Tun::create`] — Linux (в т.ч. OpenWrt, WSL2): создаёт интерфейс, при желании задаёт адрес
+//! - [`Tun::create`] (`platform::TunDevice`) — Linux (в т.ч. OpenWrt, WSL2): создаёт интерфейс, при желании задаёт адрес
 //!   IPv4, MTU и поднимает его. Нужны права `CAP_NET_ADMIN` (root) и `/dev/net/tun` (на OpenWrt —
 //!   модуль `kmod-tun`).
 //! - [`Tun::from_fd`] — Android (и Linux): дескриптор от `VpnService.Builder.establish()`.
@@ -59,10 +59,12 @@ mod tests {
 pub mod bridge;
 pub mod device;
 pub mod hub;
+
+// Системная часть (TUN, маршруты, хуки, сигнал остановки) — по платформам, см. `platform`.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+pub mod platform;
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub mod routes;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod imp;
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use imp::Tun;
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+pub use platform::NativeTun as Tun;
