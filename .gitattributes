@@ -1,0 +1,4 @@
+# Скрипты оболочек: LF для Linux/busybox/Git Bash (CRLF ломает "sh"), CRLF для cmd.
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
