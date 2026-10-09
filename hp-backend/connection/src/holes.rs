@@ -67,6 +67,10 @@ pub struct PoolPolicy {
     /// независимо от сравнения с другими (тот же порог, что `multilink::link_is_bad`: доставлено
     /// меньше половины).
     pub bad_loss: f32,
+    /// Порог плановой чистки: когда дыр больше минимума, худшая по потерям уходит, только если её
+    /// потери выше этого (без порога любая случайная потеря одного пакета гоняла бы набор по кругу
+    /// и держала его у минимума).
+    pub cull_loss: f32,
     /// Новую дыру не сравниваем по потерям первые `grace` — ещё не накопила выборку/не остыла от
     /// всплеска на старте.
     pub grace: Duration,
@@ -79,6 +83,7 @@ impl Default for PoolPolicy {
             max_total: 10,
             add_interval: Duration::from_secs(10),
             bad_loss: 0.5,
+            cull_loss: 0.03,
             grace: Duration::from_secs(10),
         }
     }
@@ -157,16 +162,16 @@ pub fn plan(holes: &[HoleInfo], since_last_open: Duration, policy: &PoolPolicy) 
         return vec![Action::Open];
     }
 
-    // 4. Дыр больше минимума — можно позволить себе почистить худшую по потерям (при равных —
-    // самую старую), пусть даже она не просрочена и не однозначно плохая: лучше заменить на
-    // свежую, чем годами держать чуть худшую дыру. Только если это не уронит набор ниже минимума.
+    // 4. Дыр больше минимума — можно почистить худшую по потерям (при равных — самую старую), пусть
+    // даже она не просрочена и не однозначно плохая, но только если потери заметные (выше
+    // `cull_loss`). Только если это не уронит набор в работе ниже минимума.
     if active_count > policy.min_active {
         let candidate = holes
             .iter()
             .filter(|h| h.state == HoleState::Active && h.age >= policy.grace)
             .max_by(|a, b| worst_loss(a).total_cmp(&worst_loss(b)).then(a.age.cmp(&b.age)));
         if let Some(worst) = candidate
-            && worst_loss(worst) > 0.0 {
+            && worst_loss(worst) > policy.cull_loss {
                 return vec![Action::Retire(worst.id)];
             }
     }
@@ -316,5 +321,15 @@ mod tests {
         // Замена прогрелась — теперь можно.
         holes[4].state = HoleState::Active;
         assert_eq!(plan(&holes, Duration::ZERO, &PoolPolicy::default()), vec![Action::Retire(0)]);
+    }
+
+    #[test]
+    fn small_losses_do_not_cull_a_hole_but_noticeable_ones_do() {
+        let policy = PoolPolicy::default();
+        let mut holes: Vec<HoleInfo> = (0..6).map(|i| active(i, 30)).collect();
+        holes[3].loss_in = Some(0.02); // случайная потеря: ниже порога чистки
+        assert_eq!(plan(&holes, Duration::ZERO, &policy), Vec::new(), "потери 2% — не повод менять дыру");
+        holes[3].loss_in = Some(0.05);
+        assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![Action::Retire(3)], "потери 5% — меняем");
     }
 }
