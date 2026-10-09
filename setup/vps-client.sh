@@ -3,7 +3,7 @@
 #   mips    — роутер OpenWrt (mipsel, soft-float): /usr/bin/vps-client, procd-служба, зона firewall wan;
 #   x86_64  — Debian/Ubuntu с systemd: /usr/local/bin/vps-client, служба hp-vps-client (нужен sudo).
 # Оба варианта: GUID клиента (setup/state), строка в clients.txt сервера (сервер подхватит за ~2 с
-# без перезапуска), хуки DNS по окружению (setup/vps-client-hooks), проверка дыр и маршрутов.
+# без перезапуска), хуки DNS по окружению (setup/vps-client-hooks), проверка дыр (не меньше 4 в работе) и маршрутов.
 # Сервер должен быть уже настроен: setup/vps-server.sh <сервер>.
 #
 #   setup/vps-client.sh <ssh-алиас клиента> [ssh-алиас сервера]     (сервер по умолчанию — ihor)
@@ -39,6 +39,9 @@ step "Сервер $SRV: клиент в clients.txt"
 ssh_to "$SRV" "touch /opt/hp-vps/clients.txt && chmod 600 /opt/hp-vps/clients.txt && (grep -qx '$CLIENT_GUID' /opt/hp-vps/clients.txt || echo '$CLIENT_GUID' >> /opt/hp-vps/clients.txt)" \
   || die "не удалось записать клиента в /opt/hp-vps/clients.txt на $SRV (сервер настроен? setup/vps-server.sh $SRV)"
 echo "строка есть в clients.txt; сервер перечитает файл за ~2 с, перезапуск не нужен"
+
+# Набор дыр динамический (4..10, дыры стареют и заменяются): «поднялся» — в работе не меньше 4.
+holes_ok() { [[ "$1" =~ дыры\ ([0-9]+)/ ]] && (( BASH_REMATCH[1] >= 4 )); }
 
 # Конфиг клиента (одинаковый для обоих вариантов): shell-совместимый key=value.
 CONF_TEXT="VPS_SERVER=$SERVER_IP:$SERVER_PORT
@@ -112,9 +115,9 @@ INIT
   for _ in $(seq 1 18); do
     sleep 5
     holes="$(ssh_to "$CLI" 'logread | grep "дыры" | tail -n 1' 2>/dev/null || true)"
-    [[ "$holes" == *"дыры 10/10"* ]] && break
+    holes_ok "$holes" && break
   done
-  if [[ "$holes" == *"дыры 10/10"* ]]; then echo "$CLI: 10/10 дыр"; else warn "$CLI: 10/10 дыр не набрано. Последняя строка: ${holes:-нет логов}"; fi
+  if holes_ok "$holes"; then echo "$CLI: ${holes#*дыры }"; else warn "$CLI: набор дыр не поднялся (нужно не меньше 4). Последняя строка: ${holes:-нет логов}"; fi
   local route=""
   for _ in $(seq 1 12); do
     route="$(ssh_to "$CLI" "ip route show 0.0.0.0/1 | head -1" 2>/dev/null || true)"
@@ -166,9 +169,9 @@ UNIT
   for _ in $(seq 1 18); do
     sleep 5
     holes="$(ssh_to "$CLI" "$sudo_cmd journalctl -u hp-vps-client --no-pager -n 20 | grep -o 'дыры [0-9/]*' | tail -n 1" 2>/dev/null || true)"
-    [[ "$holes" == *"10/10"* ]] && break
+    holes_ok "$holes" && break
   done
-  if [[ "$holes" == *"10/10"* ]]; then echo "$CLI: 10/10 дыр"; else warn "$CLI: 10/10 дыр не набрано. Последняя строка: ${holes:-нет логов}"; fi
+  if holes_ok "$holes"; then echo "$CLI: $holes"; else warn "$CLI: набор дыр не поднялся (нужно не меньше 4). Последняя строка: ${holes:-нет логов}"; fi
   warn "маршруты туннеля перехватывают весь трафик клиента (кроме адреса сервера). Управление $CLI по сети, отличной от его аплинка, может оборваться — см. PLAN, раздел TODO."
 }
 

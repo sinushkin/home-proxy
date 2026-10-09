@@ -76,6 +76,9 @@ pub struct PeerSession {
     pub addr: SocketAddr,
     /// Другие внешние адреса того же сокета (их видели другие STUN-серверы).
     pub extra: Vec<SocketAddr>,
+    /// Когда пир зарегистрировал запись (мс Unix; `0` — не указано). В VPS-режиме клиент указывает
+    /// здесь время запуска процесса: по росту значения сервер узнаёт о перезапуске клиента.
+    pub registered_at_unix_ms: u64,
 }
 
 impl PeerSession {
@@ -317,6 +320,7 @@ pub fn peer_session_from(r: &Rendezvous, pair: &PairSecret, peer_id: Uuid) -> Re
                 Some(SocketAddr::new(e.ip.parse().ok()?, port))
             })
             .collect(),
+        registered_at_unix_ms: r.registered_at_unix_ms,
     })
 }
 
@@ -390,7 +394,7 @@ mod tests {
         let got = decode_peer_session(&record.encode_to_vec(), peer, &PairSecret::new(peer, me)).unwrap().unwrap();
         assert_eq!(
             got,
-            (PeerSession { slot: 3, session_id, addr: "203.0.113.7:40000".parse().unwrap(), extra: vec![] }, 1_700_000_000_000)
+            (PeerSession { slot: 3, session_id, addr: "203.0.113.7:40000".parse().unwrap(), extra: vec![], registered_at_unix_ms: 1_700_000_000_000 }, 1_700_000_000_000)
         );
     }
 

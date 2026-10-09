@@ -271,6 +271,8 @@ impl<D: PacketDevice> Service<D> {
                             received: h.received,
                             loss_out: h.loss_out.unwrap_or(-1.0),
                             loss_in: h.loss_in.unwrap_or(-1.0),
+                            age_secs: h.age.as_secs().min(u64::from(u32::MAX)) as u32,
+                            draining: h.state == connection::holes::HoleState::Draining,
                         })
                         .collect(),
                     addresses: self.hub.addresses_of(e.peer.peer_id).iter().map(|a| a.to_string()).collect(),

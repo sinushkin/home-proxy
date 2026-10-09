@@ -21,7 +21,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -352,10 +352,19 @@ pub struct PeerLink {
     pub sender: Arc<LinkSender>,
     last_seen: Arc<Mutex<Instant>>,
     keepalive_timeout: Duration,
+    /// От пира приходил хотя бы один пакет после пробива (не `Punch`/`PunchAck`): значит, он принял
+    /// наши ответы — путь работает в обе стороны.
+    confirmed: Arc<AtomicBool>,
     _receiver: AbortOnDrop,
 }
 
 impl PeerLink {
+    /// Путь в обе стороны подтверждён: пир прислал пакет уже после пробива. Пассивная сторона (сервер)
+    /// из одного `Punch` знает лишь, что пир достижим, а ответы доходят ли до него — нет.
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed.load(Ordering::Relaxed)
+    }
+
     /// Завершается, когда от пира не приходило ни одного валидного пакета
     /// `keepalive_timeout`.
     pub async fn lost(&self) {
@@ -415,6 +424,7 @@ pub async fn establish(
 
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let stats = Arc::new(LinkStats::default());
+    let confirmed = Arc::new(AtomicBool::new(false));
     let (send_keys, recv_keys) = identity.keys();
     let send_keys = Arc::new(send_keys);
     // Обе фоновые задачи держим под охраной: если `establish` отменят по
@@ -427,6 +437,7 @@ pub async fn establish(
         found_tx,
         last_seen.clone(),
         stats.clone(),
+        confirmed.clone(),
         events,
     )));
 
@@ -484,6 +495,7 @@ pub async fn establish(
         sender,
         last_seen,
         keepalive_timeout: config.keepalive_timeout,
+        confirmed,
         _receiver: receiver,
     })
 }
@@ -512,6 +524,7 @@ fn note_packet(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     socket: Arc<UdpSocket>,
     identity: PeerIdentity,
@@ -519,6 +532,7 @@ async fn receive_loop(
     endpoint: watch::Sender<Option<SocketAddr>>,
     last_seen: Arc<Mutex<Instant>>,
     stats: Arc<LinkStats>,
+    confirmed: Arc<AtomicBool>,
     events: mpsc::Sender<LinkEvent>,
 ) {
     let expected_from = peer_name(&identity.peer_id);
@@ -551,6 +565,7 @@ async fn receive_loop(
             if lite_slot != identity.slot {
                 continue;
             }
+            confirmed.store(true, Ordering::Relaxed);
             note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
             if let Some(event) = event {
                 let _ = events.send(event).await;
@@ -593,6 +608,7 @@ async fn receive_loop(
                 if lite.slot != identity.slot {
                     continue;
                 }
+                confirmed.store(true, Ordering::Relaxed);
                 note_packet(identity.slot, from, &endpoint, &last_seen, &stats);
                 // hp-stats: на пробу синхронизации часов отвечаем сразу с этого сокета (клиенту
                 // для точной оценки RTT важна короткая задержка ответа, лишний шаг через

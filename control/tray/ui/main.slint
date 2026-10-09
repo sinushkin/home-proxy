@@ -19,6 +19,7 @@ export struct HoleRow {
     received: string,
     loss-out: string,
     loss-in: string,
+    age: string,
     level: int,
 }
 
@@ -52,8 +53,9 @@ component HoleTable inherits VerticalLayout {
     spacing: 2px;
     HorizontalLayout {
         spacing: 8px;
-        Text { width: 28px; text: "#"; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { width: 72px; text: "#"; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
         Text { horizontal-stretch: 1; text: "адрес телефона"; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { width: 64px; text: "возраст"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
         Text { width: 64px; text: "отправлено"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
         Text { width: 64px; text: "получено"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
         Text { width: 56px; text: "потери ↑"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
@@ -62,13 +64,14 @@ component HoleTable inherits VerticalLayout {
     for hole in holes: HorizontalLayout {
         spacing: 8px;
         HorizontalLayout {
-            width: 28px;
+            width: 72px;
             spacing: 4px;
             alignment: start;
             Dot { level: hole.level; width: 8px; height: 8px; border-radius: 4px; y: 4px; }
             Text { text: hole.slot; font-size: 12px; }
         }
         Text { horizontal-stretch: 1; text: hole.addr; font-size: 12px; overflow: elide; }
+        Text { width: 64px; text: hole.age; horizontal-alignment: right; font-size: 12px; }
         Text { width: 64px; text: hole.sent; horizontal-alignment: right; font-size: 12px; }
         Text { width: 64px; text: hole.received; horizontal-alignment: right; font-size: 12px; }
         Text { width: 56px; text: hole.loss-out; horizontal-alignment: right; font-size: 12px; }

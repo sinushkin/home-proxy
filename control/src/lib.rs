@@ -179,6 +179,15 @@ pub fn registration_text(peer: &proto::PeerStatus, now_unix_ms: u64) -> Option<S
     Some(format!("регистрация {when} с {}", peer.registered_addr))
 }
 
+/// Возраст дыры для людей: «42 с», «3 м 05 с», «2 ч 07 м».
+pub fn age_text(secs: u32) -> String {
+    match secs {
+        0..60 => format!("{secs} с"),
+        60..3600 => format!("{} м {:02} с", secs / 60, secs % 60),
+        _ => format!("{} ч {:02} м", secs / 3600, secs % 3600 / 60),
+    }
+}
+
 /// Соединение со службой после рукопожатия и `Hello`.
 pub struct Client {
     reader: secure::SealedReader<OwnedReadHalf>,
@@ -295,5 +304,15 @@ mod tests {
         assert_eq!(read_raw(&mut b).await.unwrap().unwrap(), b"one");
         assert_eq!(read_raw(&mut b).await.unwrap().unwrap(), b"second");
         assert!(read_raw(&mut b).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn hole_age_is_human_readable() {
+        assert_eq!(age_text(0), "0 с");
+        assert_eq!(age_text(42), "42 с");
+        assert_eq!(age_text(60), "1 м 00 с");
+        assert_eq!(age_text(185), "3 м 05 с");
+        assert_eq!(age_text(3600), "1 ч 00 м");
+        assert_eq!(age_text(7620), "2 ч 07 м");
     }
 }

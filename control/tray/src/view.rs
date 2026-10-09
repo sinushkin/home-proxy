@@ -199,6 +199,7 @@ pub fn render(window: &MainWindow, state: &UiState) {
                     received: grouped(h.received).into(),
                     loss_out: percent(h.loss_out).into(),
                     loss_in: percent(h.loss_in).into(),
+                    age: if h.draining { format!("{}, слив", hp_control::age_text(h.age_secs)) } else { hp_control::age_text(h.age_secs) }.into(),
                     level: hole_level(h),
                 })
                 .collect();

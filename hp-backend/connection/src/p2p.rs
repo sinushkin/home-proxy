@@ -385,7 +385,7 @@ mod tests {
     use super::*;
 
     fn session(n: u8) -> PeerSession {
-        PeerSession { slot: 0, session_id: Uuid::from_bytes([n; 16]), addr: SocketAddr::from(([203, 0, 113, n], 1000)), extra: vec![] }
+        PeerSession { slot: 0, session_id: Uuid::from_bytes([n; 16]), addr: SocketAddr::from(([203, 0, 113, n], 1000)), extra: vec![], registered_at_unix_ms: 0 }
     }
 
     /// Пир перезапускался, пока мы пробивались: берём последнюю запись, а не первую в очереди.

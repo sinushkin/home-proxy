@@ -1,12 +1,14 @@
 //! `vps-client`: клиент `vps-server` с белым IP. Обычная схема «клиент — сервер»: адрес
-//! сервера известен заранее, ни STUN, ни MQTT, ни пробива. Поднимает TUN и 10 дыр к серверу:
+//! сервера известен заранее, ни STUN, ни MQTT, ни пробива. Поднимает TUN и динамический набор дыр к серверу (4..10, дыры стареют и заменяются):
 //! IP-пакеты по дырам как есть (TCP с номером в потоке, сервер возвращает порядок). Маршруты
 //! туннеля ставит сам (`hp_tun::routes`), DNS и прочее системное — скрипты хуков.
 //!
 //! Аргументы: `<ip_сервера[:порт_знакомства]> <мой_guid> <guid_сервера>` (порт знакомства по
 //! умолчанию 40000). Адрес в туннеле выдаёт сервер. Окружение: `TUN_NAME` (`hp0`), `TUN_MTU`
 //! (1400), `REORDER_WAIT_MS` (начальное ожидание буфера порядка, 8; 0 — выключить),
-//! `DATA_HOLES` (0 — данные через все живые дыры), `ROUTES` (`auto` — маршруты туннеля; `off` —
+//! `DATA_HOLES` (0 — данные через все живые дыры), набор дыр динамический: `HOLES_MIN` (4 — не
+//! меньше стольких в работе), `HOLES_MAX` (10), `HOLE_AGE` (`60-180` — срок жизни дыры в секундах,
+//! случайный в этих пределах), `ROUTES` (`auto` — маршруты туннеля; `off` —
 //! не трогать маршруты), `ON_TUN_UP` / `ON_TUN_DOWN` (скрипты хуков, по умолчанию
 //! `/etc/vps-client/on-tun-up.sh` и `on-tun-down.sh`, если файлов нет — ничего не делается),
 //! `RUNTIME=multi`, `RUST_LOG`, `LOG_TARGET=syslog` (OpenWrt). Нужны права root (Windows — администратор
@@ -21,7 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use connection::multilink::{Discovery, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::holes::PoolPolicy;
+use connection::multilink::{Discovery, MultiLink, MultiLinkOptions, DEFAULT_HOLE_AGE, DEFAULT_REORDER_WAIT, TARGET_LINKS};
 use connection::proto::AddressKind;
 use hp_tun::platform::{HookLauncher, NativeHooks, NativeShutdown, NativeTun};
 use hp_tun::routes::{hook_env, Hooks, Routes};
@@ -36,6 +39,16 @@ fn env_number<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
         Ok(value) => value.trim().parse().map_err(|_| anyhow::anyhow!("{name}: некорректное число")),
         Err(_) => Ok(default),
     }
+}
+
+/// Диапазон секунд `мин-макс` (например `60-180`) или одно число.
+fn env_age_range(name: &str, default: (Duration, Duration)) -> Result<(Duration, Duration)> {
+    let Ok(value) = std::env::var(name) else { return Ok(default) };
+    let bad = || anyhow::anyhow!("{name}: ожидается «мин-макс» в секундах, например 60-180");
+    let (min, max) = value.trim().split_once('-').unwrap_or((value.trim(), value.trim()));
+    let (min, max): (u64, u64) = (min.trim().parse().map_err(|_| bad())?, max.trim().parse().map_err(|_| bad())?);
+    anyhow::ensure!(min >= 1 && min <= max, bad());
+    Ok((Duration::from_secs(min), Duration::from_secs(max)))
 }
 
 fn env_path(name: &str, default: &str) -> PathBuf {
@@ -60,9 +73,20 @@ async fn run() -> Result<()> {
     let server = connection::vps::parse_server(&args[0]).context("адрес сервера: ожидается ip или ip:порт")?;
     let my_id: Uuid = args[1].parse().context("мой GUID")?;
     let server_id: Uuid = args[2].parse().context("GUID сервера")?;
+    let pool = PoolPolicy {
+        min_active: env_number("HOLES_MIN", PoolPolicy::default().min_active)?,
+        max_total: env_number("HOLES_MAX", PoolPolicy::default().max_total)?,
+        ..PoolPolicy::default()
+    };
+    anyhow::ensure!(
+        pool.min_active >= 1 && pool.min_active <= pool.max_total && pool.max_total <= TARGET_LINKS as usize,
+        "HOLES_MIN должно быть от 1 до HOLES_MAX, а HOLES_MAX — не больше {TARGET_LINKS}"
+    );
     let options = MultiLinkOptions {
         reorder_wait: Duration::from_millis(env_number("REORDER_WAIT_MS", DEFAULT_REORDER_WAIT.as_millis() as u64)?),
         data_holes: env_number("DATA_HOLES", 0u8)?,
+        pool,
+        hole_age: env_age_range("HOLE_AGE", DEFAULT_HOLE_AGE)?,
         ..MultiLinkOptions::default()
     };
     let (link, mut incoming) =

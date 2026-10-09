@@ -7,7 +7,7 @@
 | Скрипт | Что делает |
 |---|---|
 | `vps-server.bat <сервер>` | как `vps-server.sh`: `/opt/hp-vps` (бинарник, `vps.env`, `clients.txt`) и служба `hp-vps-server` |
-| `vps-client.bat <сервер> [имя]` | этот ПК как клиент: GUID, строка в `clients.txt` сервера, сборка/копия `vps-client.exe`, `wintun.dll`, хуки, задача планировщика «home-proxy vps-client» (SYSTEM, при загрузке), проверка 10/10 дыр |
+| `vps-client.bat <сервер> [имя]` | этот ПК как клиент: GUID, строка в `clients.txt` сервера, сборка/копия `vps-client.exe`, `wintun.dll`, хуки, задача планировщика «home-proxy vps-client» (SYSTEM, при загрузке), проверка набора дыр (не меньше 4 в работе) |
 | `vps-client-remove.bat` | убрать клиента с этого ПК (сервер не трогает) |
 | `vps-prepare.bat <сервер>` | фаервол/NAT сервера: запускает `setup/vps-prepare.sh` через bash из Git for Windows |
 | `vps-client-router-vps-server.bat <сервер>` | сервер + этот ПК |

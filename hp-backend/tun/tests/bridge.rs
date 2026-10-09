@@ -38,7 +38,7 @@ fn ip_packet(proto: u8, src: [u8; 4], dst: [u8; 4], marker: u8) -> Vec<u8> {
     p
 }
 
-/// VPS-сервер и VPS-клиент на loopback с поднятыми 10 дырами.
+/// VPS-сервер и VPS-клиент на loopback с поднятыми дырами (не меньше `min_active` = 4).
 async fn vps_pair(ports: std::ops::RangeInclusive<u16>, client_options: MultiLinkOptions) -> (Arc<MultiLink>, Rx, Arc<MultiLink>, Rx) {
     let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
     let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -63,7 +63,7 @@ async fn vps_pair(ports: std::ops::RangeInclusive<u16>, client_options: MultiLin
     .unwrap();
     let (server, client) = (Arc::new(server), Arc::new(client));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
-    while server.live_count() < 10 || client.live_count() < 10 {
+    while server.live_count() < 4 || client.live_count() < 4 {
         assert!(tokio::time::Instant::now() < deadline, "дыры не поднялись");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

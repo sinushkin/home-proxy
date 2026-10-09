@@ -62,7 +62,17 @@ async fn main() -> Result<()> {
                 }
                 for h in p.holes {
                     let loss = |l: f32| if l < 0.0 { "—".to_string() } else { format!("{:.1}%", l * 100.0) };
-                    println!("  #{} {} отправлено {} получено {} потери ↑{} ↓{}", h.slot, h.peer_addr, h.sent, h.received, loss(h.loss_out), loss(h.loss_in));
+                    let state = if h.draining { ", сливается" } else { "" };
+                    println!(
+                        "  #{} {} возраст {}{state}, отправлено {} получено {} потери ↑{} ↓{}",
+                        h.slot,
+                        h.peer_addr,
+                        hp_control::age_text(h.age_secs),
+                        h.sent,
+                        h.received,
+                        loss(h.loss_out),
+                        loss(h.loss_in)
+                    );
                 }
             }
         }

@@ -64,6 +64,7 @@ impl Routes {
     pub async fn start(tun: &str, mut bypass: Vec<Ipv4Addr>, probe: Ipv4Addr) -> Result<Self> {
         bypass.sort_unstable();
         bypass.dedup();
+        #[allow(clippy::default_constructed_unit_structs)] // тип платформы: у Linux и Windows сейчас без полей
         let backend = NativeRoutes::default();
         let uplink = match backend.current_uplink(tun).await? {
             Some(up) => up,

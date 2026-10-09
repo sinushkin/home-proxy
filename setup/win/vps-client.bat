@@ -174,9 +174,9 @@ call "%C%" :step "Check (up to 90 s)"
 set "HOLES=0"
 for /l %%i in (1,1,18) do if "!HOLES!"=="0" (
   ping -n 6 127.0.0.1 >nul
-  findstr /c:"10/10" "%DATA%\vps-client.log" >nul 2>&1 && set "HOLES=1"
+  findstr /r /c:" [4-9]/10," /c:" 10/10," "%DATA%\vps-client.log" >nul 2>&1 && set "HOLES=1"
 )
-if "!HOLES!"=="1" (echo %CLI%: 10/10 holes) else (echo WARNING: 10/10 holes not reached; see %DATA%\vps-client.log 1>&2)
+if "!HOLES!"=="1" (echo %CLI%: hole set is up) else (echo WARNING: fewer than 4 holes; see %DATA%\vps-client.log 1>&2)
 powershell -NoProfile -Command "if (Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/1 -InterfaceAlias '%CLIENT_TUN%' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
 if errorlevel 1 (echo WARNING: 0.0.0.0/1 is not in %CLIENT_TUN% 1>&2) else (echo all traffic goes to %CLIENT_TUN% ^(0.0.0.0/1^), the default route is untouched)
 

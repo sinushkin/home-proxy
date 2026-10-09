@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::auth::PairSecret;
+use crate::holes::{HoleState, PoolPolicy};
 use crate::label::Label;
 use crate::link_id::PeerLinkId;
 use crate::pool::Packet;
@@ -116,6 +117,8 @@ pub(crate) enum SlotPhase {
     Punching,
     /// Дыра открыта.
     Connected,
+    /// Дыра сливается: данные по ней уже не шлём, ждём, пока дойдут последние.
+    Draining,
 }
 
 /// Общее состояние соединения с пиром.
@@ -179,6 +182,20 @@ impl StateTracker {
 
     fn current(&self) -> ConnState {
         aggregate(self.inner.lock().unwrap().phases.values())
+    }
+
+    /// Дыра закрыта: фаза больше не учитывается (номера динамических дыр не переиспользуются).
+    fn remove(&self, slot: SlotId) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.phases.remove(&slot);
+        let now = aggregate(inner.phases.values());
+        if inner.last != Some(now) {
+            let label = &self.label;
+            if let Some(prev) = inner.last {
+                log::info!("{label}состояние соединения: {prev} -> {now}");
+            }
+            inner.last = Some(now);
+        }
     }
 
     fn set(&self, slot: SlotId, phase: SlotPhase) {
@@ -281,9 +298,10 @@ impl XorShift32 {
 pub(crate) struct LiveLink {
     pub slot: SlotId,
     pub sender: Arc<LinkSender>,
-    /// hp-stats (фича `stats`): когда дыра встала в реестр — для `hole_age_ms` в записях.
-    #[cfg(feature = "stats")]
-    pub established_at: Instant,
+    /// Когда дыра встала в реестр (возраст дыры в статусе и `hole_age_ms` в записях hp-stats).
+    pub opened_at: Instant,
+    /// `Active` или `Draining`: сливаемая дыра принимает, но для отправки не выбирается.
+    pub state: HoleState,
 }
 
 /// Общий реестр живых дыр. `index` — тот самый `Map<PeerLinkId, SlotId>`.
@@ -325,6 +343,10 @@ pub struct HoleStatus {
     /// отчёта ещё нет или мало пакетов.
     pub loss_out: Option<f32>,
     pub loss_in: Option<f32>,
+    /// Сколько дыра уже открыта (с момента, как встала в реестр).
+    pub age: Duration,
+    /// `Active` — в работе, `Draining` — сливается (данные по ней уже не шлём).
+    pub state: HoleState,
 }
 
 /// Снимок набора дыр: общее состояние и живые дыры по порядку слотов.
@@ -353,16 +375,57 @@ impl LinkRegistry {
         }
     }
 
+    /// Сколько дыр можно использовать: не считая ещё не подтверждённых пиром.
     fn live_count(&self) -> usize {
-        self.by_slot.len()
+        self.by_slot.values().filter(|l| l.state != HoleState::Warming).count()
+    }
+
+    /// Дыра подтверждена пиром: теперь по ней можно слать данные.
+    fn mark_active(&mut self, slot: SlotId) {
+        if let Some(link) = self.by_slot.get_mut(&slot)
+            && link.state == HoleState::Warming
+        {
+            link.state = HoleState::Active;
+        }
+    }
+
+    /// Дыра сливается: для отправки больше не выбирается. `false` — такой дыры нет.
+    fn mark_draining(&mut self, slot: SlotId) -> bool {
+        match self.by_slot.get_mut(&slot) {
+            Some(link) => {
+                link.state = HoleState::Draining;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Убирает дыру по номеру (задача дыры оборвана до того, как сама это сделала).
+    fn remove_slot(&mut self, slot: SlotId) {
+        if self.by_slot.remove(&slot).is_some() {
+            self.index.retain(|_, s| *s != slot);
+            self.reports.remove(&slot);
+        }
+    }
+
+    /// Состояние и потери дыры для политики набора; `None` — дыры нет в реестре.
+    pub(crate) fn hole_info(&self, slot: SlotId) -> Option<(HoleState, Option<f32>, Option<f32>)> {
+        let link = self.by_slot.get(&slot)?;
+        let report = self.reports.get(&slot);
+        Some((
+            link.state,
+            report.and_then(|r| loss(r.my_sent, r.peer_received)),
+            report.and_then(|r| loss(r.peer_sent, r.my_received)),
+        ))
     }
 
     pub(crate) fn links(&self) -> Vec<LiveLink> {
         self.by_slot.values().cloned().collect()
     }
 
-    fn received_on(&self, slot: SlotId) -> u64 {
-        self.by_slot.get(&slot).map(|l| l.sender.stats().1).unwrap_or(0)
+    /// Сколько пакетов получено по дыре; `None` — дыры в реестре нет (ещё не открыта или уже закрыта).
+    fn received_on(&self, slot: SlotId) -> Option<u64> {
+        self.by_slot.get(&slot).map(|l| l.sender.stats().1)
     }
 
     /// Запоминает отчёт пира о дыре вместе с нашими счётчиками на этот момент.
@@ -387,6 +450,8 @@ impl LinkRegistry {
                     received,
                     loss_out: report.and_then(|r| loss(r.my_sent, r.peer_received)),
                     loss_in: report.and_then(|r| loss(r.peer_sent, r.my_received)),
+                    age: link.opened_at.elapsed(),
+                    state: link.state,
                 }
             })
             .collect();
@@ -437,11 +502,29 @@ pub struct MultiLinkOptions {
     /// Номер интерфейса, к которому привязать сокеты слотов (Linux: без него сокет с адресом
     /// физического адаптера всё равно ушёл бы по маршруту по умолчанию — в VPN); см. `bind`.
     pub bind_ifindex: Option<u32>,
+    /// Динамический набор дыр (VPS-режим): сколько держать и как менять (`holes::plan`). P2P
+    /// работает на фиксированных слотах `0..TARGET_LINKS` и это поле игнорирует.
+    pub pool: PoolPolicy,
+    /// Срок жизни дыры динамического набора: на каждую дыру случайно в этих пределах (чтобы у
+    /// переоткрытия не было ровного ритма).
+    pub hole_age: (Duration, Duration),
 }
+
+/// Срок жизни дыры по умолчанию (`PLAN-dynamic-holes-relay.md`, раздел 2).
+pub const DEFAULT_HOLE_AGE: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(180));
 
 impl Default for MultiLinkOptions {
     fn default() -> Self {
-        Self { reorder_wait: DEFAULT_REORDER_WAIT, data_holes: 0, local_port_base: 0, reorder_clients: true, bind_ip: None, bind_ifindex: None }
+        Self {
+            reorder_wait: DEFAULT_REORDER_WAIT,
+            data_holes: 0,
+            local_port_base: 0,
+            reorder_clients: true,
+            bind_ip: None,
+            bind_ifindex: None,
+            pool: PoolPolicy::default(),
+            hole_age: DEFAULT_HOLE_AGE,
+        }
     }
 }
 
@@ -459,7 +542,10 @@ pub struct MultiLink {
     picker: Mutex<SlotPicker>,
     wrap_seq: Mutex<SeqCounters>,
     data_holes: u8,
-    redrop_txs: HashMap<SlotId, mpsc::Sender<()>>,
+    /// Команды задачам дыр (слить, пробить заново); у динамического набора дыры заводят сами.
+    ctl: HoleCtl,
+    /// VPS-режим: набор дыр динамический (`holes::plan`), иначе фиксированные слоты `0..TARGET_LINKS`.
+    dynamic: bool,
     control_rx: Mutex<Option<mpsc::Receiver<Control>>>,
     state: Arc<StateTracker>,
     /// Текущее ожидание буфера порядка (обновляется раз в 30 с из `control_loop`); см. `LinkStatus`.
@@ -525,20 +611,17 @@ impl MultiLink {
         let (control_tx, control_rx) = mpsc::channel::<Control>(CONTROL_CHANNEL_CAPACITY);
         let state = Arc::new(StateTracker::new(label.clone()));
 
-        let mut redrop_txs = HashMap::new();
-        let mut bases = Vec::new();
-        for slot in 0..TARGET_LINKS {
-            let (redrop_tx, redrop_rx) = mpsc::channel::<()>(1);
-            redrop_txs.insert(slot, redrop_tx);
-            bases.push(SlotBase {
-                slot,
-                label: label.clone(),
-                registry: registry.clone(),
-                events: events_tx.clone(),
-                state: state.clone(),
-                redrop_rx,
-            });
-        }
+        let dynamic = matches!(discovery, Discovery::VpsServer { .. } | Discovery::VpsClient { .. });
+        let ctl = HoleCtl::default();
+        let factory = HoleFactory {
+            label: label.clone(),
+            registry: registry.clone(),
+            events: events_tx.clone(),
+            state: state.clone(),
+            ctl: ctl.clone(),
+        };
+        // P2P: фиксированные слоты с готовыми каналами команд; VPS заводит дыры сам, по одной.
+        let bases: Vec<SlotBase> = if dynamic { Vec::new() } else { (0..TARGET_LINKS).map(|slot| factory.make(slot, false, false)).collect() };
 
         let bind_ip = options.bind_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]));
         let vps_pair = || vps::Pair { my_peer_id, peer_id, secret: pair.clone() };
@@ -559,12 +642,19 @@ impl MultiLink {
                 (started.tasks, Some(started.hole_records), Some(started.registrar))
             }
             Discovery::VpsServer { public_ip, bootstrap } => {
-                let config = vps::ServerConfig { public_ip, pair: vps_pair(), bootstrap };
-                (vps::start_server(&label, config, bases).await?, None, None)
+                let config = vps::ServerConfig { public_ip, pair: vps_pair(), bootstrap, pool: options.pool };
+                (vps::start_server(&label, config, factory.clone()).await?, None, None)
             }
             Discovery::VpsClient { server } => {
-                let config = vps::ClientConfig { server, pair: vps_pair(), bind_ip, bind_ifindex: options.bind_ifindex };
-                (vps::start_client(&label, config, bases).await?, None, None)
+                let config = vps::ClientConfig {
+                    server,
+                    pair: vps_pair(),
+                    bind_ip,
+                    bind_ifindex: options.bind_ifindex,
+                    pool: options.pool,
+                    hole_age: options.hole_age,
+                };
+                (vps::start_client(&label, config, factory.clone()).await?, None, None)
             }
         };
 
@@ -589,7 +679,7 @@ impl MultiLink {
             label.clone(),
             events_rx,
             registry.clone(),
-            redrop_txs.clone(),
+            (ctl.clone(), dynamic),
             hole_records,
             (incoming_tx, control_tx),
             options,
@@ -609,7 +699,8 @@ impl MultiLink {
             picker: Mutex::new(SlotPicker::default()),
             wrap_seq: Mutex::new(SeqCounters::default()),
             data_holes: options.data_holes,
-            redrop_txs,
+            ctl,
+            dynamic,
             control_rx: Mutex::new(Some(control_rx)),
             state,
             reorder_wait_ms,
@@ -634,8 +725,12 @@ impl MultiLink {
         let registry = self.registry.lock().unwrap();
         let mut slots = [0; TARGET_LINKS as usize];
         let mut count = 0;
-        for &slot in registry.by_slot.keys() {
-            if count < slots.len() {
+        // Данные идут по дырам в работе. Сливаемые берём, только если других нет (лучше они, чем
+        // ничего); ещё не подтверждённые пиром — никогда: ответы по ним могут не доходить.
+        let any_active = registry.by_slot.values().any(|l| l.state == HoleState::Active);
+        let wanted = if any_active { HoleState::Active } else { HoleState::Draining };
+        for (&slot, link) in &registry.by_slot {
+            if count < slots.len() && link.state == wanted {
                 slots[count] = slot;
                 count += 1;
             }
@@ -711,11 +806,15 @@ impl MultiLink {
         self.registry.lock().unwrap().live_count()
     }
 
-    /// Перенести дыру `slot` на новые порты: слот регистрируется заново (в VPS-режиме —
-    /// на новом порту сервера), пиру уходит `DeleteLink`, чтобы и он бросил старую.
+    /// Бросить дыру `slot`. Фиксированный слот (P2P) регистрируется заново на новых портах, пиру
+    /// уходит `DeleteLink`; в динамическом наборе (VPS) дыра сливается (`Drain` пиру), а
+    /// замену открывает политика набора.
     pub async fn move_slot(&self, slot: SlotId) {
-        request_redrop(&self.redrop_txs, slot);
-        broadcast_delete_link(&self.registry, slot).await;
+        send_command(&self.ctl, slot, HoleCmd::Retire);
+        // Динамическая дыра сама сообщит пиру `Drain`; фиксированному слоту нужен `DeleteLink`.
+        if !self.dynamic {
+            broadcast_delete_link(&self.registry, slot).await;
+        }
     }
 
     /// Живые дыры: слот и текущий адрес пира.
@@ -788,7 +887,7 @@ impl MultiLink {
             kind,
             client_id,
             flow,
-            hole_age_ms: u32::try_from(link.established_at.elapsed().as_millis()).unwrap_or(u32::MAX),
+            hole_age_ms: u32::try_from(link.opened_at.elapsed().as_millis()).unwrap_or(u32::MAX),
         });
     }
 }
@@ -910,8 +1009,8 @@ async fn control_loop(
     label: Label,
     mut events: mpsc::Receiver<LinkEvent>,
     registry: Arc<Mutex<LinkRegistry>>,
-    redrop_txs: HashMap<SlotId, mpsc::Sender<()>>,
-hole_records: Option<mpsc::Sender<Rendezvous>>,
+    (ctl, dynamic): (HoleCtl, bool),
+    hole_records: Option<mpsc::Sender<Rendezvous>>,
     (incoming, control): (mpsc::Sender<Incoming>, mpsc::Sender<Control>),
     options: MultiLinkOptions,
     reorder_wait_ms: Arc<AtomicU32>,
@@ -965,27 +1064,27 @@ hole_records: Option<mpsc::Sender<Rendezvous>>,
                     registry.lock().unwrap().record_report(&stat);
                     if is_link_bad(&registry, &stat) {
                         log::warn!(
-                            "{label}слот {}: пир отправил {}, мы получили {} — дыра плохая, пробиваем заново",
+                            "{label}слот {}: пир отправил {}, мы получили {} — дыра плохая, {}",
                             stat.slot,
                             stat.sent,
-                            registry.lock().unwrap().received_on(stat.slot)
+                            registry.lock().unwrap().received_on(stat.slot).unwrap_or(0),
+                            if dynamic { "сливаем" } else { "пробиваем заново" }
                         );
-                        request_redrop(&redrop_txs, stat.slot);
-                        broadcast_delete_link(&registry, stat.slot).await;
+                        send_command(&ctl, stat.slot, HoleCmd::Retire);
+                        if !dynamic {
+                            broadcast_delete_link(&registry, stat.slot).await;
+                        }
                     }
                 }
             }
             LinkEvent::DeleteLink { slot } => {
-                log::info!("{label}слот {slot}: пир просит удалить линк, пробиваем заново");
-                request_redrop(&redrop_txs, slot);
+                log::info!("{label}слот {slot}: пир просит удалить линк{}", if dynamic { ", сливаем" } else { ", пробиваем заново" });
+                send_command(&ctl, slot, HoleCmd::PeerDrain);
             }
-            // Динамический набор дыр (PLAN-dynamic-holes-relay.md, M5): пока только проводка —
-            // никто `Drain` не инициирует (нет политики, какая дыра и когда сливается) и реестр
-            // не умеет состояние `Draining`. Когда M5 появится, здесь будет: пометить дыру
-            // `Draining` (не выбирать для отправки, приём — как у любой живой), ответить `Drain`
-            // (идемпотентно), подождать `drain_grace` и закрыть. Сейчас — только лог.
+            // Пир сливает дыру: задача дыры пометит её `Draining`, подождёт последние пакеты и закроется.
             LinkEvent::PeerDrain { slot } => {
-                log::info!("{label}слот {slot}: получен Drain (M5 ещё не реализован, без действия)");
+                log::info!("{label}слот {slot}: пир сливает дыру (Drain)");
+                send_command(&ctl, slot, HoleCmd::PeerDrain);
             }
             LinkEvent::PeerData { slot, payload, pid } => {
                 if !dedup.admit(pid) {
@@ -1094,7 +1193,8 @@ async fn deliver(
 const REORDER_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
 fn is_link_bad(registry: &Arc<Mutex<LinkRegistry>>, stat: &PeerLinkStat) -> bool {
-    let my_received = registry.lock().unwrap().received_on(stat.slot);
+    // Дыры нет в реестре — она ещё открывается или уже закрыта: судить рано (не «0 получено»).
+    let Some(my_received) = registry.lock().unwrap().received_on(stat.slot) else { return false };
     link_is_bad(stat.sent, my_received)
 }
 
@@ -1103,9 +1203,22 @@ fn link_is_bad(peer_sent: u64, my_received: u64) -> bool {
     peer_sent >= MIN_STATS_SAMPLE && my_received * 2 < peer_sent
 }
 
-fn request_redrop(redrop_txs: &HashMap<SlotId, mpsc::Sender<()>>, slot: SlotId) {
-    if let Some(tx) = redrop_txs.get(&slot) {
-        let _ = tx.try_send(());
+/// Команда задаче дыры.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoleCmd {
+    /// Мы бросаем дыру: плохая, просрочена, `move_slot`. Динамическая дыра сообщит пиру `Drain`.
+    Retire,
+    /// Пир просит бросить дыру (`Drain`, `DeleteLink`): пиру говорить уже не нужно.
+    PeerDrain,
+}
+
+/// Каналы команд задач дыр по номеру. Фиксированные слоты заводятся при старте, динамические —
+/// по одной вместе с дырой (`HoleFactory::make`) и убираются, когда задача дыры заканчивается.
+pub(crate) type HoleCtl = Arc<Mutex<HashMap<SlotId, mpsc::Sender<HoleCmd>>>>;
+
+pub(crate) fn send_command(ctl: &HoleCtl, slot: SlotId, cmd: HoleCmd) {
+    if let Some(tx) = ctl.lock().unwrap().get(&slot) {
+        let _ = tx.try_send(cmd);
     }
 }
 
@@ -1116,15 +1229,70 @@ async fn broadcast_delete_link(registry: &Arc<Mutex<LinkRegistry>>, slot: SlotId
     }
 }
 
+/// Сколько сливаемая дыра ещё принимает, прежде чем закрыться: за это время доходят последние
+/// пакеты, а `Drain` успевает дойти до пира по другим дырам (`PLAN-dynamic-holes-relay.md`, §3).
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_millis(2100);
+
+/// Сколько сервер ждёт первый пакет клиента после пробива, прежде чем счесть дыру нерабочей.
+/// Прошлая версия клиента шлёт первый пакет после пробива не сразу (keep-alive 2..10 с), поэтому с запасом.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Заводит `SlotBase` для задачи дыры: общие для всех дыр реестр, события, фазы и команды.
+#[derive(Clone)]
+pub(crate) struct HoleFactory {
+    pub label: Label,
+    pub registry: Arc<Mutex<LinkRegistry>>,
+    pub events: mpsc::Sender<LinkEvent>,
+    state: Arc<StateTracker>,
+    pub ctl: HoleCtl,
+}
+
+impl HoleFactory {
+    /// Дыра с номером `slot` и её канал команд. `dynamic` — дыра живёт один раз (слив, затем
+    /// конец задачи); иначе слот перерегистрируется и работает дальше (P2P).
+    pub(crate) fn make(&self, slot: SlotId, dynamic: bool, confirm_peer: bool) -> SlotBase {
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        self.ctl.lock().unwrap().insert(slot, cmd_tx);
+        SlotBase {
+            slot,
+            label: self.label.clone(),
+            registry: self.registry.clone(),
+            events: self.events.clone(),
+            state: self.state.clone(),
+            cmd_rx,
+            ctl: self.ctl.clone(),
+            dynamic,
+            confirm_peer,
+        }
+    }
+}
+
 /// Общее для рабочей задачи слота любого режима: реестр живых дыр, события дыр, фазы слота и
-/// просьбы пробить дыру заново (плохая дыра, `DeleteLink` пира, `move_slot`).
+/// команды (плохая дыра, `Drain`/`DeleteLink` пира, `move_slot`).
 pub(crate) struct SlotBase {
     pub slot: SlotId,
     pub label: Label,
     pub registry: Arc<Mutex<LinkRegistry>>,
     pub events: mpsc::Sender<LinkEvent>,
     state: Arc<StateTracker>,
-    pub redrop_rx: mpsc::Receiver<()>,
+    pub cmd_rx: mpsc::Receiver<HoleCmd>,
+    ctl: HoleCtl,
+    dynamic: bool,
+    /// Данные по дыре пойдут, только когда пир сам пришлёт пакет после пробива (сервер: из одного
+    /// `Punch` не видно, доходят ли до клиента наши ответы).
+    confirm_peer: bool,
+}
+
+impl Drop for SlotBase {
+    /// Конец задачи динамической дыры (в том числе оборванной): дыра уходит из реестра, каналов
+    /// команд и фаз — следов не остаётся, номер не переиспользуется.
+    fn drop(&mut self) {
+        if self.dynamic {
+            self.ctl.lock().unwrap().remove(&self.slot);
+            self.registry.lock().unwrap().remove_slot(self.slot);
+            self.state.remove(self.slot);
+        }
+    }
 }
 
 impl SlotBase {
@@ -1132,42 +1300,97 @@ impl SlotBase {
         self.state.set(self.slot, phase);
     }
 
-    /// Держит живую дыру в реестре, пока она не потеряна (`PeerLink::lost`), не помечена
-    /// плохой или не завершился `interrupt` (режим сам решил её бросить). Затем убирает из
-    /// реестра — слот начинает новую регистрацию.
+    /// Держит живую дыру в реестре, пока она не потеряна (`PeerLink::lost`), не получила команду
+    /// (плохая, слив пира) или не завершился `interrupt` (режим сам решил её бросить). Затем убирает
+    /// из реестра. Динамическая дыра перед этим сливается: помечается `Draining`, пиру уходит
+    /// `Drain`, ещё `DRAIN_GRACE` она принимает; фиксированный слот сразу начинает новую регистрацию.
+    /// Дыра с `confirm_peer` сначала `Warming` (данные не идут) и становится `Active`, когда пир
+    /// подтвердил путь; не подтвердил за `CONFIRM_TIMEOUT` — дыра закрывается.
     pub(crate) async fn hold(&mut self, link: PeerLink, interrupt: impl std::future::Future<Output = ()>) {
-        let (slot, label) = (self.slot, &self.label);
-        // Просьбы пробить заново, пришедшие до этой дыры, к ней не относятся.
-        while self.redrop_rx.try_recv().is_ok() {}
+        let (slot, label) = (self.slot, self.label.clone());
+        // Команды, пришедшие до этой дыры, к ней не относятся.
+        while self.cmd_rx.try_recv().is_ok() {}
         let link_id = link.link_id;
+        let mut warming = self.confirm_peer && !link.is_confirmed();
         {
+            let state = if warming { HoleState::Warming } else { HoleState::Active };
             let mut reg = self.registry.lock().unwrap();
-            reg.insert(
-                link_id,
-                LiveLink {
-                    slot,
-                    sender: link.sender.clone(),
-                    #[cfg(feature = "stats")]
-                    established_at: Instant::now(),
-                },
-            );
+            reg.insert(link_id, LiveLink { slot, sender: link.sender.clone(), opened_at: Instant::now(), state });
             log::info!("{label}слот {slot}: дыра открыта {} <-> {} (живых дыр: {})", link.local_addr, link.peer_addr, reg.live_count());
         }
         self.phase(SlotPhase::Connected);
-        tokio::select! {
-            _ = link.lost() => log::warn!("{label}слот {slot}: дыра потеряна, перерегистрация"),
-            _ = self.redrop_rx.recv() => log::warn!("{label}слот {slot}: дыра помечена плохой, пробиваем заново"),
-            _ = interrupt => log::info!("{label}слот {slot}: пир пришёл заново, перерегистрация"),
+        if self.dynamic {
+            // Сразу даём знать пиру, что наши пакеты ходят: для сервера это подтверждение дыры.
+            link.sender.send_keepalive().await;
+        }
+        let opened = Instant::now();
+        let mut confirm_tick = tokio::time::interval(Duration::from_millis(100));
+        tokio::pin!(interrupt);
+        let command = loop {
+            tokio::select! {
+                _ = link.lost() => {
+                    log::warn!("{label}слот {slot}: дыра потеряна{}", if self.dynamic { "" } else { ", перерегистрация" });
+                    break None;
+                }
+                command = self.cmd_rx.recv() => {
+                    if !self.dynamic {
+                        log::warn!("{label}слот {slot}: дыра помечена плохой, пробиваем заново");
+                    }
+                    break command;
+                }
+                _ = &mut interrupt => {
+                    log::info!("{label}слот {slot}: пир пришёл заново, перерегистрация");
+                    break None;
+                }
+                _ = confirm_tick.tick(), if warming => {
+                    if link.is_confirmed() {
+                        warming = false;
+                        self.registry.lock().unwrap().mark_active(slot);
+                        log::debug!("{label}слот {slot}: пир подтвердил дыру за {:?}", opened.elapsed());
+                    } else if opened.elapsed() >= CONFIRM_TIMEOUT {
+                        log::warn!("{label}слот {slot}: пир не подтвердил дыру за {CONFIRM_TIMEOUT:?} (ответы не доходят?), закрываем");
+                        break None;
+                    }
+                }
+            }
+        };
+        if let (true, Some(command)) = (self.dynamic, command) {
+            self.drain(command).await;
         }
         let mut reg = self.registry.lock().unwrap();
         reg.remove(link_id);
         log::debug!("{label}слот {slot}: дыра удалена из реестра (живых: {})", reg.live_count());
     }
+
+    /// Слив: данные по дыре больше не идут, пир об этом знает, последние пакеты успевают дойти.
+    async fn drain(&mut self, command: HoleCmd) {
+        let (slot, label) = (self.slot, self.label.clone());
+        self.registry.lock().unwrap().mark_draining(slot);
+        self.phase(SlotPhase::Draining);
+        if command == HoleCmd::PeerDrain {
+            log::info!("{label}слот {slot}: пир сливает дыру, принимаем ещё {DRAIN_GRACE:?}");
+            tokio::time::sleep(DRAIN_GRACE).await;
+            return;
+        }
+        log::info!("{label}слот {slot}: сливаем дыру, пиру — Drain");
+        // `Drain` (и `DeleteLink` для прошлых версий) шлём по этой и ещё двум дырам, трижды: сама дыра может быть плохой.
+        for _ in 0..3 {
+            let mut links = self.registry.lock().unwrap().links();
+            links.sort_by_key(|l| (l.slot != slot, l.state != HoleState::Active));
+            for link in links.into_iter().take(3) {
+                link.sender.send_drain(slot).await;
+                // Прошлая версия клиента `Drain` не знает и бросает дыру по `DeleteLink`; новая
+                // обрабатывает оба одинаково.
+                link.sender.send_delete_link(slot).await;
+            }
+            tokio::time::sleep(DRAIN_GRACE / 3).await;
+        }
+    }
 }
 
 /// Псевдослучайная длительность в [min, max] на основе текущего времени
 /// (для джиттера качество ГПСЧ не важно, поэтому без внешних зависимостей).
-fn jittered(min: Duration, max: Duration) -> Duration {
+pub(crate) fn jittered(min: Duration, max: Duration) -> Duration {
     let span = max.saturating_sub(min).as_millis().max(1) as u64;
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64;
     min + Duration::from_millis(nanos % span)
@@ -1329,7 +1552,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            HashMap::new(),
+            (HoleCtl::default(), false),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: wait, ..MultiLinkOptions::default() },
@@ -1371,7 +1594,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            HashMap::new(),
+            (HoleCtl::default(), false),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
@@ -1412,7 +1635,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            HashMap::new(),
+            (HoleCtl::default(), false),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
@@ -1452,7 +1675,7 @@ mod tests {
             Label::new(""),
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
-            HashMap::new(),
+            (HoleCtl::default(), false),
             None,
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::from_millis(500), reorder_clients: false, ..MultiLinkOptions::default() },
@@ -1501,15 +1724,28 @@ mod tests {
         }
     }
 
-    /// VPS-режим целиком на loopback: знакомство через порт сервера, 10 дыр без STUN и
-    /// MQTT, данные в обе стороны, перенос слота на новый порт сервера.
-    #[tokio::test]
-    async fn vps_server_and_client_link_all_slots_and_move_a_slot() {
-        let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let bootstrap = vps::Bootstrap::bind(bootstrap_port, 47100..=47299).await.unwrap();
-        let options = MultiLinkOptions::default();
-        let (server, mut server_rx) = MultiLink::start_discovery(
+    /// Быстрая политика набора для тестов: дыры добавляются каждые полсекунды, живут `age`.
+    fn quick_options(min: usize, max: usize, age: (Duration, Duration)) -> MultiLinkOptions {
+        MultiLinkOptions {
+            pool: PoolPolicy { min_active: min, max_total: max, add_interval: Duration::from_millis(500), ..PoolPolicy::default() },
+            hole_age: age,
+            ..MultiLinkOptions::default()
+        }
+    }
+
+    const LONG_AGE: (Duration, Duration) = (Duration::from_secs(600), Duration::from_secs(600));
+
+    /// Номера дыр в работе (не сливаемых).
+    fn active_ids(link: &MultiLink) -> Vec<SlotId> {
+        link.status().holes.iter().filter(|h| h.state == HoleState::Active).map(|h| h.slot).collect()
+    }
+
+    fn all_ids(link: &MultiLink) -> Vec<SlotId> {
+        link.status().holes.iter().map(|h| h.slot).collect()
+    }
+
+    async fn start_pair(bootstrap: &vps::Bootstrap, port: u16, server_id: Uuid, client_id: Uuid, options: MultiLinkOptions) -> ((MultiLink, mpsc::Receiver<Incoming>), (MultiLink, mpsc::Receiver<Incoming>)) {
+        let server = MultiLink::start_discovery(
             "",
             Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap: bootstrap.clone() },
             server_id,
@@ -1518,17 +1754,29 @@ mod tests {
         )
         .await
         .unwrap();
-        let (client, mut client_rx) = MultiLink::start_discovery(
+        let client = MultiLink::start_discovery(
             "",
-            Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)) },
+            Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], port)) },
             client_id,
             server_id,
             options,
         )
         .await
         .unwrap();
+        (server, client)
+    }
 
-        wait_until("10 дыр с обеих сторон", 40, || server.live_count() == 10 && client.live_count() == 10).await;
+    /// VPS-режим целиком на loopback: знакомство через порт сервера, набор дыр растёт до максимума
+    /// без STUN и MQTT, данные в обе стороны, возраст дыры идёт, слитая дыра заменяется новой.
+    #[tokio::test]
+    async fn vps_dynamic_set_grows_links_and_replaces_a_retired_hole() {
+        let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bootstrap = vps::Bootstrap::bind(bootstrap_port, 47100..=47299).await.unwrap();
+        let ((server, mut server_rx), (client, mut client_rx)) =
+            start_pair(&bootstrap, bootstrap_port, server_id, client_id, quick_options(3, 5, LONG_AGE)).await;
+
+        wait_until("5 дыр с обеих сторон", 40, || server.live_count() == 5 && client.live_count() == 5).await;
         for (_, addr) in client.live_links() {
             let port = addr.unwrap().port();
             assert!((47100..=47299).contains(&port), "клиент ходит на порт из диапазона сервера: {port}");
@@ -1554,16 +1802,81 @@ mod tests {
         }
         assert_eq!(got, (0..20u64).map(|s| (5u32, s)).collect::<Vec<_>>());
 
-        let old = client.live_links().into_iter().find(|l| l.0 == 3).unwrap().1.unwrap();
-        server.move_slot(3).await;
-        wait_until("слот 3 на новом порту сервера", 40, || {
-            client.live_links().iter().any(|l| l.0 == 3 && l.1.is_some_and(|a| a != old)) && client.live_count() == 10
+        // Возраст дыры идёт; все дыры в работе.
+        let before = client.status().holes;
+        assert!(before.iter().all(|h| h.state == HoleState::Active));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let after = client.status().holes;
+        for h in &before {
+            let later = after.iter().find(|a| a.slot == h.slot).expect("дыра жива");
+            assert!(later.age >= h.age + Duration::from_secs(1), "возраст растёт: {:?} -> {:?}", h.age, later.age);
+        }
+
+        // Сервер сливает дыру: оба конца её закрывают, клиент открывает замену под новым номером.
+        let victim = all_ids(&client)[2];
+        server.move_slot(victim).await;
+        wait_until("дыра слита и заменена", 40, || {
+            !all_ids(&client).contains(&victim) && !all_ids(&server).contains(&victim) && client.live_count() == 5 && server.live_count() == 5
         })
         .await;
     }
 
+    /// Дыры стареют и заменяются, а пакеты при этом не теряются: слив отдаёт последние пакеты,
+    /// отправка по сливаемой дыре прекращается, а в работе всегда не меньше `min_active` дыр.
+    #[tokio::test]
+    async fn vps_holes_rotate_by_age_without_losing_packets() {
+        let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let bootstrap_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bootstrap = vps::Bootstrap::bind(bootstrap_port, 47900..=48099).await.unwrap();
+        let options = quick_options(3, 4, (Duration::from_secs(3), Duration::from_secs(4)));
+        let ((server, server_rx), (client, client_rx)) = start_pair(&bootstrap, bootstrap_port, server_id, client_id, options).await;
+        wait_until("4 дыры с обеих сторон", 40, || server.live_count() == 4 && client.live_count() == 4).await;
+        let first = all_ids(&client);
+
+        const COUNT: u32 = 500;
+        let up = async {
+            for i in 0..COUNT {
+                client.send_data(&i.to_be_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        };
+        let down = async {
+            for i in 0..COUNT {
+                server.send_data(&i.to_be_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        };
+        // Следим, что в работе всегда не меньше `min_active` дыр на обеих сторонах.
+        let watch = async {
+            let mut worst = usize::MAX;
+            for _ in 0..140 {
+                worst = worst.min(active_ids(&client).len()).min(active_ids(&server).len());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            worst
+        };
+        let collect = |mut rx: mpsc::Receiver<Incoming>| async move {
+            let mut seen = std::collections::HashSet::new();
+            while seen.len() < COUNT as usize {
+                let Ok(Some(p)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await else { break };
+                seen.insert(u32::from_be_bytes(p.payload[..4].try_into().unwrap()));
+            }
+            seen.len()
+        };
+        let (_, _, worst, at_server, at_client) = tokio::join!(up, down, watch, collect(server_rx), collect(client_rx));
+        assert_eq!(at_server, COUNT as usize, "вверх дошло не всё");
+        assert_eq!(at_client, COUNT as usize, "вниз дошло не всё");
+        assert!(worst >= 3, "в работе было меньше min_active дыр: {worst}");
+
+        let now = all_ids(&client);
+        let replaced = first.iter().filter(|id| !now.contains(id)).count();
+        assert!(replaced >= 2, "за 14 с должны смениться хотя бы две дыры из {first:?}, сейчас {now:?}");
+        let server_now = all_ids(&server);
+        assert!(server_now.iter().all(|id| now.contains(id)) || server_now.len() <= 4, "сервер держит лишнее: {server_now:?} против {now:?}");
+    }
+
     /// Два клиента на одном порту знакомства (один `Bootstrap` на процесс, общий GUID сервера):
-    /// оба поднимают по 10 дыр, а остановка одного не трогает другого и освобождает его имя.
+    /// оба набирают дыры, а остановка одного не трогает другого и освобождает его имя.
     #[tokio::test]
     async fn vps_server_serves_two_clients_on_one_port() {
         let server_id = Uuid::new_v4();
@@ -1572,31 +1885,31 @@ mod tests {
         let bootstrap = vps::Bootstrap::bind(bootstrap_port, 47300..=47499).await.unwrap();
         let server_discovery = || Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap: bootstrap.clone() };
         let client_discovery = || Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)) };
-        let options = MultiLinkOptions::default();
+        let options = quick_options(3, 4, LONG_AGE);
 
         let (server_a, _rx_a) = MultiLink::start_discovery("", server_discovery(), server_id, client_a, options).await.unwrap();
         let (server_b, _rx_b) = MultiLink::start_discovery("", server_discovery(), server_id, client_b, options).await.unwrap();
         let (peer_a, _peer_a_rx) = MultiLink::start_discovery("", client_discovery(), client_a, server_id, options).await.unwrap();
         let (peer_b, _peer_b_rx) = MultiLink::start_discovery("", client_discovery(), client_b, server_id, options).await.unwrap();
-        wait_until("оба клиента: по 10 дыр", 40, || {
-            server_a.live_count() == 10 && server_b.live_count() == 10 && peer_a.live_count() == 10 && peer_b.live_count() == 10
+        wait_until("оба клиента: по 4 дыры", 40, || {
+            server_a.live_count() == 4 && server_b.live_count() == 4 && peer_a.live_count() == 4 && peer_b.live_count() == 4
         })
         .await;
 
         // Остановили клиента B: его наборы дыр уходят, клиент A продолжает работать.
         drop(peer_b);
         drop(server_b);
-        wait_until("A остался с 10 дырами", 20, || server_a.live_count() == 10 && peer_a.live_count() == 10).await;
+        wait_until("A остался с 4 дырами", 20, || server_a.live_count() == 4 && peer_a.live_count() == 4).await;
 
         // Клиент B вернулся: его имя снова занято только им, знакомство проходит.
         let (server_b, _rx_b) = MultiLink::start_discovery("", server_discovery(), server_id, client_b, options).await.unwrap();
         let (peer_b, _peer_b_rx) = MultiLink::start_discovery("", client_discovery(), client_b, server_id, options).await.unwrap();
-        wait_until("B снова с 10 дырами", 40, || server_b.live_count() == 10 && peer_b.live_count() == 10).await;
+        wait_until("B снова с 4 дырами", 40, || server_b.live_count() == 4 && peer_b.live_count() == 4).await;
     }
 
-    /// Клиент пропал (процесс убит) и пришёл снова с новыми сессиями, а сервер своих дыр ещё не
-    /// потерял: сервер обязан отвечать на порту знакомства и принять нового клиента сразу, а не
-    /// после тайм-аутов (раньше на этом сервер замолкал навсегда).
+    /// Клиент пропал (процесс убит) и пришёл снова, а сервер своих дыр ещё не потерял: сервер
+    /// узнаёт перезапуск по времени запуска в запросе знакомства, закрывает прошлые дыры клиента
+    /// и принимает нового сразу, не дожидаясь тайм-аута потери (15 с).
     #[tokio::test]
     async fn vps_server_accepts_a_restarted_client_at_once() {
         let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
@@ -1604,20 +1917,25 @@ mod tests {
         let bootstrap = vps::Bootstrap::bind(bootstrap_port, 47600..=47799).await.unwrap();
         let server_discovery = || Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap: bootstrap.clone() };
         let client_discovery = || Discovery::VpsClient { server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)) };
-        let options = MultiLinkOptions::default();
+        let options = quick_options(3, 4, LONG_AGE);
         let (server, _server_rx) = MultiLink::start_discovery("", server_discovery(), server_id, client_id, options).await.unwrap();
 
         let (first, _first_rx) = MultiLink::start_discovery("", client_discovery(), client_id, server_id, options).await.unwrap();
-        wait_until("первый клиент: 10 дыр", 20, || server.live_count() == 10 && first.live_count() == 10).await;
+        wait_until("первый клиент: 4 дыры", 20, || server.live_count() == 4 && first.live_count() == 4).await;
+        let old = all_ids(&server);
         drop(first);
+        // Время запуска в миллисекундах: второй клиент должен стартовать позже первого.
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
-        // Потеря дыры на сервере — через 15 с тишины; новый клиент должен встать раньше.
         let (second, mut second_rx) = MultiLink::start_discovery("", client_discovery(), client_id, server_id, options).await.unwrap();
-        wait_until("второй клиент: 10 дыр до тайм-аута потери", 10, || second.live_count() == 10).await;
+        wait_until("сервер держит только дыры нового клиента", 10, || {
+            let now = all_ids(&server);
+            now.len() == 4 && now.iter().all(|id| !old.contains(id)) && second.live_count() == 4
+        })
+        .await;
         server.send_data(b"hello").await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), second_rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.payload, b"hello");
-
     }
 
     /// hp-stats целиком на loopback (PLAN-ML.md): сервер нумерует пакеты вниз, клиент (сам
@@ -1649,7 +1967,7 @@ mod tests {
         )
         .await
         .unwrap();
-        wait_until("10 дыр с обеих сторон", 40, || server.live_count() == 10 && client.live_count() == 10).await;
+        wait_until("дыры с обеих сторон", 40, || server.live_count() >= 4 && client.live_count() >= 4).await;
 
         let dir = std::env::temp_dir().join(format!("hp-stats-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

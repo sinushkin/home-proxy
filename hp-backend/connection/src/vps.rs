@@ -1,50 +1,53 @@
 //! VPS-режим: у сервера белый IP, пробивать ничего не нужно.
 //!
 //! Клиент заранее знает `ip:порт знакомства` сервера. Никаких STUN, MQTT и окон пробива: клиент
-//! спрашивает, сервер отвечает «твой слот k — мой порт P, сессия S», клиент идёт на этот порт.
+//! спрашивает, сервер отвечает «твоя дыра k — мой порт P, сессия S», клиент идёт на этот порт.
+//!
+//! **Набор дыр динамический** (`PLAN-dynamic-holes-relay.md`): дыра «поработала — умерла». Номер
+//! дыры (`SlotId`) монотонный, назначает его клиент, и он не переиспользуется. Клиент — координатор:
+//! `Manager` раз в секунду зовёт `holes::plan` и открывает новые дыры или сливает старые и плохие;
+//! сервер реактивный: на запрос знакомства с новым номером он заводит дыру (`ServerHole`).
 //!
 //! **Порт знакомства**: запрос начинается с открытого имени клиента (`auth::peer_name`); чужое имя
-//! сервер молча отбрасывает. На подписанный запрос клиента по слоту k (его запись `Rendezvous` с
-//! сессией) сервер отвечает текущей записью своего слота k. Запись у слота есть всегда — с момента,
-//! как он занял порт, — и не снимается никогда, только заменяется новой. Состояние знакомства
-//! (записи и сессии по слотам) держит актор клиента `ClientActor`; слоты обновляют его через канал.
+//! сервер молча отбрасывает. На подписанный запрос клиента по дыре k (его запись `Rendezvous` с
+//! сессией) сервер отвечает записью своей дыры k, когда она готова. Состояние знакомства клиента
+//! держит его актор `ClientActor`; дыры сообщают ему о себе через канал. Недавно закрытые номера
+//! актор помнит, чтобы запоздалый запрос не воскресил дыру.
 //!
-//! Стейт-машина **слота сервера** (инициатор всего — клиент):
-//!
-//! ```text
-//!   Listening: новый случайный порт P из диапазона и сессия S; запись (P, S) — в таблицу порта
-//!   знакомства ──────────────────────────────────────────────────────────────────────────┐
-//!        │ пришла сессия клиента C (не та, с которой была прошлая дыра)                   │
-//!        ▼                                                                                │
-//!   Accepting(C): ждём на P первый подписанный пакет клиента; пришла сессия новее — ждём   │
-//!   уже её (без тайм-аута: клиента, который пропал, ждать не вредно)                      │
-//!        │                                                                                │
-//!   Connected: дыра в реестре, пока не потеряна, не помечена плохой (`move_slot`) или      │
-//!   клиент не пришёл с новой сессией (перезапустился) → новая регистрация ────────────────┘
-//! ```
-//!
-//! Стейт-машина **слота клиента**:
+//! Задача **дыры сервера** (один проход):
 //!
 //! ```text
-//!   Asking: новый локальный сокет и сессия C; раз в секунду шлём запрос на порт знакомства ─┐
-//!        │ ответ сервера (P, S)                                                            │
-//!        ▼                                                                                 │
-//!   Connecting(P, S): стучимся на P (запросы продолжаются); ответ сменился — идём на новый   │
-//!        │                                                                                 │
-//!   Connected: дыра в реестре, пока не потеряна или не помечена плохой → новая сессия ───────┘
+//!   Listening: порт P из банка и сессия S; запись (P, S) — актору порта знакомства
+//!        │
+//!   Accepting: ждём на P первый подписанный пакет клиента (не дольше PUNCH_WINDOW)
+//!        │
+//!   Connected: дыра в реестре (SlotBase::hold), пока не потеряна и не слита (Drain) → конец
 //! ```
 //!
-//! Все слоты знакомятся через порт знакомства напрямую (виртуал-брокер P2P здесь не нужен).
-//! Обмен на нём — обычный `PeerMessage::Lite` с `Rendezvous` внутри (номер слота — в записи),
-//! подписанный и замаскированный ключами знакомства из секрета пары
+//! Задача **дыры клиента** (один проход):
+//!
+//! ```text
+//!   Asking: новый локальный сокет и сессия C; раз в секунду шлём запрос на порт знакомства
+//!        │ ответ сервера (P, S)
+//!   Connecting(P, S): стучимся на P (запросы продолжаются); ответ сменился — идём на новый
+//!        │
+//!   Connected: дыра в реестре, пока не потеряна и не слита → конец; Manager откроет замену
+//! ```
+//!
+//! Слив (`Drain`) — в `multilink::SlotBase::hold`: любая сторона, признавшая дыру плохой или
+//! просроченной, помечает её `Draining` (данные по ней больше не шлёт), сообщает пиру `Drain`
+//! по нескольким дырам, ещё ~2 с принимает и закрывает; порт возвращается в банк.
+//!
+//! Обмен на порту знакомства — обычный `PeerMessage::Lite` с `Rendezvous` внутри (номер дыры — в
+//! записи), подписанный и замаскированный ключами знакомства из секрета пары
 //! (`auth::PairSecret::bootstrap_keys`); сама запись тоже подписана. Без полного GUID обеих
 //! сторон такой пакет не подделать.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
@@ -53,7 +56,8 @@ use uuid::Uuid;
 
 use crate::auth::{peer_name, PairSecret, RecvKeys, SendKeys};
 use crate::codec;
-use crate::multilink::{AbortOnDrop, SlotBase, SlotId, SlotPhase, TARGET_LINKS};
+use crate::holes::{plan, Action, HoleInfo, HoleState, PoolPolicy};
+use crate::multilink::{jittered, send_command, AbortOnDrop, HoleCmd, HoleFactory, SlotBase, SlotId, SlotPhase};
 use crate::port_pool::{PortLease, PortPool};
 use crate::proto::{lite, peer_message, Lite, PeerMessage, Rendezvous};
 use crate::punch::{self, PeerIdentity, PunchConfig};
@@ -68,6 +72,20 @@ const ASK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Длина открытого имени клиента перед запросом знакомства (`auth::peer_name`).
 const NAME_LEN: usize = 8;
+
+/// Сколько клиент ждёт свою дыру (ответ сервера и пробив), а сервер — клиента на выданном порту.
+/// Дольше не ждём: бывает, что ответы по новой паре портов не доходят, тогда нужна другая дыра.
+const PUNCH_WINDOW: Duration = Duration::from_secs(30);
+
+/// Сколько клиент ждёт, пока дыра откроется (ответ сервера и пробив), прежде чем бросить её и открыть
+/// другую: бывает, что по новой паре портов ответы не доходят.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Сколько недавно закрытых номеров дыр помнит актор клиента (запоздалый запрос их не воскресит).
+const CLOSED_MEMORY: usize = 256;
+
+/// Как часто менеджер набора зовёт политику.
+const MANAGE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Очередь команд листенера (регистрация и снятие клиентов).
 const COMMAND_QUEUE: usize = 16;
@@ -105,8 +123,10 @@ impl Pair {
     }
 
     /// Наша подписанная запись слота.
-    fn record(&self, slot: crate::multilink::SlotId, session: Uuid, endpoint: SocketAddr) -> Rendezvous {
-        rendezvous::our_record(&self.secret, self.my_peer_id, slot, session, &[endpoint], 0)
+    /// `started_ms` — время запуска процесса клиента (мс Unix; у сервера `0`): по его росту
+    /// сервер узнаёт, что клиент перезапущен и его прошлые дыры мертвы.
+    fn record(&self, slot: crate::multilink::SlotId, session: Uuid, endpoint: SocketAddr, started_ms: u64) -> Rendezvous {
+        rendezvous::our_record(&self.secret, self.my_peer_id, slot, session, &[endpoint], started_ms)
     }
 }
 
@@ -115,15 +135,13 @@ fn wrap(record: Rendezvous) -> PeerMessage {
     PeerMessage { body: Some(peer_message::Body::Lite(Lite { slot, payload: Some(lite::Payload::Rendezvous(record)), pid: None })) }
 }
 
-/// Достаёт запись слота пира (подпись пакета и записи проверены, слот в пределах набора); всё
-/// остальное — `None`.
+/// Достаёт запись дыры пира (подпись пакета и записи проверены); всё остальное — `None`.
 fn unwrap(data: &[u8], keys: &mut RecvKeys, pair: &Pair) -> Option<PeerSession> {
     let msg = codec::decode(data.to_vec(), keys)?;
     let Some(peer_message::Body::Lite(Lite { payload: Some(lite::Payload::Rendezvous(r)), .. })) = msg.body else {
         return None;
     };
-    let session = rendezvous::peer_session_from(&r, &pair.secret, pair.peer_id).ok()?;
-    (session.slot < TARGET_LINKS).then_some(session)
+    rendezvous::peer_session_from(&r, &pair.secret, pair.peer_id).ok()
 }
 
 /// Занимает порт из банка и привязывает к нему сокет. Если привязка не удалась (порт занят
@@ -223,6 +241,7 @@ pub(crate) struct ServerConfig {
     pub public_ip: IpAddr,
     pub pair: Pair,
     pub bootstrap: Bootstrap,
+    pub pool: PoolPolicy,
 }
 
 /// Запрос знакомства, уже отделённый от открытого имени клиента.
@@ -231,46 +250,40 @@ struct Knock {
     from: SocketAddr,
 }
 
-/// Новая запись слота сервера: слот сообщает актору клиента, что отвечать на знакомство.
-struct OfferUpdate {
-    slot: SlotId,
-    record: Rendezvous,
+/// Сообщения дыр сервера актору своего клиента.
+enum HoleMsg {
+    /// Дыра заняла порт: что отвечать на знакомство.
+    Offer { slot: SlotId, epoch: u32, record: Rendezvous },
+    /// Задача дыры закончилась. `retry` — по нашей вине (не нашёлся порт): номер не «закрыт»,
+    /// следующий запрос клиента заведёт дыру заново.
+    Ended { slot: SlotId, epoch: u32, retry: bool },
 }
 
-/// Регистрирует клиента на общем порту знакомства и запускает его слоты и актор.
-pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConfig, bases: Vec<SlotBase>) -> Result<Vec<AbortOnDrop>> {
+/// Регистрирует клиента на общем порту знакомства и запускает его актор (он заводит дыры).
+pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConfig, factory: HoleFactory) -> Result<Vec<AbortOnDrop>> {
     let name = peer_name(&config.pair.peer_id);
     let Registration { socket, knocks, guard } = config.bootstrap.register(name.clone()).await;
     log::info!("{label}VPS-сервер: клиент {name} на порту знакомства {}", config.bootstrap.port());
 
-    let (offer_tx, offer_rx) = mpsc::channel(TARGET_LINKS as usize);
-    let mut sessions = Vec::new();
-    let mut tasks = Vec::new();
-    for base in bases {
-        // Последняя сессия клиента для этого слота (с порта знакомства).
-        let (client_tx, client_rx) = watch::channel(None);
-        sessions.push(client_tx);
-        let slot = ServerSlot {
-            public_ip: config.public_ip,
-            ports: config.bootstrap.ports(),
-            pair: config.pair.clone(),
-            offers: offer_tx.clone(),
-            client_rx,
-            base,
-        };
-        tasks.push(AbortOnDrop(tokio::spawn(slot.run())));
-    }
     let (send, recv) = config.pair.secret.bootstrap_keys();
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let actor = ClientActor {
         socket,
-        pair: config.pair.clone(),
+        pair: config.pair,
         send,
         recv,
-        offers: vec![None; TARGET_LINKS as usize],
-        sessions,
+        public_ip: config.public_ip,
+        ports: config.bootstrap.ports(),
+        factory,
+        msg_tx,
+        holes: HashMap::new(),
+        next_epoch: 0,
+        closed: VecDeque::new(),
+        // С запасом на сливаемые дыры: клиент открывает замену, пока старая ещё закрывается.
+        max_holes: config.pool.max_total * 2,
+        client_started: 0,
     };
-    tasks.push(AbortOnDrop(tokio::spawn(actor.run(knocks, offer_rx, guard))));
-    Ok(tasks)
+    Ok(vec![AbortOnDrop(tokio::spawn(actor.run(knocks, msg_rx, guard)))])
 }
 
 /// Листенер порта знакомства: команды регистрации и раздача запросов по открытому имени.
@@ -304,130 +317,192 @@ async fn listen(socket: Arc<UdpSocket>, mut commands: mpsc::Receiver<Command>) {
     }
 }
 
-/// Владелец состояния клиента на сервере: записи слотов для знакомства и сессии клиента по слотам.
-/// Блокировок нет: состояние меняет только эта задача, слоты пишут через канал.
+/// Дыра клиента на сервере: что отвечать на знакомство и задача дыры.
+struct ServerHoleRec {
+    epoch: u32,
+    client_session: Uuid,
+    offer: Option<Rendezvous>,
+    _task: AbortOnDrop,
+}
+
+/// Владелец состояния клиента на сервере: его дыры, ответы на знакомство, недавно закрытые номера.
+/// Блокировок нет: состояние меняет только эта задача, дыры пишут ей через канал.
 struct ClientActor {
     socket: Arc<UdpSocket>,
     pair: Pair,
     send: SendKeys,
     recv: RecvKeys,
-    offers: Vec<Option<Rendezvous>>,
-    sessions: Vec<watch::Sender<Option<Uuid>>>,
+    public_ip: IpAddr,
+    ports: Arc<PortPool>,
+    factory: HoleFactory,
+    msg_tx: mpsc::UnboundedSender<HoleMsg>,
+    holes: HashMap<SlotId, ServerHoleRec>,
+    next_epoch: u32,
+    closed: VecDeque<(SlotId, Uuid)>,
+    max_holes: usize,
+    /// Время запуска процесса клиента по его последнему запросу (`0` — ещё не знаем).
+    client_started: u64,
 }
 
 impl ClientActor {
-    async fn run(mut self, mut knocks: mpsc::Receiver<Knock>, mut updates: mpsc::Receiver<OfferUpdate>, _registration: Unregistration) {
+    async fn run(mut self, mut knocks: mpsc::Receiver<Knock>, mut messages: mpsc::UnboundedReceiver<HoleMsg>, _registration: Unregistration) {
         loop {
             tokio::select! {
-                Some(knock) = knocks.recv() => self.knock(knock).await,
-                Some(update) = updates.recv() => self.offers[update.slot as usize] = Some(update.record),
-                else => return,
+                knock = knocks.recv() => match knock {
+                    Some(knock) => self.knock(knock).await,
+                    None => return,
+                },
+                Some(message) = messages.recv() => self.on_message(message),
             }
         }
     }
 
-    /// Запрос клиента по слоту k → его сессия слоту k, в ответ — запись слота k.
+    fn on_message(&mut self, message: HoleMsg) {
+        match message {
+            HoleMsg::Offer { slot, epoch, record } => {
+                if let Some(hole) = self.holes.get_mut(&slot).filter(|h| h.epoch == epoch) {
+                    hole.offer = Some(record);
+                }
+            }
+            HoleMsg::Ended { slot, epoch, retry } => {
+                if let Some(hole) = self.holes.get(&slot).filter(|h| h.epoch == epoch) {
+                    let client_session = hole.client_session;
+                    self.holes.remove(&slot);
+                    if !retry {
+                        self.closed.push_back((slot, client_session));
+                        if self.closed.len() > CLOSED_MEMORY {
+                            self.closed.pop_front();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Запрос клиента по дыре k: новый номер — заводим дыру; в ответ — запись дыры, когда готова.
     async fn knock(&mut self, knock: Knock) {
         let Some(request) = unwrap(&knock.packet, &mut self.recv, &self.pair) else { return };
-        let slot = request.slot as usize;
-        self.sessions[slot].send_if_modified(|current| {
-            let changed = *current != Some(request.session_id);
-            if changed {
-                log::debug!("знакомство: слот {slot}, клиент {}, сессия {}", knock.from, request.session_id);
-                *current = Some(request.session_id);
+        let slot = request.slot;
+        let started = request.registered_at_unix_ms;
+        if started > self.client_started {
+            // Клиент перезапущен (время запуска выросло): его прошлые дыры мертвы, не ждём тайм-аута потери.
+            if self.client_started != 0 && !self.holes.is_empty() {
+                log::info!("клиент перезапущен: закрываем его прошлые дыры ({})", self.holes.len());
+                self.holes.clear();
             }
-            changed
-        });
-        if let Some(offer) = self.offers[slot].clone() {
+            self.closed.clear();
+            self.client_started = started;
+        } else if started != 0 && started < self.client_started {
+            return; // запоздалый запрос прошлого экземпляра клиента
+        }
+        // Запоздалый запрос уже закрытой дыры её не воскрешает.
+        if self.closed.contains(&(slot, request.session_id)) {
+            return;
+        }
+        match self.holes.get(&slot) {
+            // Тот же номер с новой сессией: так делает прошлая версия клиента (фиксированные слоты
+            // 0..9 перерегистрируются после потери дыры). Прошлая дыра этого номера брошена.
+            Some(hole) if hole.client_session != request.session_id => {
+                log::debug!("знакомство: дыра {slot} перерегистрирована клиентом {}, новая сессия {}", knock.from, request.session_id);
+                if let Some(mut old) = self.holes.remove(&slot) {
+                    // Дожидаемся конца старой задачи: её уборка (реестр, команды, фазы) не должна
+                    // задеть новую дыру с тем же номером.
+                    old._task.0.abort();
+                    let _ = (&mut old._task.0).await;
+                }
+                self.spawn_hole(slot, request.session_id);
+            }
+            Some(_) => {}
+            None => {
+                if self.holes.len() >= self.max_holes {
+                    log::debug!("знакомство: у клиента {} уже {} дыр, запрос дыры {slot} отброшен", knock.from, self.holes.len());
+                    return;
+                }
+                log::debug!("знакомство: дыра {slot}, клиент {}, сессия {}", knock.from, request.session_id);
+                self.spawn_hole(slot, request.session_id);
+            }
+        }
+        if let Some(offer) = self.holes.get(&slot).and_then(|h| h.offer.clone()) {
             let _ = self.socket.send_to(&codec::encode(&wrap(offer), &self.send), knock.from).await;
         }
     }
-}
 
-/// Рабочая задача одного слота сервера.
-struct ServerSlot {
-    public_ip: IpAddr,
-    ports: Arc<PortPool>,
-    pair: Pair,
-    offers: mpsc::Sender<OfferUpdate>,
-    client_rx: watch::Receiver<Option<Uuid>>,
-    base: SlotBase,
-}
-
-impl ServerSlot {
-    async fn run(mut self) {
-        let (slot, label) = (self.base.slot, self.base.label.clone());
-        // Сессия клиента, с которой была последняя дыра: её повторный запрос — не повод
-        // принимать заново (клиент после потери дыры приходит с новой сессией).
-        let mut last_linked: Option<Uuid> = None;
-        loop {
-            // Listening: новый порт и сессия, запись сразу в таблице порта знакомства.
-            self.base.phase(SlotPhase::Rendezvous);
-            // Порт остаётся в банке, пока жива эта дыра (`port_lease`): вернётся, когда слот начнёт заново.
-            let (port_lease, socket) = match lease_and_bind(&self.ports).await {
-                Ok((lease, socket)) => (lease, Arc::new(socket)),
-                Err(e) => {
-                    log::warn!("{label}слот {slot}: не удалось занять порт: {e:#}; повтор");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
-            let port = port_lease.port();
-            let my_session = Uuid::new_v4();
-            let record = self.pair.record(slot, my_session, SocketAddr::new(self.public_ip, port));
-            let _ = self.offers.send(OfferUpdate { slot, record }).await;
-            log::debug!("{label}слот {slot}: порт {port}");
-
-            // Accepting: ждём пакет клиента на порту; сессия клиента сменилась — ждём уже её.
-            let link = 'accept: loop {
-                let client = tokio::select! {
-                    client = next_client(&mut self.client_rx, last_linked) => client,
-                    _ = self.base.redrop_rx.recv() => break 'accept None,
-                };
-                let Some(client) = client else { return };
-                log::info!("{label}слот {slot}: ждём клиента на порту {port}");
-                self.base.phase(SlotPhase::Punching);
-                let attempt = punch::establish(
-                    socket.clone(),
-                    port,
-                    Vec::new(), // пассивно: отвечаем туда, откуда придёт клиент
-                    self.pair.identity(slot, my_session, client),
-                    PunchConfig::default(),
-                    self.base.events.clone(),
-                );
-                tokio::select! {
-                    result = attempt => match result {
-                        Ok(link) => break 'accept Some((link, client)),
-                        Err(e) => {
-                            log::warn!("{label}слот {slot}: приём не удался: {e}");
-                            break 'accept None;
-                        }
-                    },
-                    _ = client_changed(&mut self.client_rx, client) => continue 'accept,
-                    _ = self.base.redrop_rx.recv() => break 'accept None,
-                }
-            };
-            let Some((link, client)) = link else { continue };
-
-            // Connected: держим, пока жива; клиент пришёл с новой сессией — значит, он эту дыру
-            // уже бросил (перезапустился), переходим на новую регистрацию сразу.
-            last_linked = Some(client);
-            let mut client_rx = self.client_rx.clone();
-            self.base.hold(link, async move { client_changed(&mut client_rx, client).await }).await;
-        }
+    fn spawn_hole(&mut self, slot: SlotId, client_session: Uuid) {
+        self.next_epoch = self.next_epoch.wrapping_add(1);
+        let epoch = self.next_epoch;
+        let hole = ServerHole {
+            public_ip: self.public_ip,
+            ports: self.ports.clone(),
+            pair: self.pair.clone(),
+            messages: self.msg_tx.clone(),
+            epoch,
+            base: self.factory.make(slot, true, true),
+        };
+        let task = AbortOnDrop(tokio::spawn(hole.run(client_session)));
+        self.holes.insert(slot, ServerHoleRec { epoch, client_session, offer: None, _task: task });
     }
 }
 
-/// Ждёт сессию клиента, отличную от `skip`; `None` — порт знакомства остановлен.
-async fn next_client(rx: &mut watch::Receiver<Option<Uuid>>, skip: Option<Uuid>) -> Option<Uuid> {
-    let value = rx.wait_for(|s| s.is_some() && *s != skip).await.ok()?;
-    *value
+/// Рабочая задача одной дыры сервера (один проход, потом дыра не возвращается).
+struct ServerHole {
+    public_ip: IpAddr,
+    ports: Arc<PortPool>,
+    pair: Pair,
+    messages: mpsc::UnboundedSender<HoleMsg>,
+    epoch: u32,
+    base: SlotBase,
 }
 
-/// Завершается, когда у клиента появилась сессия, отличная от `current`.
-async fn client_changed(rx: &mut watch::Receiver<Option<Uuid>>, current: Uuid) {
-    if rx.wait_for(|s| s.is_some_and(|s| s != current)).await.is_err() {
-        std::future::pending::<()>().await;
+impl ServerHole {
+    async fn run(mut self, client: Uuid) {
+        let (slot, epoch) = (self.base.slot, self.epoch);
+        let retry = self.serve(client).await;
+        let _ = self.messages.send(HoleMsg::Ended { slot, epoch, retry });
+    }
+
+    /// Возвращает `true`, если дыру не удалось завести по нашей вине (нет порта).
+    async fn serve(&mut self, client: Uuid) -> bool {
+        let (slot, label) = (self.base.slot, self.base.label.clone());
+        self.base.phase(SlotPhase::Rendezvous);
+        // Порт остаётся в банке, пока жива дыра: вернётся, когда задача закончится.
+        let (port_lease, socket) = match lease_and_bind(&self.ports).await {
+            Ok((lease, socket)) => (lease, Arc::new(socket)),
+            Err(e) => {
+                log::warn!("{label}дыра {slot}: не удалось занять порт: {e:#}");
+                return true;
+            }
+        };
+        let port = port_lease.port();
+        let my_session = Uuid::new_v4();
+        let record = self.pair.record(slot, my_session, SocketAddr::new(self.public_ip, port), 0);
+        let _ = self.messages.send(HoleMsg::Offer { slot, epoch: self.epoch, record });
+        log::info!("{label}дыра {slot}: ждём клиента на порту {port}");
+        self.base.phase(SlotPhase::Punching);
+        let attempt = punch::establish(
+            socket.clone(),
+            port,
+            Vec::new(), // пассивно: отвечаем туда, откуда придёт клиент
+            self.pair.identity(slot, my_session, client),
+            PunchConfig::default(),
+            self.base.events.clone(),
+        );
+        let link = tokio::select! {
+            result = tokio::time::timeout(PUNCH_WINDOW, attempt) => match result {
+                Ok(Ok(link)) => link,
+                Ok(Err(e)) => {
+                    log::warn!("{label}дыра {slot}: приём не удался: {e}");
+                    return false;
+                }
+                Err(_) => {
+                    log::info!("{label}дыра {slot}: клиент не пришёл за {PUNCH_WINDOW:?}, закрываем");
+                    return false;
+                }
+            },
+            _ = self.base.cmd_rx.recv() => return false,
+        };
+        self.base.hold(link, std::future::pending()).await;
+        drop(port_lease);
+        false
     }
 }
 
@@ -441,9 +516,11 @@ pub(crate) struct ClientConfig {
     pub pair: Pair,
     pub bind_ip: IpAddr,
     pub bind_ifindex: Option<u32>,
+    pub pool: PoolPolicy,
+    pub hole_age: (Duration, Duration),
 }
 
-/// Сокет знакомства клиента: запросы серверу и разбор ответов по слотам.
+/// Сокет знакомства клиента: запросы серверу и разбор ответов по дырам.
 struct ClientBootstrap {
     socket: UdpSocket,
     server: SocketAddr,
@@ -468,16 +545,20 @@ impl ClientBootstrap {
     }
 }
 
-/// Принимает ответы сервера и раскладывает их по слотам (последний ответ слота — в его `watch`).
-async fn receive_offers(boot: Arc<ClientBootstrap>, mut recv: RecvKeys, pair: Pair, offers: Vec<watch::Sender<Option<PeerSession>>>) {
+/// Ответы сервера по номерам дыр: последний ответ дыры — в её `watch`.
+type Offers = Arc<Mutex<HashMap<SlotId, watch::Sender<Option<PeerSession>>>>>;
+
+/// Принимает ответы сервера и раскладывает их по дырам (ответ на уже закрытую дыру отбрасывается).
+async fn receive_offers(boot: Arc<ClientBootstrap>, mut recv: RecvKeys, pair: Pair, offers: Offers) {
     let mut buf = [0u8; 1500];
     loop {
         let Ok((n, _)) = boot.socket.recv_from(&mut buf).await else { continue };
         let Some(offer) = unwrap(&buf[..n], &mut recv, &pair) else { continue };
-        offers[offer.slot as usize].send_if_modified(|current| {
+        let Some(tx) = offers.lock().unwrap().get(&offer.slot).cloned() else { continue };
+        tx.send_if_modified(|current| {
             let changed = current.as_ref() != Some(&offer);
             if changed {
-                log::debug!("знакомство: слот {}, сервер предлагает {} (сессия {})", offer.slot, offer.addr, offer.session_id);
+                log::debug!("знакомство: дыра {}, сервер предлагает {} (сессия {})", offer.slot, offer.addr, offer.session_id);
                 *current = Some(offer.clone());
             }
             changed
@@ -485,110 +566,225 @@ async fn receive_offers(boot: Arc<ClientBootstrap>, mut recv: RecvKeys, pair: Pa
     }
 }
 
-/// Сокет знакомства и слоты клиента.
-pub(crate) async fn start_client(label: &crate::label::Label, config: ClientConfig, bases: Vec<SlotBase>) -> Result<Vec<AbortOnDrop>> {
+/// Сокет знакомства и менеджер набора дыр клиента.
+pub(crate) async fn start_client(label: &crate::label::Label, config: ClientConfig, factory: HoleFactory) -> Result<Vec<AbortOnDrop>> {
     let socket = crate::bind::udp(config.bind_ip, 0, config.bind_ifindex).await.context("сокет знакомства")?;
     let (send, recv) = config.pair.secret.bootstrap_keys();
     let name = peer_name(&config.pair.my_peer_id);
     let boot = Arc::new(ClientBootstrap { socket, server: config.server, send, name });
     log::info!("{label}VPS-клиент: сервер {}", config.server);
 
-    let mut offers = Vec::new();
-    let mut tasks = Vec::new();
-    for base in bases {
-        let (offer_tx, offer_rx) = watch::channel(None);
-        offers.push(offer_tx);
-        let slot = ClientSlot {
-            boot: boot.clone(),
-            pair: config.pair.clone(),
-            bind_ip: config.bind_ip,
-            bind_ifindex: config.bind_ifindex,
-            offer_rx,
-            base,
-        };
-        tasks.push(AbortOnDrop(tokio::spawn(slot.run())));
-    }
-    tasks.push(AbortOnDrop(tokio::spawn(receive_offers(boot, recv, config.pair, offers))));
-    Ok(tasks)
+    let offers = Offers::default();
+    let (ended_tx, ended_rx) = mpsc::unbounded_channel();
+    let manager = Manager {
+        boot: boot.clone(),
+        pair: config.pair.clone(),
+        bind_ip: config.bind_ip,
+        bind_ifindex: config.bind_ifindex,
+        factory,
+        offers: offers.clone(),
+        pool: config.pool,
+        hole_age: config.hole_age,
+        holes: HashMap::new(),
+        // Номера монотонные и не переиспользуются; старт случайный (до миллиона — чтобы в статусе
+        // номера были короткими), чтобы перезапущенный клиент не пересёкся с номерами прошлого запуска.
+        next_id: u32::from_le_bytes(Uuid::new_v4().into_bytes()[..4].try_into().expect("4 байта")) % 1_000_000,
+        last_open: Instant::now() - config.pool.add_interval,
+        ended_tx,
+        started_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_millis() as u64).max(1),
+    };
+    Ok(vec![
+        AbortOnDrop(tokio::spawn(receive_offers(boot, recv, config.pair, offers))),
+        AbortOnDrop(tokio::spawn(manager.run(ended_rx))),
+    ])
 }
 
-/// Рабочая задача одного слота клиента.
-struct ClientSlot {
+/// Дыра, которую ведёт менеджер.
+struct HoleRec {
+    opened: Instant,
+    max_age: Duration,
+    _task: AbortOnDrop,
+}
+
+/// Менеджер набора дыр клиента: раз в секунду оценивает набор (`holes::plan`) и открывает новые
+/// дыры или сливает старые и плохие. Номера назначает он.
+struct Manager {
+    boot: Arc<ClientBootstrap>,
+    pair: Pair,
+    bind_ip: IpAddr,
+    bind_ifindex: Option<u32>,
+    factory: HoleFactory,
+    offers: Offers,
+    pool: PoolPolicy,
+    hole_age: (Duration, Duration),
+    holes: HashMap<SlotId, HoleRec>,
+    next_id: SlotId,
+    last_open: Instant,
+    ended_tx: mpsc::UnboundedSender<SlotId>,
+    /// Время запуска процесса (мс Unix), во всех запросах знакомства: так сервер узнаёт о перезапуске.
+    started_ms: u64,
+}
+
+impl Manager {
+    async fn run(mut self, mut ended: mpsc::UnboundedReceiver<SlotId>) {
+        let mut ticker = tokio::time::interval(MANAGE_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => self.evaluate(),
+                Some(slot) = ended.recv() => {
+                    self.holes.remove(&slot);
+                    // Не ждём очередного тика: замена нужна сразу, если дыр не хватает.
+                    self.evaluate();
+                }
+            }
+        }
+    }
+
+    fn evaluate(&mut self) {
+        let now = Instant::now();
+        let infos: Vec<HoleInfo> = {
+            let registry = self.factory.registry.lock().unwrap();
+            self.holes
+                .iter()
+                .map(|(&id, rec)| {
+                    let age = now.duration_since(rec.opened);
+                    match registry.hole_info(id) {
+                        Some((state, loss_out, loss_in)) => HoleInfo { id, state, age, max_age: rec.max_age, loss_out, loss_in },
+                        // Ещё не в реестре: идёт знакомство и пробив.
+                        None => HoleInfo { id, state: HoleState::Warming, age, max_age: rec.max_age, loss_out: None, loss_in: None },
+                    }
+                })
+                .collect()
+        };
+        for action in plan(&infos, now.duration_since(self.last_open), &self.pool) {
+            match action {
+                Action::Open => {
+                    if self.holes.len() < self.pool.max_total * 2 {
+                        self.open(now);
+                    }
+                }
+                Action::Retire(id) => {
+                    log::debug!("{}политика набора: сливаем дыру {id}", self.factory.label);
+                    send_command(&self.factory.ctl, id, HoleCmd::Retire);
+                }
+            }
+        }
+    }
+
+    fn open(&mut self, now: Instant) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.last_open = now;
+        let max_age = jittered(self.hole_age.0, self.hole_age.1);
+        let (offer_tx, offer_rx) = watch::channel(None);
+        self.offers.lock().unwrap().insert(id, offer_tx);
+        let hole = ClientHole {
+            boot: self.boot.clone(),
+            pair: self.pair.clone(),
+            bind_ip: self.bind_ip,
+            bind_ifindex: self.bind_ifindex,
+            offer_rx,
+            base: self.factory.make(id, true, false),
+            offers: self.offers.clone(),
+            ended: self.ended_tx.clone(),
+            started_ms: self.started_ms,
+        };
+        let task = AbortOnDrop(tokio::spawn(hole.run()));
+        self.holes.insert(id, HoleRec { opened: now, max_age, _task: task });
+    }
+}
+
+/// Рабочая задача одной дыры клиента (один проход, потом дыра не возвращается).
+struct ClientHole {
     boot: Arc<ClientBootstrap>,
     pair: Pair,
     bind_ip: IpAddr,
     bind_ifindex: Option<u32>,
     offer_rx: watch::Receiver<Option<PeerSession>>,
     base: SlotBase,
+    offers: Offers,
+    ended: mpsc::UnboundedSender<SlotId>,
+    started_ms: u64,
 }
 
-impl ClientSlot {
+impl ClientHole {
     async fn run(mut self) {
-        let (slot, label) = (self.base.slot, self.base.label.clone());
-        loop {
-            // Asking: новый сокет (новый локальный адрес — на случай, если плохой была
-            // именно эта пара портов) и новая сессия; спрашиваем, пока не залинкуемся.
-            self.base.phase(SlotPhase::Rendezvous);
-            let socket = match crate::bind::udp(self.bind_ip, 0, self.bind_ifindex).await {
-                Ok(socket) => Arc::new(socket),
-                Err(e) => {
-                    log::warn!("{label}слот {slot}: сокет слота: {e}; повтор");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
-            let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
-            let my_session = Uuid::new_v4();
-            let asking = self.boot.ask(self.pair.record(slot, my_session, SocketAddr::from(([0, 0, 0, 0], port))));
+        let slot = self.base.slot;
+        self.serve().await;
+        self.offers.lock().unwrap().remove(&slot);
+        let _ = self.ended.send(slot);
+    }
 
-            // Connecting: идём на порт из последнего ответа; ответ сменился — на новый. Ответ,
-            // оставшийся от прошлой регистрации, тоже годится: сервер, получив нашу новую сессию,
-            // либо примет её на том же порту, либо выдаст новый — и мы на него перейдём.
-            let link = 'connect: loop {
-                let offer = tokio::select! {
-                    offer = self.offer_rx.wait_for(Option::is_some) => match offer {
-                        Ok(offer) => offer.clone().expect("проверено"),
-                        Err(_) => return,
-                    },
-                    _ = self.base.redrop_rx.recv() => break 'connect None,
-                };
-                self.offer_rx.mark_unchanged();
-                log::info!("{label}слот {slot}: идём на порт сервера {}", offer.addr);
-                self.base.phase(SlotPhase::Punching);
-                // Сокет говорит только с этим портом сервера: ядру не искать маршрут на каждый
-                // пакет, чужие адреса отсекаются в ядре.
-                if let Err(e) = socket.connect(offer.addr).await {
-                    log::warn!("{label}слот {slot}: connect к {}: {e}", offer.addr);
-                }
-                let attempt = punch::establish(
-                    socket.clone(),
-                    port,
-                    vec![offer.addr],
-                    self.pair.identity(slot, my_session, offer.session_id),
-                    PunchConfig { margin: 0, ..PunchConfig::default() },
-                    self.base.events.clone(),
-                );
-                tokio::select! {
-                    result = attempt => match result {
-                        Ok(link) => break 'connect Some(link),
-                        Err(e) => {
-                            log::warn!("{label}слот {slot}: подключение не удалось: {e}");
-                            break 'connect None;
-                        }
-                    },
-                    changed = self.offer_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        continue 'connect;
-                    }
-                    _ = self.base.redrop_rx.recv() => break 'connect None,
+    async fn serve(&mut self) {
+        let (slot, label) = (self.base.slot, self.base.label.clone());
+        // Asking: свой сокет (новый локальный адрес на каждую дыру) и сессия; спрашиваем, пока не
+        // залинкуемся.
+        self.base.phase(SlotPhase::Rendezvous);
+        let socket = match crate::bind::udp(self.bind_ip, 0, self.bind_ifindex).await {
+            Ok(socket) => Arc::new(socket),
+            Err(e) => {
+                log::warn!("{label}дыра {slot}: сокет дыры: {e}");
+                return;
+            }
+        };
+        let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        let my_session = Uuid::new_v4();
+        let asking = self.boot.ask(self.pair.record(slot, my_session, SocketAddr::from(([0, 0, 0, 0], port)), self.started_ms));
+        let deadline = tokio::time::sleep(OPEN_TIMEOUT);
+        tokio::pin!(deadline);
+
+        // Connecting: идём на порт из последнего ответа; ответ сменился — на новый.
+        let link = 'connect: loop {
+            let offer = tokio::select! {
+                offer = self.offer_rx.wait_for(Option::is_some) => match offer {
+                    Ok(offer) => offer.clone().expect("проверено"),
+                    Err(_) => return,
+                },
+                _ = self.base.cmd_rx.recv() => return,
+                _ = &mut deadline => {
+                    log::info!("{label}дыра {slot}: сервер не ответил за {OPEN_TIMEOUT:?}, закрываем");
+                    return;
                 }
             };
-            drop(asking);
-            let Some(link) = link else { continue };
-            self.base.hold(link, std::future::pending()).await;
-        }
+            self.offer_rx.mark_unchanged();
+            log::info!("{label}дыра {slot}: идём на порт сервера {}", offer.addr);
+            self.base.phase(SlotPhase::Punching);
+            // Сокет говорит только с этим портом сервера: ядру не искать маршрут на каждый пакет,
+            // чужие адреса отсекаются в ядре.
+            if let Err(e) = socket.connect(offer.addr).await {
+                log::warn!("{label}дыра {slot}: connect к {}: {e}", offer.addr);
+            }
+            let attempt = punch::establish(
+                socket.clone(),
+                port,
+                vec![offer.addr],
+                self.pair.identity(slot, my_session, offer.session_id),
+                PunchConfig { margin: 0, ..PunchConfig::default() },
+                self.base.events.clone(),
+            );
+            tokio::select! {
+                result = attempt => match result {
+                    Ok(link) => break 'connect link,
+                    Err(e) => {
+                        log::warn!("{label}дыра {slot}: подключение не удалось: {e}");
+                        return;
+                    }
+                },
+                changed = self.offer_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue 'connect;
+                }
+                _ = self.base.cmd_rx.recv() => return,
+                _ = &mut deadline => {
+                    log::info!("{label}дыра {slot}: дыра не открылась за {OPEN_TIMEOUT:?}, закрываем");
+                    return;
+                }
+            }
+        };
+        drop(asking);
+        self.base.hold(link, std::future::pending()).await;
     }
 }
 
@@ -608,23 +804,24 @@ mod tests {
     }
 
     #[test]
-    fn only_signed_records_of_the_expected_peer_within_the_set_are_accepted() {
+    fn only_signed_records_of_the_expected_peer_are_accepted() {
         let (me, peer) = (Uuid::new_v4(), Uuid::new_v4());
         let mine = pair(me, peer);
         let theirs = pair(peer, me);
         let (send, mut recv) = theirs.secret.bootstrap_keys();
         let endpoint = SocketAddr::from(([203, 0, 113, 10], 41234));
-        let packet = |p: &Pair, slot: crate::multilink::SlotId| codec::encode(&wrap(p.record(slot, Uuid::new_v4(), endpoint)), &send);
+        let packet = |p: &Pair, slot: crate::multilink::SlotId| codec::encode(&wrap(p.record(slot, Uuid::new_v4(), endpoint, 0)), &send);
 
         let ok = unwrap(&packet(&theirs, 3), &mut recv, &mine).expect("запись пира");
         assert_eq!((ok.slot, ok.addr), (3, endpoint));
+        let big = unwrap(&packet(&theirs, 4_000_000_000), &mut recv, &mine).expect("номера динамических дыр велики");
+        assert_eq!(big.slot, 4_000_000_000);
         assert!(unwrap(&packet(&mine, 0), &mut recv, &mine).is_none(), "своя запись (эхо)");
-        assert!(unwrap(&packet(&theirs, TARGET_LINKS), &mut recv, &mine).is_none(), "слот вне набора");
 
         let stranger = pair(peer, Uuid::new_v4());
         assert!(unwrap(&packet(&stranger, 0), &mut recv, &mine).is_none(), "запись подписана чужим");
         let (foreign_send, _) = stranger.secret.bootstrap_keys();
-        let foreign = codec::encode(&wrap(theirs.record(0, Uuid::new_v4(), endpoint)), &foreign_send);
+        let foreign = codec::encode(&wrap(theirs.record(0, Uuid::new_v4(), endpoint, 0)), &foreign_send);
         assert!(unwrap(&foreign, &mut recv, &mine).is_none(), "пакет чужих ключей знакомства");
     }
 
@@ -644,16 +841,49 @@ mod tests {
         assert!(knocks.try_recv().is_err(), "чужое имя должно отбрасываться молча");
     }
 
+    /// Прошлая версия клиента держит фиксированные слоты 0..9 и после потери дыры перерегистрирует
+    /// тот же номер с новой сессией: сервер обязан завести дыру заново, а не молчать.
     #[tokio::test]
-    async fn client_session_waits_skip_the_linked_one_and_see_changes() {
-        let (tx, mut rx) = watch::channel(None);
-        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        tx.send(Some(a)).unwrap();
-        assert_eq!(next_client(&mut rx, None).await, Some(a));
-        let wait = tokio::time::timeout(Duration::from_millis(50), next_client(&mut rx, Some(a))).await;
-        assert!(wait.is_err(), "сессию прошлой дыры не принимаем");
-        tx.send(Some(b)).unwrap();
-        assert_eq!(next_client(&mut rx, Some(a)).await, Some(b));
-        tokio::time::timeout(Duration::from_millis(50), client_changed(&mut rx, a)).await.expect("сессия сменилась");
+    async fn server_follows_a_legacy_client_that_reregisters_the_same_slot() {
+        use crate::multilink::{Discovery, MultiLink, MultiLinkOptions};
+        let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let boot_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bootstrap = Bootstrap::bind(boot_port, 48200..=48299).await.unwrap();
+        let (_server, _rx) = MultiLink::start_discovery(
+            "",
+            Discovery::VpsServer { public_ip: "127.0.0.1".parse().unwrap(), bootstrap },
+            server_id,
+            client_id,
+            MultiLinkOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let client = pair(client_id, server_id);
+        let (send, mut recv) = client.secret.bootstrap_keys();
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let server_addr = SocketAddr::from(([127, 0, 0, 1], boot_port));
+        let mut ask = async |slot: SlotId, session: Uuid| -> PeerSession {
+            for _ in 0..20 {
+                let record = client.record(slot, session, SocketAddr::from(([127, 0, 0, 1], 50000)), 0);
+                let mut packet = peer_name(&client_id).into_bytes();
+                packet.extend_from_slice(&codec::encode(&wrap(record), &send));
+                socket.send_to(&packet, server_addr).await.unwrap();
+                let mut buf = [0u8; 1500];
+                if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await
+                    && let Some(offer) = unwrap(&buf[..n], &mut recv, &client)
+                {
+                    return offer;
+                }
+            }
+            panic!("сервер не ответил на знакомство");
+        };
+
+        let first = ask(3, Uuid::new_v4()).await;
+        assert_eq!(first.slot, 3);
+        let second = ask(3, Uuid::new_v4()).await;
+        assert_eq!(second.slot, 3);
+        assert_ne!(first.session_id, second.session_id, "новая сессия клиента — новая дыра сервера");
+        assert_ne!(first.addr, second.addr, "новая дыра занимает другой порт");
     }
 }

@@ -140,7 +140,10 @@ pub fn plan(holes: &[HoleInfo], since_last_open: Duration, policy: &PoolPolicy) 
     // минимума. При нехватке запаса на всех просроченных — сливаем самых старых по возрасту
     // первыми, остальные ждут следующей оценки (запас появится от правила 2 или от собственного
     // старения других дыр).
-    let slack = live_count.saturating_sub(policy.min_active);
+    // Запас считаем по `Active`: прогреваемая замена в работу ещё не вошла, и слив старой дыры под
+    // неё уронил бы набор в работе ниже минимума, пока замена не прогреется.
+    let active_count = holes.iter().filter(|h| h.state == HoleState::Active).count();
+    let slack = active_count.saturating_sub(policy.min_active);
     if slack > 0 {
         let mut expired: Vec<&HoleInfo> = holes.iter().filter(|h| is_live(h) && h.age >= h.max_age).collect();
         if !expired.is_empty() {
@@ -157,10 +160,10 @@ pub fn plan(holes: &[HoleInfo], since_last_open: Duration, policy: &PoolPolicy) 
     // 4. Дыр больше минимума — можно позволить себе почистить худшую по потерям (при равных —
     // самую старую), пусть даже она не просрочена и не однозначно плохая: лучше заменить на
     // свежую, чем годами держать чуть худшую дыру. Только если это не уронит набор ниже минимума.
-    if live_count > policy.min_active {
+    if active_count > policy.min_active {
         let candidate = holes
             .iter()
-            .filter(|h| is_live(h) && h.age >= policy.grace)
+            .filter(|h| h.state == HoleState::Active && h.age >= policy.grace)
             .max_by(|a, b| worst_loss(a).total_cmp(&worst_loss(b)).then(a.age.cmp(&b.age)));
         if let Some(worst) = candidate
             && worst_loss(worst) > 0.0 {
@@ -301,5 +304,17 @@ mod tests {
         holes.push(hole(5, HoleState::Draining, 50, 120, Some(0.9), None)); // сливается, плохая, но уже не трогаем
         let actions = plan(&holes, Duration::from_secs(999), &PoolPolicy::default());
         assert_eq!(actions, vec![Action::Open], "Draining не считается живой — живых 5, растём по интервалу");
+    }
+
+    #[test]
+    fn expired_hole_stays_until_its_replacement_has_warmed_up() {
+        // Ровно `min_active` в работе, одна просрочена, замена ещё прогревается: сливать рано —
+        // в работе осталось бы меньше минимума.
+        let mut holes: Vec<HoleInfo> = (0..4).map(|i| active(i, if i == 0 { 200 } else { 30 })).collect();
+        holes.push(hole(4, HoleState::Warming, 1, 120, None, None));
+        assert_eq!(plan(&holes, Duration::ZERO, &PoolPolicy::default()), Vec::new());
+        // Замена прогрелась — теперь можно.
+        holes[4].state = HoleState::Active;
+        assert_eq!(plan(&holes, Duration::ZERO, &PoolPolicy::default()), vec![Action::Retire(0)]);
     }
 }
