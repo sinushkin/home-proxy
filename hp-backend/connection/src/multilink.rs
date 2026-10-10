@@ -416,13 +416,14 @@ impl LinkRegistry {
     }
 
     /// Состояние и потери дыры для политики набора; `None` — дыры нет в реестре.
-    pub(crate) fn hole_info(&self, slot: SlotId) -> Option<(HoleState, Option<f32>, Option<f32>)> {
+    pub(crate) fn hole_info(&self, slot: SlotId) -> Option<(HoleState, Option<f32>, Option<f32>, u64)> {
         let link = self.by_slot.get(&slot)?;
         let report = self.reports.get(&slot);
         Some((
             link.state,
             report.and_then(|r| loss(r.my_sent, r.peer_received)),
             report.and_then(|r| loss(r.peer_sent, r.my_received)),
+            report.map_or(0, |r| r.my_sent.min(r.peer_sent)),
         ))
     }
 

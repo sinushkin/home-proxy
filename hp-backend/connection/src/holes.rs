@@ -43,6 +43,8 @@ pub struct HoleInfo {
     pub loss_out: Option<f32>,
     /// Доля потерь от пира к нам.
     pub loss_in: Option<f32>,
+    /// Сколько пакетов легло в оценку потерь (меньшее из двух направлений; `0` — отчёта пира ещё нет).
+    pub sample: u64,
 }
 
 /// Что делать с набором дыр по итогам одной оценки.
@@ -71,6 +73,9 @@ pub struct PoolPolicy {
     /// потери выше этого (без порога любая случайная потеря одного пакета гоняла бы набор по кругу
     /// и держала его у минимума).
     pub cull_loss: f32,
+    /// Плановая чистка по потерям — только при такой выборке: на 20–30 пакетах один потерянный
+    /// даёт 3–5% и гонял бы набор по кругу из-за шума (радиоканал теряет пакеты и без плохих дыр).
+    pub cull_min_sample: u64,
     /// Новую дыру не сравниваем по потерям первые `grace` — ещё не накопила выборку/не остыла от
     /// всплеска на старте.
     pub grace: Duration,
@@ -84,6 +89,7 @@ impl Default for PoolPolicy {
             add_interval: Duration::from_secs(10),
             bad_loss: 0.5,
             cull_loss: 0.03,
+            cull_min_sample: 200,
             grace: Duration::from_secs(10),
         }
     }
@@ -121,8 +127,8 @@ pub(crate) fn snapshot(
         .map(|(id, opened, max_age)| {
             let age = now.duration_since(opened);
             match registry.hole_info(id) {
-                Some((state, loss_out, loss_in)) => HoleInfo { id, state, age, max_age, loss_out, loss_in },
-                None => HoleInfo { id, state: HoleState::Warming, age, max_age, loss_out: None, loss_in: None },
+                Some((state, loss_out, loss_in, sample)) => HoleInfo { id, state, age, max_age, loss_out, loss_in, sample },
+                None => HoleInfo { id, state: HoleState::Warming, age, max_age, loss_out: None, loss_in: None, sample: 0 },
             }
         })
         .collect()
@@ -187,7 +193,7 @@ pub fn plan(holes: &[HoleInfo], since_last_open: Duration, policy: &PoolPolicy) 
     if active_count > policy.min_active {
         let candidate = holes
             .iter()
-            .filter(|h| h.state == HoleState::Active && h.age >= policy.grace)
+            .filter(|h| h.state == HoleState::Active && h.age >= policy.grace && h.sample >= policy.cull_min_sample)
             .max_by(|a, b| worst_loss(a).total_cmp(&worst_loss(b)).then(a.age.cmp(&b.age)));
         if let Some(worst) = candidate
             && worst_loss(worst) > policy.cull_loss {
@@ -203,7 +209,7 @@ mod tests {
     use super::*;
 
     fn hole(id: HoleId, state: HoleState, age_s: u64, max_age_s: u64, loss_out: Option<f32>, loss_in: Option<f32>) -> HoleInfo {
-        HoleInfo { id, state, age: Duration::from_secs(age_s), max_age: Duration::from_secs(max_age_s), loss_out, loss_in }
+        HoleInfo { id, state, age: Duration::from_secs(age_s), max_age: Duration::from_secs(max_age_s), loss_out, loss_in, sample: 1000 }
     }
 
     fn active(id: HoleId, age_s: u64) -> HoleInfo {
@@ -300,6 +306,23 @@ mod tests {
         holes[2].loss_in = Some(0.6); // хуже bad_loss=0.5 — доставлено меньше половины
         let actions = plan(&holes, Duration::from_secs(0), &policy);
         assert_eq!(actions, vec![Action::Retire(2), Action::Open], "аварийная плохая дыра: слив + немедленная замена");
+    }
+
+    #[test]
+    fn planned_loss_cull_needs_a_real_sample_not_one_lost_packet() {
+        let policy = PoolPolicy::default();
+        let mut holes: Vec<_> = (0..6).map(|i| active(i, 50)).collect();
+        // 3.5% на 30 пакетах — один потерянный: шум, дыру не трогаем.
+        holes[2].loss_in = Some(0.035);
+        holes[2].sample = 30;
+        assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![]);
+        // Те же 3.5% на большой выборке — уже закономерность, худшая уходит.
+        holes[2].sample = policy.cull_min_sample;
+        assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![Action::Retire(2)]);
+        // А однозначно плохая дыра (>50%) сливается и на малой выборке: ждать нечего.
+        holes[2].loss_in = Some(0.9);
+        holes[2].sample = 20;
+        assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![Action::Retire(2), Action::Open]);
     }
 
     #[test]

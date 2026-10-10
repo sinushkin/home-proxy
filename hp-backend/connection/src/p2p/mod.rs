@@ -227,14 +227,18 @@ impl Core {
     }
 
     /// Запись пира: известной дыре — передать; неизвестный номер — открыть ответную дыру, если у
-    /// нас сейчас меньше `max_total` дыр; закрытую (номер, сессия) повторно не открываем.
+    /// нас сейчас меньше `max_total` дыр с известным пиром; закрытую (номер, сессия) повторно не
+    /// открываем. Свои дыры, на которые пир ещё не ответил, место не занимают: иначе на последнем
+    /// месте обе стороны открывают по дыре одновременно, каждая считает набор полным и отвергает
+    /// запись другой — навсегда. Лучше выйдет на одну-две дыры больше `max_total`, чем тупик.
     fn on_peer(&mut self, now: Instant, session: PeerSession, pick_age: &mut impl FnMut() -> Duration) -> Option<Effect> {
         let id = session.slot;
         if let Some(rec) = self.holes.get_mut(&id) {
             rec.peer_session = Some(session.session_id);
             return Some(Effect::Forward { id, session });
         }
-        if self.closed.contains(&(id, session.session_id)) || self.holes.len() >= self.pool.max_total {
+        let matched = self.holes.values().filter(|r| r.peer_session.is_some()).count();
+        if self.closed.contains(&(id, session.session_id)) || matched >= self.pool.max_total {
             return None;
         }
         self.holes.insert(id, Record { opened: now, max_age: pick_age(), peer_session: Some(session.session_id) });
@@ -348,6 +352,22 @@ impl Manager {
             crate::holes::snapshot(&registry, self.core.records(), now)
         };
         let effects = self.core.evaluate(now, &infos, &mut self.pick_age());
+        // Причина слива в логе: по сроку или по потерям (иначе отладка набора слепая).
+        for effect in &effects {
+            if let Effect::Retire(id) = effect
+                && let Some(h) = infos.iter().find(|h| h.id == *id)
+            {
+                let loss = |l: Option<f32>| l.map_or("—".to_string(), |l| format!("{:.1}%", l * 100.0));
+                log::info!(
+                    "{}политика набора: сливаем дыру {id} (возраст {} с из {} с, потери ↑{} ↓{})",
+                    self.factory.label,
+                    h.age.as_secs(),
+                    h.max_age.as_secs(),
+                    loss(h.loss_out),
+                    loss(h.loss_in)
+                );
+            }
+        }
         self.execute(effects);
     }
 
@@ -644,7 +664,7 @@ mod tests {
     /// Снимок набора для `evaluate`: все дыры ядра в заданном состоянии и возрасте.
     fn infos(core: &Core, now: Instant, state: HoleState) -> Vec<HoleInfo> {
         core.records()
-            .map(|(id, opened, max_age)| HoleInfo { id, state, age: now.duration_since(opened), max_age, loss_out: None, loss_in: None })
+            .map(|(id, opened, max_age)| HoleInfo { id, state, age: now.duration_since(opened), max_age, loss_out: None, loss_in: None, sample: 1000 })
             .collect()
     }
 
@@ -672,6 +692,23 @@ mod tests {
         // После того как одна закрылась, место снова есть.
         core.on_ended(1);
         assert!(matches!(core.on_peer(t0, session(4, 1), &mut age()), Some(Effect::Spawn { id: 4, .. })));
+    }
+
+    #[test]
+    fn our_unanswered_hole_does_not_block_answering_the_peers_at_the_maximum() {
+        // Последнее место: у нас 2 дыры с пиром и своя, на которую пир ещё не ответил (max = 3).
+        // Пир одновременно открыл свою: её нужно принять, иначе обе стороны ждут друг друга вечно.
+        let t0 = Instant::now();
+        let mut core = core(2, 3, t0);
+        core.on_peer(t0, session(1, 1), &mut age());
+        core.on_peer(t0, session(2, 1), &mut age());
+        let now = t0 + START_GRACE + Duration::from_secs(11);
+        let snapshot = infos(&core, now, HoleState::Active);
+        let own = spawned(&core.evaluate(now, &snapshot, &mut age()));
+        assert_eq!(own.len(), 1, "своя дыра открыта и ждёт ответа");
+        assert!(matches!(core.on_peer(now, session(50, 1), &mut age()), Some(Effect::Spawn { id: 50, .. })), "запись пира принимаем");
+        // А набор из дыр с известным пиром по-прежнему не растёт сверх максимума.
+        assert_eq!(core.on_peer(now, session(51, 1), &mut age()), None);
     }
 
     #[test]
