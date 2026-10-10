@@ -304,7 +304,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   `CONTROL_ADDR` — только адрес LAN). `OpenWRT/luci-app-homeproxy/` — страница LuCI (JS): показать
   и скопировать строку, «Новая строка подключения» (`fs.exec` `hp-router|vps-client --config
   <настройки> --connection-string|--new-connection-string`, служба находится сама, права — ACL rpcd;
-  адрес в строке — LAN роутера, ssh-туннель не нужен; на `o1` работает с `vps-client`),
+  адрес в строке — LAN роутера, ssh-туннель не нужен; на `o1` работает с `hp-router`),
   плюс `/etc/init.d/hp-router` (procd; бинарник `/usr/bin`, настройки `/etc/hp-router`).
   Полные GUID — секрет пары: в статус и в логи идут только имена (`peer_name`). `control/README.md`.
 - `setup/win/` — `.bat`-аналоги `setup/*.sh` для Windows: `vps-server.bat` (Linux-сервер по ssh, GUID уже работающего сервера не меняет), `vps-client.bat` (этот ПК как клиент: задача планировщика, Wintun, хуки `.ps1`), `vps-client-remove.bat`, `vps-prepare.bat` (через bash из Git for Windows), `DRY_RUN=1`; `.bat` только ASCII, CRLF (`.gitattributes`). `setup/win/README.md`.
@@ -478,8 +478,8 @@ NAT/провайдерами.
   интернет дома идёт через него, ломать нельзя. С 2026-10-10 на нём `hp-router` (2 в 1: шлюз к VPS +
   P2P-пир для телефонов) вместо `vps-client`: `/usr/bin/hp-router`, `/etc/hp-router/` (`router.env`,
   `ca.crt`, `control.key`), хуки прежние в `/etc/vps-client/`, управление на адресе LAN
-  (`CONTROL_ADDR`), LuCI-страница стоит; `vps-client` выключен, бинарник и конфиг оставлены для
-  отката, копии предыдущих версий — в `/tmp` (до перезагрузки). Менять только скриптом с проверкой
+  (`CONTROL_ADDR`), LuCI-страница стоит; `vps-client` с `o1` удалён (2026-10-10; откат — только из
+  бэкапов на ПК пользователя). Менять только скриптом с проверкой
   и автоматическим откатом (образец — замена 2026-10-10 в `PLAN-dynamic-holes-relay.md` и
   `OpenWRT/Tun.md`). `ihor` — VPS с `vps-server`, к которому ходит `o1`; тоже продуктовый.
 - `test` (SSH-алиас, libvirt-ВМ на этом ПК, Debian 13, `sudo` без пароля) — Linux-машина для
