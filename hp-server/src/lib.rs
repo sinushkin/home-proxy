@@ -28,7 +28,7 @@
 //!   IP-адрес адаптера или `off`;
 //!   REORDER_WAIT_MS — сколько мс ждать недостающий TCP-пакет при восстановлении порядка (8;
 //!   0 — выключить); DATA_HOLES — через сколько дыр слать данные (0 — через все живые);
-//!   HOLES_MIN (4), HOLES_MAX (10), HOLE_AGE (`60-180`, секунды) — динамический набор дыр: не
+//!   HOLES_MIN (4), HOLES_MAX (10), HOLE_AGE (`180-600`, секунды) — динамический набор дыр: не
 //!   меньше стольких в работе, не больше стольких всего, дыры стареют и заменяются.
 //!
 //! Логи: `RUST_LOG` (по умолчанию `info`), `LOG_TARGET=syslog` — в syslog,
@@ -202,7 +202,7 @@ impl Common {
 }
 
 /// Динамический набор дыр из настроек: `HOLES_MIN` (4 — не меньше стольких в работе), `HOLES_MAX`
-/// (10), `HOLE_AGE` (`60-180` — срок жизни дыры в секундах, случайный в этих пределах).
+/// (10), `HOLE_AGE` (`180-600` по умолчанию — срок жизни дыры в секундах, случайный в этих пределах).
 pub fn holes_settings(get: &impl Fn(&str) -> Option<String>) -> Result<(PoolPolicy, (Duration, Duration))> {
     let number = |name: &str, default: usize| -> Result<usize> {
         get(name).map_or(Ok(default), |v| v.trim().parse().with_context(|| format!("{name}: ожидается число")))

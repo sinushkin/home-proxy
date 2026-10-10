@@ -182,7 +182,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       не смешиваются. **Набор дыр динамический**: дыра «поработала — умерла», номер (`SlotId`, u32)
       монотонный, назначает клиент. Клиентский `Manager` раз в секунду зовёт `holes::plan`
       (`PoolPolicy`: в работе ≥ `min_active` = 4, всего ≤ `max_total` = 10, +1 дыра в 10 с, срок
-      жизни дыры случайный 60–180 с, худшая по потерям уходит раньше) и открывает/сливает дыры;
+      жизни дыры случайный 3–10 мин (180–600 с), худшая по потерям уходит раньше) и открывает/сливает дыры;
       сервер реактивный: на запрос знакомства с новым номером `ClientActor` заводит `ServerHole`
       (порт из банка, `max_total × 2` дыр на клиента, недавно закрытые `(номер, сессия)` не
       воскрешает; тот же номер с новой сессией — перерегистрация прошлого клиента с фиксированными
@@ -297,8 +297,9 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   Пиры на ходу — `hp-server/src/service.rs` (ожидающий сопряжения телефон ≤ 1, сопряжённые —
   `peers.state`, 600) и `hp-router` (`phones.state`, свободный `client_id`, `RwLock` на телефонах;
   `CONTROL_ADDR` — только адрес LAN). `OpenWRT/luci-app-homeproxy/` — страница LuCI (JS): показать
-  и скопировать строку, «Новая строка подключения» (`fs.exec` `hp-router --config
-  /etc/hp-router/router.env --connection-string|--new-connection-string`, права — ACL rpcd),
+  и скопировать строку, «Новая строка подключения» (`fs.exec` `hp-router|vps-client --config
+  <настройки> --connection-string|--new-connection-string`, служба находится сама, права — ACL rpcd;
+  адрес в строке — LAN роутера, ssh-туннель не нужен; на `o1` работает с `vps-client`),
   плюс `/etc/init.d/hp-router` (procd; бинарник `/usr/bin`, настройки `/etc/hp-router`).
   Полные GUID — секрет пары: в статус и в логи идут только имена (`peer_name`). `control/README.md`.
 - `setup/win/` — `.bat`-аналоги `setup/*.sh` для Windows: `vps-server.bat` (Linux-сервер по ssh, GUID уже работающего сервера не меняет), `vps-client.bat` (этот ПК как клиент: задача планировщика, Wintun, хуки `.ps1`), `vps-client-remove.bat`, `vps-prepare.bat` (через bash из Git for Windows), `DRY_RUN=1`; `.bat` только ASCII, CRLF (`.gitattributes`). `setup/win/README.md`.

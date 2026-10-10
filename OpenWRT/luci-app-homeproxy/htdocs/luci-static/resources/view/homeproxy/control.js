@@ -3,19 +3,46 @@
 'require fs';
 'require ui';
 
-// Home Proxy: строка подключения трея к hp-router. Показать и скопировать, если забыли, или
-// выпустить новую (новый ключ: прежние строки перестают работать сразу, трей на ПК попросит
-// вставить новую). Сам ключ хранит hp-router (/etc/hp-router/control.key), страница его только
-// показывает через `hp-router --connection-string`.
+// Home Proxy: строка подключения трея к службе на этом роутере — hp-router или vps-client (какая
+// установлена). Показать и скопировать, если забыли, или выпустить новую (новый ключ: прежние
+// строки перестают работать сразу, трей на ПК попросит вставить новую). Сам ключ хранит служба
+// (control.key рядом с настройками), страница его только показывает через `<служба> --config
+// <настройки> --connection-string`. Адрес в строке — CONTROL_ADDR из настроек службы (адрес LAN
+// роутера, например 192.168.1.1:47001): трей на ПК подключается напрямую, ssh-туннель не нужен.
 
-var BIN = '/usr/bin/hp-router';
-var CONF = '/etc/hp-router/router.env';
+var SERVICES = [
+	{ name: 'hp-router', bin: '/usr/bin/hp-router', conf: '/etc/hp-router/router.env' },
+	{ name: 'vps-client', bin: '/usr/bin/vps-client', conf: '/etc/vps-client/vps-client.conf' }
+];
 
-function run(flag) {
-	return fs.exec(BIN, [ '--config', CONF, flag ]).then(function(res) {
+function exec(service, flag) {
+	return fs.exec(service.bin, [ '--config', service.conf, flag ]).then(function(res) {
 		if (res.code !== 0)
-			throw new Error((res.stderr || res.stdout || '').trim() || ('hp-router: код ' + res.code));
+			throw new Error((res.stderr || res.stdout || '').trim() || (service.name + ': код ' + res.code));
 		return (res.stdout || '').trim();
+	});
+}
+
+// Службы пробуем по порядку; первая, что ответила, и есть служба этого роутера. Если не ответила
+// ни одна — показываем ошибку той, что установлена (не «команда не найдена»).
+function find(flag) {
+	var errors = [];
+	return SERVICES.reduce(function(chain, service) {
+		return chain.then(function(found) {
+			if (found)
+				return found;
+			return exec(service, flag).then(function(text) {
+				return { service: service, text: text };
+			}, function(e) {
+				errors.push(e);
+				return null;
+			});
+		});
+	}, Promise.resolve(null)).then(function(found) {
+		if (found)
+			return found;
+		var real = errors.filter(function(e) { return !/not found|ENOENT|No such file|NotFound|Entry not found/i.test(e.message); });
+		throw (real[0] || new Error('На роутере нет службы Home Proxy (ни hp-router, ни vps-client).'));
 	});
 }
 
@@ -37,11 +64,13 @@ function copyText(text) {
 
 return view.extend({
 	load: function() {
-		return run('--connection-string').catch(function(e) { return e; });
+		return find('--connection-string').catch(function(e) { return e; });
 	},
 
-	render: function(result) {
-		var ok = typeof result === 'string';
+	render: function(found) {
+		var ok = !(found instanceof Error);
+		var service = ok ? found.service : null;
+		var result = ok ? found.text : found;
 		var field = E('input', {
 			'type': 'password',
 			'readonly': true,
@@ -76,6 +105,7 @@ return view.extend({
 
 		var renew = E('button', {
 			'class': 'cbi-button cbi-button-negative',
+			'disabled': !ok,
 			'click': function() {
 				ui.showModal('Новая строка подключения', [
 					E('p', 'Будет выпущен новый ключ. Трей, подключённый по прежней строке, сразу потеряет связь с роутером — в нём нужно будет вставить новую строку. Телефоны это не затрагивает.'),
@@ -85,7 +115,7 @@ return view.extend({
 						E('button', {
 							'class': 'cbi-button cbi-button-negative',
 							'click': function() {
-								return run('--new-connection-string').then(function(text) {
+								return exec(service, '--new-connection-string').then(function(text) {
 									ui.hideModal();
 									field.value = text;
 									problem.style.display = 'none';
@@ -104,8 +134,10 @@ return view.extend({
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', 'Home Proxy'),
 			E('div', { 'class': 'cbi-map-descr' },
-				'Строка подключения связывает трей Home Proxy на ПК с этим роутером: в ней адрес управления и ключ канала. ' +
-				'Трей просит её при первом запуске (или кнопка «Служба…»). Строка — секрет: с ней можно добавлять и удалять телефоны.'),
+				'Строка подключения связывает трей Home Proxy на ПК с этим роутером' + (ok ? ' (служба ' + service.name + ')' : '') +
+				': в ней адрес управления в LAN и ключ канала, ssh-туннель не нужен. ' +
+				'Трей просит её при первом запуске (или кнопка «Служба…»). Строка — секрет: она открывает управление службой' +
+				(ok && service.name === 'hp-router' ? ', в том числе добавление и удаление телефонов.' : ' (состояние, дыры, потери).')),
 			problem,
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-value' }, [

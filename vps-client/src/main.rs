@@ -7,7 +7,7 @@
 //! умолчанию 40000). Адрес в туннеле выдаёт сервер. Окружение: `TUN_NAME` (`hp0`), `TUN_MTU`
 //! (1400), `REORDER_WAIT_MS` (начальное ожидание буфера порядка, 8; 0 — выключить),
 //! `DATA_HOLES` (0 — данные через все живые дыры), набор дыр динамический: `HOLES_MIN` (4 — не
-//! меньше стольких в работе), `HOLES_MAX` (10), `HOLE_AGE` (`60-180` — срок жизни дыры в секундах,
+//! меньше стольких в работе), `HOLES_MAX` (10), `HOLE_AGE` (`180-600` по умолчанию — срок жизни дыры в секундах,
 //! случайный в этих пределах), `ROUTES` (`auto` — маршруты туннеля; `off` —
 //! не трогать маршруты), `ON_TUN_UP` / `ON_TUN_DOWN` (скрипты хуков, по умолчанию
 //! `/etc/vps-client/on-tun-up.sh` и `on-tun-down.sh`, если файлов нет — ничего не делается),
@@ -58,26 +58,73 @@ fn env_age_range(name: &str, default: (Duration, Duration)) -> Result<(Duration,
     Ok((Duration::from_secs(min), Duration::from_secs(max)))
 }
 
-/// `CONTROL_ADDR` из окружения.
-fn control_addr() -> Result<Option<SocketAddr>> {
-    hp_control::parse_control_addr(std::env::var("CONTROL_ADDR").ok().as_deref())
-}
-
-/// Файл ключа управления: `CONTROL_KEY_FILE`, иначе `control.key` рядом с хуками службы.
-fn control_key_file() -> PathBuf {
-    if let Ok(path) = std::env::var("CONTROL_KEY_FILE")
-        && !path.trim().is_empty()
-    {
-        return PathBuf::from(path.trim());
+/// `[--config путь] --connection-string | --new-connection-string` → (файл настроек, новый ключ?).
+/// Страница LuCI зовёт именно так: у неё нет окружения службы, настройки берутся из файла.
+fn parse_connection_args(args: &[String]) -> Option<(Option<PathBuf>, bool)> {
+    match args {
+        [flag] => connection_flag(flag).map(|new_key| (None, new_key)),
+        [config, path, flag] if config == "--config" => connection_flag(flag).map(|new_key| (Some(PathBuf::from(path)), new_key)),
+        _ => None,
     }
-    let (up, _) = NativeHooks::default_scripts();
-    up.parent().map(PathBuf::from).unwrap_or_default().join(hp_control::KEY_FILE)
 }
 
-/// `vps-client --connection-string` / `--new-connection-string`: строка подключения трея к этой службе.
-fn print_connection_string(new_key: bool) -> Result<()> {
-    let addr = control_addr()?.context("управление выключено: задайте CONTROL_ADDR=127.0.0.1:47001 (или адрес LAN)")?;
-    let key_file = control_key_file();
+fn connection_flag(flag: &str) -> Option<bool> {
+    match flag {
+        "--connection-string" => Some(false),
+        "--new-connection-string" => Some(true),
+        _ => None,
+    }
+}
+
+/// Настройки `KEY=VALUE` (как у службы: `vps-client.conf`); пустые строки, `#` и кавычки пропускаются.
+fn parse_conf(text: &str) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().trim_matches(|c| c == '"' || c == '\'').to_string()))
+        .collect()
+}
+
+/// `CONTROL_ADDR` и файл ключа по настройкам `get` (файл настроек или окружение).
+/// Ключ — `CONTROL_KEY_FILE`, иначе `control.key` рядом с хуками службы; относительный путь —
+/// от каталога файла настроек.
+fn control_settings(get: impl Fn(&str) -> Option<String>, conf_dir: Option<&std::path::Path>) -> Result<(Option<SocketAddr>, PathBuf)> {
+    let addr = hp_control::parse_control_addr(get("CONTROL_ADDR").as_deref())?;
+    let key_file = match get("CONTROL_KEY_FILE").map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+        Some(path) => match conf_dir {
+            Some(dir) => dir.join(path),
+            None => PathBuf::from(path),
+        },
+        None => {
+            let (up, _) = NativeHooks::default_scripts();
+            up.parent().map(PathBuf::from).unwrap_or_default().join(hp_control::KEY_FILE)
+        }
+    };
+    Ok((addr, key_file))
+}
+
+/// `CONTROL_ADDR` и файл ключа из окружения (так их видит запущенная служба).
+fn control_addr() -> Result<Option<SocketAddr>> {
+    Ok(control_settings(|name| std::env::var(name).ok(), None)?.0)
+}
+
+fn control_key_file() -> PathBuf {
+    control_settings(|name| std::env::var(name).ok(), None).map(|(_, key_file)| key_file).unwrap_or_default()
+}
+
+/// `vps-client [--config файл] --connection-string` / `--new-connection-string`: строка подключения
+/// трея к этой службе. Без `--config` настройки берутся из окружения.
+fn print_connection_string(config: Option<&std::path::Path>, new_key: bool) -> Result<()> {
+    let (addr, key_file) = match config {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).with_context(|| format!("не удалось прочитать {}", path.display()))?;
+            let conf = parse_conf(&text);
+            control_settings(|name| conf.get(name).cloned(), path.parent())?
+        }
+        None => (control_addr()?, control_key_file()),
+    };
+    let addr = addr.context("управление выключено: задайте CONTROL_ADDR (адрес LAN роутера или 127.0.0.1) в настройках службы")?;
     let key = if new_key { hp_control::replace_key(&key_file)? } else { hp_control::load_or_create_key(&key_file)? };
     println!("{}", hp_control::connection_string(addr, &key));
     Ok(())
@@ -168,10 +215,8 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     hp_logging::init()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let [flag] = args.as_slice()
-        && (flag == "--connection-string" || flag == "--new-connection-string")
-    {
-        return print_connection_string(flag == "--new-connection-string");
+    if let Some((config, new_key)) = parse_connection_args(&args) {
+        return print_connection_string(config.as_deref(), new_key);
     }
     anyhow::ensure!(args.len() == 3, "использование: vps-client <ip_сервера[:порт_знакомства]> <мой_guid> <guid_сервера>");
     let server = connection::vps::parse_server(&args[0]).context("адрес сервера: ожидается ip или ip:порт")?;
@@ -272,5 +317,58 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn connection_string_flags_with_and_without_a_config() {
+        assert_eq!(parse_connection_args(&args(&["--connection-string"])), Some((None, false)));
+        assert_eq!(parse_connection_args(&args(&["--new-connection-string"])), Some((None, true)));
+        assert_eq!(
+            parse_connection_args(&args(&["--config", "/etc/vps-client/vps-client.conf", "--new-connection-string"])),
+            Some((Some("/etc/vps-client/vps-client.conf".into()), true))
+        );
+        // Обычный запуск службы: адрес, свой и чужой GUID.
+        assert_eq!(parse_connection_args(&args(&["203.0.113.10:40600", "a", "b"])), None);
+        assert_eq!(parse_connection_args(&args(&["--config", "x", "--other"])), None);
+    }
+
+    #[test]
+    fn conf_is_key_value_with_comments_and_quotes() {
+        let conf = parse_conf(
+            r#"# служба
+VPS_SERVER=203.0.113.10:40600
+
+CONTROL_ADDR = "192.168.1.1:47001"
+RUST_LOG='info'
+"#,
+        );
+        assert_eq!(conf.get("CONTROL_ADDR").map(String::as_str), Some("192.168.1.1:47001"));
+        assert_eq!(conf.get("RUST_LOG").map(String::as_str), Some("info"));
+        assert_eq!(conf.len(), 3);
+    }
+
+    #[test]
+    fn control_settings_come_from_the_config_and_the_key_path_is_relative_to_it() {
+        let conf = parse_conf("CONTROL_ADDR=192.168.1.1:47001
+CONTROL_KEY_FILE=keys/control.key
+");
+        let (addr, key) = control_settings(|n| conf.get(n).cloned(), Some(std::path::Path::new("/etc/vps-client"))).unwrap();
+        assert_eq!(addr, Some("192.168.1.1:47001".parse().unwrap()));
+        assert_eq!(key, PathBuf::from("/etc/vps-client/keys/control.key"));
+        // Управление выключено: адреса нет, ключ — по умолчанию рядом с хуками.
+        let (addr, key) = control_settings(|_| None, None).unwrap();
+        assert_eq!(addr, None);
+        assert!(key.ends_with(hp_control::KEY_FILE));
+        // 0.0.0.0 нельзя.
+        assert!(control_settings(|n| (n == "CONTROL_ADDR").then(|| "0.0.0.0:47001".to_string()), None).is_err());
     }
 }

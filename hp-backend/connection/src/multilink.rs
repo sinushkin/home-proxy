@@ -528,8 +528,10 @@ pub struct MultiLinkOptions {
     pub hole_age: (Duration, Duration),
 }
 
-/// Срок жизни дыры по умолчанию (`PLAN-dynamic-holes-relay.md`, раздел 2).
-pub const DEFAULT_HOLE_AGE: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(180));
+/// Срок жизни дыры по умолчанию: от 3 до 10 минут, случайно на каждую дыру. Реже менять дыры незачем:
+/// замена не теряет пакеты, а такой срок достаточно короток, чтобы не копилась статистика по паре
+/// портов (`PLAN-dynamic-holes-relay.md`, раздел 2).
+pub const DEFAULT_HOLE_AGE: (Duration, Duration) = (Duration::from_secs(180), Duration::from_secs(600));
 
 impl Default for MultiLinkOptions {
     fn default() -> Self {

@@ -31,6 +31,8 @@ export struct PeerRow {
     live: int,
     target: int,
     addresses: string,
+    /// Подпись колонки адресов дыр: «адрес телефона» или «адрес сервера».
+    addr-title: string,
     loss: string,
     reorder: string,
     registration: string,
@@ -50,11 +52,12 @@ component Dot inherits Rectangle {
 
 component HoleTable inherits VerticalLayout {
     in property <[HoleRow]> holes;
+    in property <string> addr-title: "адрес телефона";
     spacing: 2px;
     HorizontalLayout {
         spacing: 8px;
         Text { width: 72px; text: "#"; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
-        Text { horizontal-stretch: 1; text: "адрес телефона"; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
+        Text { horizontal-stretch: 1; text: root.addr-title; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
         Text { width: 64px; text: "возраст"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
         Text { width: 64px; text: "отправлено"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
         Text { width: 64px; text: "получено"; horizontal-alignment: right; color: Palette.foreground.transparentize(0.4); font-size: 11px; }
@@ -128,7 +131,7 @@ component PeerCard inherits Rectangle {
                 if peer.registration != "": Text { text: peer.registration; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
             }
         }
-        if peer.expanded: HoleTable { holes: peer.holes; }
+        if peer.expanded: HoleTable { holes: peer.holes; addr-title: peer.addr-title; }
         if peer.expanded && peer.removable: HorizontalLayout {
             alignment: end;
             Button {
@@ -239,10 +242,11 @@ export component MainWindow inherits Window {
                 clicked => { root.open-setup(); }
             }
             Rectangle { horizontal-stretch: 1; }
-            Button {
+            // Сопряжение телефонов есть не у каждой службы (у vps-client его нет) — кнопку не показываем.
+            if root.pairing-supported: Button {
                 text: root.busy ? "Готовлю код…" : "Добавить телефон";
                 primary: true;
-                enabled: root.connected && root.pairing-supported && !root.busy;
+                enabled: root.connected && !root.busy;
                 clicked => { root.add-phone(); }
             }
         }

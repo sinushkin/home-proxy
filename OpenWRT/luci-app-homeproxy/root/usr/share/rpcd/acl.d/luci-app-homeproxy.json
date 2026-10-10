@@ -1,14 +1,24 @@
 {
 	"luci-app-homeproxy": {
-		"description": "Home Proxy: строка подключения трея (показать, сменить ключ)",
+		"description": "Home Proxy: строка подключения трея (показать, сменить ключ) — hp-router или vps-client",
 		"read": {
 			"file": {
-				"/usr/bin/hp-router --config /etc/hp-router/router.env --connection-string": [ "exec" ]
+				"/usr/bin/hp-router --config /etc/hp-router/router.env --connection-string": [
+					"exec"
+				],
+				"/usr/bin/vps-client --config /etc/vps-client/vps-client.conf --connection-string": [
+					"exec"
+				]
 			}
 		},
 		"write": {
 			"file": {
-				"/usr/bin/hp-router --config /etc/hp-router/router.env --new-connection-string": [ "exec" ]
+				"/usr/bin/hp-router --config /etc/hp-router/router.env --new-connection-string": [
+					"exec"
+				],
+				"/usr/bin/vps-client --config /etc/vps-client/vps-client.conf --new-connection-string": [
+					"exec"
+				]
 			}
 		}
 	}

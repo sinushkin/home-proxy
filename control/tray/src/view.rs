@@ -238,6 +238,7 @@ pub fn render(window: &MainWindow, state: &UiState) {
                 live: peer.live as i32,
                 target: peer.target as i32,
                 addresses: peer.addresses.join(", ").into(),
+                addr_title: if is_vps(peer) { "адрес сервера" } else { "адрес телефона" }.into(),
                 reorder: reorder_text(peer).into(),
                 registration: hp_control::registration_text(peer, now_unix() * 1000).unwrap_or_default().into(),
                 loss: if out < 0.0 && inn < 0.0 { SharedString::new() } else { format!("потери ↑{} ↓{}", percent(out), percent(inn)).into() },

@@ -31,8 +31,11 @@ hpctl --connect 'homeproxy-control://192.168.1.1:47001/<ключ>' status
 
 `status` показывает один «пир» — VPS-сервер: живые дыры в работе, у каждой номер, адрес, возраст,
 признак «сливается», счётчики и потери в обе стороны; ниже — трафик моста. Набор дыр
-динамический: `HOLES_MIN`, `HOLES_MAX`, `HOLE_AGE` (например `60-180`). На роутере с `setup/vps-client.sh`
-включить так: `CONTROL_ADDR=192.168.1.1:47001 setup/vps-client.sh <клиент> <сервер>`.
+динамический: `HOLES_MIN`, `HOLES_MAX`, `HOLE_AGE` (по умолчанию `180-600`, секунды). На роутере с `setup/vps-client.sh`
+включить так: `CONTROL_ADDR=192.168.1.1:47001 setup/vps-client.sh <клиент> <сервер>`. Строку подключения
+показывает и страница LuCI (**Службы → Home Proxy**, `OpenWRT/luci-app-homeproxy`) — для неё
+нужен адрес LAN в `CONTROL_ADDR`, `vps-client --config /etc/vps-client/vps-client.conf
+--connection-string` читает его из файла настроек. Срок жизни дыры — `HOLE_AGE`, по умолчанию 3–10 минут (`180-600`).
 
 Раньше клиент умел и мост для WireGuard на `127.0.0.1:<порт>`; от WireGuard отказались
 (`../Performance.md`: на роутере 10–12 Мбит/с с WireGuard против 21 без него).

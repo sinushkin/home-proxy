@@ -691,3 +691,14 @@ M5.
   `Discovery` теперь в `connection::discovery`, `stun` — `connection::p2p::stun` (повторно
   экспортирован как `connection::stun` при фиче `p2p`).
 
+- 2026-10-10 (позже) — **срок жизни дыры 3–10 минут; управление `vps-client` без ssh-туннеля (LuCI).**
+  - `DEFAULT_HOLE_AGE` = 180–600 с (было 60–180): при 0% потерь дыры меняются реже, замена по-прежнему
+    без потерь пакетов.
+  - `vps-client --config <vps-client.conf> --connection-string|--new-connection-string` читает
+    `CONTROL_ADDR`/`CONTROL_KEY_FILE` из файла настроек (так его зовёт страница LuCI, у неё нет окружения
+    службы); страница LuCI находит службу (`hp-router` или `vps-client`), ACL расширен.
+  - Выкачено на `o1`: `CONTROL_ADDR=192.168.3.1:47001` (LAN роутера), LuCI-приложение установлено,
+    трей и `hpctl` на ПК подключаются напрямую. Проверено через настоящий путь uhttpd → rpcd: команда
+    с выданным ACL возвращает строку, `--new-connection-string` и чужие аргументы — отказ (код 6).
+    Страница в браузере не открывалась.
+
