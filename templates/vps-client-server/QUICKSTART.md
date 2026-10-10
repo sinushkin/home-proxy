@@ -51,7 +51,7 @@ RUST_LOG=info
 ```bash
 /usr/local/bin/vps-server --config /etc/hp-vps/server.env
 # Должно вывести:
-# vps-server: белый IP 203.0.113.10, порт знакомства 40000, порты слотов 40001-49999
+# vps-server: белый IP 203.0.113.10, порт знакомства 40000, порты дыр 40001-49999
 # Ctrl+C для выхода
 ```
 

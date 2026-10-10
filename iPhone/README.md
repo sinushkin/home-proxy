@@ -23,7 +23,7 @@
 
 - На Android VPN — `VpnService` внутри приложения. На iOS нужны **приложение и отдельное
   расширение `Packet Tunnel Provider`** (свой процесс). В расширении жил бы наш клиент
-  (10 дыр); пакеты туннеля iOS отдаёт не дескриптором TUN, как Android, а через
+  (динамический набор дыр, 4–10); пакеты туннеля iOS отдаёт не дескриптором TUN, как Android, а через
   `NEPacketTunnelFlow` (`readPackets`/`writePackets`) — ядру нужен вход «пакет из Swift» вместо
   `hp_tun::Tun`. Раньше план был на `wireguard-apple` (WireGuardKit); от WireGuard в проекте
   отказались.

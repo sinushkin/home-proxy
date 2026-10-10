@@ -10,7 +10,7 @@ WSL и прав): [`../windows/README.md`](../windows/README.md). WSL2 нуже�
 через ваш домашний VPN). Образ на базе Alpine, несколько мегабайт в архиве.
 
 ```
-телефон -> 10 дыр ==== интернет ==== WSL2 (Alpine): hp-server -> hp0 (10.80.0.1/16)
+телефон -> дыры ==== интернет ==== WSL2 (Alpine): hp-server -> hp0 (10.80.0.1/16)
                                          -> iptables MASQUERADE -> eth0 -> Windows -> интернет
 ```
 
