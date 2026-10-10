@@ -38,9 +38,11 @@ export RUSTC_BOOTSTRAP=1
 # (клиент VPS-сервера с белым IP). Один пакет:
 # PACKAGES=hp-router ./OpenWRT/build.sh
 PACKAGES="${PACKAGES:-hp-router peer vps-client}"
-args=()
-for package in $PACKAGES; do args+=(-p "$package"); done
-cargo build --release "${args[@]}" --target "$TARGET" -Zbuild-std=std,panic_abort
+# По одному пакету за вызов: при сборке нескольких сразу cargo объединяет фичи зависимостей, и
+# `vps-client` (только фича `vps` крейта connection, без MQTT/TLS) раздулся бы до размера `hp-router`.
+for package in $PACKAGES; do
+  cargo build --release -p "$package" --target "$TARGET" -Zbuild-std=std,panic_abort
+done
 
 for package in $PACKAGES; do
   bin="$CARGO_TARGET_DIR/$TARGET/release/$package"

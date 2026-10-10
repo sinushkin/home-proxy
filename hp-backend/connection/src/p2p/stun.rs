@@ -252,3 +252,39 @@ mod list_tests {
         assert!(ip_differs.contains("маршрут"), "{ip_differs}");
     }
 }
+
+/// Поддельный STUN-сервер для тестов других модулей: на каждый Binding Request отвечает адресом,
+/// с которого запрос пришёл (на loopback это и есть «внешний» адрес сокета).
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+
+    pub(crate) async fn spawn() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                if n < 20 {
+                    continue;
+                }
+                let SocketAddr::V4(v4) = from else { continue };
+                let xor_port = v4.port() ^ (MAGIC_COOKIE >> 16) as u16;
+                let xor_ip = u32::from_be_bytes(v4.ip().octets()) ^ MAGIC_COOKIE;
+                let mut value = vec![0x00, 0x01];
+                value.extend_from_slice(&xor_port.to_be_bytes());
+                value.extend_from_slice(&xor_ip.to_be_bytes());
+                let mut msg = Vec::new();
+                msg.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+                msg.extend_from_slice(&(value.len() as u16 + 4).to_be_bytes());
+                msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                msg.extend_from_slice(&buf[8..20]);
+                msg.extend_from_slice(&XOR_MAPPED_ADDRESS.to_be_bytes());
+                msg.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                msg.extend_from_slice(&value);
+                let _ = socket.send_to(&msg, from).await;
+            }
+        });
+        addr
+    }
+}

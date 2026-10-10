@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use connection::auth::peer_name;
-use connection::multilink::Discovery;
+use connection::discovery::Discovery;
 use connection::vps;
 use hp_server::settings::Settings;
 use hp_server::{Peer, PeerChange};

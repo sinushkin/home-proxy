@@ -16,7 +16,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use connection::multilink::{Discovery, Incoming, MultiLink, MultiLinkOptions, TARGET_LINKS};
+use connection::discovery::Discovery;
+use connection::multilink::{Incoming, MultiLink, MultiLinkOptions, TARGET_LINKS};
 use connection::proto::AddressKind;
 use tokio::sync::mpsc;
 use uuid::Uuid;

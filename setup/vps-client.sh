@@ -51,7 +51,10 @@ TUN_NAME=$CLIENT_TUN
 RUST_LOG=info
 ON_TUN_UP=/etc/vps-client/on-tun-up.sh
 ON_TUN_DOWN=/etc/vps-client/on-tun-down.sh
-"
+${CONTROL_ADDR:+CONTROL_ADDR=$CONTROL_ADDR
+}"
+# CONTROL_ADDR (необязательно, при запуске скрипта): протокол управления для hpctl/трея, например
+# 192.168.1.1:47001 (адрес LAN роутера) или 127.0.0.1:47001; строка подключения — vps-client --connection-string.
 
 install_openwrt() {
   require_build_tools
@@ -91,7 +94,7 @@ start_service() {
 	. "$CONF"
 	procd_open_instance
 	procd_set_param command "$PROG" "$VPS_SERVER" "$VPS_MY_ID" "$VPS_PEER_ID"
-	procd_set_param env TUN_NAME="$TUN_NAME" RUST_LOG="$RUST_LOG" ON_TUN_UP="$ON_TUN_UP" ON_TUN_DOWN="$ON_TUN_DOWN"
+	procd_set_param env TUN_NAME="$TUN_NAME" RUST_LOG="$RUST_LOG" ON_TUN_UP="$ON_TUN_UP" ON_TUN_DOWN="$ON_TUN_DOWN" CONTROL_ADDR="$CONTROL_ADDR" CONTROL_KEY_FILE="$CONTROL_KEY_FILE"
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1

@@ -13,7 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use connection::auth::peer_name;
-use connection::multilink::{ConnState, Control, Discovery, MultiLink, MultiLinkOptions, TARGET_LINKS};
+use connection::discovery::Discovery;
+use connection::multilink::{ConnState, Control, MultiLink, MultiLinkOptions, TARGET_LINKS};
 use connection::proto::{AddressAssign, AddressKind};
 use hp_control::proto;
 use hp_tun::device::PacketDevice;
@@ -259,7 +260,7 @@ impl<D: PacketDevice> Service<D> {
                         ConnState::Connected(_) => "connected",
                     }
                     .into(),
-                    live: status.holes.len() as u32,
+                    live: status.in_work() as u32,
                     target: TARGET_LINKS,
                     holes: status
                         .holes

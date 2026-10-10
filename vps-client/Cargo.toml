@@ -9,9 +9,11 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
-connection = { path = "../hp-backend/connection" }
+# Только VPS-режим: без MQTT/TLS и STUN клиент заметно меньше (флеш роутера).
+connection = { path = "../hp-backend/connection", default-features = false, features = ["vps"] }
 hp-logging = { path = "../hp-backend/logging" }
 hp-tun = { path = "../hp-backend/tun" }
+hp-control = { path = "../control" }
 
 [features]
 # hp-stats (PLAN-ML.md): клиент участвует в по-пакетной статистике (TimeProbe/PidReport), сам

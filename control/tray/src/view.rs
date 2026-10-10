@@ -74,10 +74,18 @@ fn mean_loss(peer: &PeerStatus) -> (f32, f32) {
     )
 }
 
+/// Сколько дыр в работе считаем здоровым набором: столько держит политика набора как минимум
+/// (`PoolPolicy::min_active`); дыр больше — запас, а не норма (набор динамический: 4..10).
+const HEALTHY_HOLES: u32 = 4;
+
+fn healthy(peer: &PeerStatus) -> bool {
+    peer.live >= HEALTHY_HOLES.min(peer.target)
+}
+
 fn peer_level(peer: &PeerStatus) -> i32 {
     if peer.live == 0 {
         if peer.state == "punching" { 2 } else { 1 }
-    } else if peer.live < peer.target {
+    } else if !healthy(peer) {
         2
     } else {
         3
@@ -93,6 +101,7 @@ fn state_text(peer: &PeerStatus) -> &'static str {
     match peer.state.as_str() {
         "connected" => "на связи",
         "punching" => "пробиваем дыры",
+        _ if is_vps(peer) => "ищем сервер",
         _ => "ищем телефон",
     }
 }
@@ -113,6 +122,12 @@ pub fn summary(state: &UiState) -> (u8, String) {
         return (0, text.into());
     };
     let vps = status.peers.iter().find(|p| is_vps(p));
+    if status.service == "vps-client" {
+        // Клиент VPS-сервера: единственный «пир» — сервер.
+        let Some(vps) = vps else { return (1, "vps-client: нет данных о VPS".into()) };
+        let text = format!("vps-client: {}/{} дыр до VPS {}", vps.live, vps.target, vps.name);
+        return (u8::try_from(peer_level(vps)).unwrap_or(1), text);
+    }
     if let Some(vps) = vps
         && vps.live == 0
     {
@@ -125,7 +140,7 @@ pub fn summary(state: &UiState) -> (u8, String) {
     let connected = peers.iter().filter(|p| p.live > 0).count();
     let level = if connected == 0 {
         1
-    } else if peers.iter().all(|p| p.live == p.target) {
+    } else if peers.iter().all(|p| healthy(p)) {
         3
     } else {
         2
@@ -156,8 +171,19 @@ pub fn render(window: &MainWindow, state: &UiState) {
 
     let real = phones(status);
     let connected = real.iter().filter(|p| p.live > 0).count();
+    let client_of_vps = status.service == "vps-client";
     window.set_headline(
-        if real.is_empty() { "Служба работает, телефонов нет".to_string() } else { format!("На связи телефонов: {connected} из {}", real.len()) }.into(),
+        if client_of_vps {
+            match status.peers.iter().find(|p| is_vps(p)) {
+                Some(vps) => format!("VPS {}: {}/{} дыр в работе", vps.name, vps.live, vps.target),
+                None => "Нет данных о VPS".to_string(),
+            }
+        } else if real.is_empty() {
+            "Служба работает, телефонов нет".to_string()
+        } else {
+            format!("На связи телефонов: {connected} из {}", real.len())
+        }
+        .into(),
     );
     let bind = if status.bind.is_empty() { String::new() } else { format!(" · дыры через {}", status.bind) };
     window.set_details(format!("{} · режим {}{bind} · работает {}", status.service, status.mode, duration(status.uptime_s)).into());
@@ -171,8 +197,9 @@ pub fn render(window: &MainWindow, state: &UiState) {
                 } else {
                     String::new()
                 };
+                let (to, from) = if client_of_vps { ("серверу", "сервера") } else { ("телефонам", "телефонов") };
                 format!(
-                    "{lan}пакетов к телефонам {} · от телефонов {} · TCP по порядку {} · отброшено {}",
+                    "{lan}пакетов к {to} {} · от {from} {} · TCP по порядку {} · отброшено {}",
                     grouped(t.to_peers),
                     grouped(t.from_peers),
                     grouped(t.ordered),
@@ -205,7 +232,7 @@ pub fn render(window: &MainWindow, state: &UiState) {
                 .collect();
             PeerRow {
                 name: peer.name.clone().into(),
-                title: if is_vps(peer) { "VPS (шлюз дома)".into() } else { format!("Телефон {}", peer.name).into() },
+                title: if is_vps(peer) && client_of_vps { format!("VPS-сервер {}", peer.name).into() } else if is_vps(peer) { "VPS (шлюз дома)".into() } else { format!("Телефон {}", peer.name).into() },
                 state: state_text(peer).into(),
                 level: peer_level(peer),
                 live: peer.live as i32,
@@ -304,6 +331,9 @@ mod tests {
         let peer = |name: &str, live| PeerStatus { name: name.into(), live, target: 10, ..Default::default() };
         state.status = Some(Status { peers: vec![peer("a", 10), peer("b", 10)], ..Default::default() });
         assert_eq!(summary(&state).0, 3);
+        // Набор динамический: четыре дыры в работе — норма, меньше — предупреждение.
+        state.status = Some(Status { peers: vec![peer("a", 5), peer("b", 4)], ..Default::default() });
+        assert_eq!(summary(&state).0, 3);
         state.status = Some(Status { peers: vec![peer("a", 10), peer("b", 3)], ..Default::default() });
         assert_eq!(summary(&state).0, 2);
         state.status = Some(Status { peers: vec![peer("a", 0)], ..Default::default() });
@@ -314,5 +344,14 @@ mod tests {
         assert_eq!(summary(&state).0, 1);
         state.status = Some(Status { peers: vec![vps(10), peer("a", 10)], ..Default::default() });
         assert_eq!(summary(&state).0, 3);
+        // vps-client: один пир — сервер.
+        state.status = Some(Status { service: "vps-client".into(), peers: vec![vps(6)], ..Default::default() });
+        let (level, text) = summary(&state);
+        assert_eq!(level, 3);
+        assert!(text.contains("6/10 дыр до VPS"), "{text}");
+        state.status = Some(Status { service: "vps-client".into(), peers: vec![vps(2)], ..Default::default() });
+        assert_eq!(summary(&state).0, 2);
+        state.status = Some(Status { service: "vps-client".into(), peers: vec![vps(0)], ..Default::default() });
+        assert_eq!(summary(&state).0, 1);
     }
 }

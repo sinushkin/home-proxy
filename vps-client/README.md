@@ -15,6 +15,25 @@ vps-client <ip_сервера[:порт_знакомства]> <мой_guid> <gu
 `LOG_TARGET=syslog` (на OpenWrt логи читаются `logread`). Маршруты в TUN — отдельно, см.
 `../OpenWRT/Tun.md`.
 
+## Управление: `hpctl` и трей
+
+`vps-client` умеет то же, что `hp-server` и `hp-router`: отдавать состояние по протоколу
+управления, `hpctl` и трей подключаются к нему так же (строка `homeproxy-control://…`).
+По умолчанию выключено; включается переменной `CONTROL_ADDR` (`127.0.0.1:47001` или адрес
+LAN роутера; `0.0.0.0` нельзя). Ключ — `CONTROL_KEY_FILE`, по умолчанию `control.key` рядом с
+хуками (`/etc/vps-client/`, на Windows `%ProgramData%\vps-client\`).
+
+```bash
+CONTROL_ADDR=192.168.1.1:47001 vps-client --connection-string   # печатает строку (создаёт ключ)
+vps-client --new-connection-string                              # новый ключ, прежние строки не работают
+hpctl --connect 'homeproxy-control://192.168.1.1:47001/<ключ>' status
+```
+
+`status` показывает один «пир» — VPS-сервер: живые дыры в работе, у каждой номер, адрес, возраст,
+признак «сливается», счётчики и потери в обе стороны; ниже — трафик моста. Набор дыр
+динамический: `HOLES_MIN`, `HOLES_MAX`, `HOLE_AGE` (например `60-180`). На роутере с `setup/vps-client.sh`
+включить так: `CONTROL_ADDR=192.168.1.1:47001 setup/vps-client.sh <клиент> <сервер>`.
+
 Раньше клиент умел и мост для WireGuard на `127.0.0.1:<порт>`; от WireGuard отказались
 (`../Performance.md`: на роутере 10–12 Мбит/с с WireGuard против 21 без него).
 

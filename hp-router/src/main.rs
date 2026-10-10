@@ -45,7 +45,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use connection::auth::peer_name;
-use connection::multilink::{ConnState, Control, Discovery, Incoming, LinkStatus, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::discovery::Discovery;
+use connection::multilink::{ConnState, Control, Incoming, LinkStatus, MultiLink, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
 use connection::proto::AddressKind;
 use hp_control::proto;
 use hp_server::service::{now_unix, pairing, PAIRING_TTL};
@@ -84,6 +85,9 @@ struct Config {
     tun_mtu: u16,
     reorder_wait: Duration,
     data_holes: u8,
+    /// Динамический набор дыр (`HOLES_MIN`, `HOLES_MAX`, `HOLE_AGE`) — к VPS и к телефонам.
+    pool: connection::holes::PoolPolicy,
+    hole_age: (Duration, Duration),
     phones: Vec<Phone>,
     /// `None` — STUN/MQTT не заданы: телефонов нет, сопряжение недоступно.
     phone_discovery: Option<PhoneDiscovery>,
@@ -124,6 +128,8 @@ impl Config {
             tun_mtu: u16::try_from(number("TUN_MTU", 1400)?).context("TUN_MTU")?,
             reorder_wait: Duration::from_millis(number("REORDER_WAIT_MS", DEFAULT_REORDER_WAIT.as_millis() as u64)?),
             data_holes: u8::try_from(number("DATA_HOLES", 0)?).context("DATA_HOLES")?,
+            pool: hp_server::holes_settings(&get)?.0,
+            hole_age: hp_server::holes_settings(&get)?.1,
             phones,
             phone_discovery,
             control: control_addr(&get)?,
@@ -438,7 +444,7 @@ fn peer_status(name: String, kind: &str, status: LinkStatus) -> proto::PeerStatu
             ConnState::Connected(_) => "connected",
         }
         .into(),
-        live: status.holes.len() as u32,
+        live: status.in_work() as u32,
         target: TARGET_LINKS,
         holes: status
             .holes
@@ -556,6 +562,8 @@ async fn run(config: Config) -> Result<()> {
         data_holes: config.data_holes,
         reorder_clients: false,
         bind_ifindex,
+        pool: config.pool,
+        hole_age: config.hole_age,
         ..MultiLinkOptions::default()
     };
     let (vps, mut vps_rx) = MultiLink::start_discovery(
@@ -597,6 +605,8 @@ async fn run(config: Config) -> Result<()> {
             reorder_wait: Duration::ZERO,
             data_holes: config.data_holes,
             bind_ifindex,
+            pool: config.pool,
+            hole_age: config.hole_age,
             ..MultiLinkOptions::default()
         },
         stats: Arc::new(RelayStats::default()),

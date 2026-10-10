@@ -9,7 +9,8 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use connection::multilink::{Control, Discovery, Incoming, MultiLink, MultiLinkOptions};
+use connection::discovery::Discovery;
+use connection::multilink::{Control, Incoming, MultiLink, MultiLinkOptions};
 use connection::proto::{AddressAssign, AddressKind, AddressRequest};
 use hp_tun::bridge::{request_address, Bridge};
 use hp_tun::hub::Hub;

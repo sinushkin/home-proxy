@@ -24,10 +24,28 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use connection::multilink::{MultiLink, TARGET_LINKS};
+use connection::holes::PoolPolicy;
+use connection::multilink::{MultiLink, MultiLinkOptions, DEFAULT_HOLE_AGE, TARGET_LINKS};
 use uuid::Uuid;
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+fn env_number<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T> {
+    match std::env::var(name) {
+        Ok(value) => value.trim().parse().map_err(|_| anyhow::anyhow!("{name}: некорректное число")),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Диапазон секунд `мин-макс` (например `60-180`) или одно число.
+fn env_age_range(name: &str, default: (Duration, Duration)) -> anyhow::Result<(Duration, Duration)> {
+    let Ok(value) = std::env::var(name) else { return Ok(default) };
+    let bad = || anyhow::anyhow!("{name}: ожидается «мин-макс» в секундах, например 60-180");
+    let (min, max) = value.trim().split_once('-').unwrap_or((value.trim(), value.trim()));
+    let (min, max): (u64, u64) = (min.trim().parse().map_err(|_| bad())?, max.trim().parse().map_err(|_| bad())?);
+    anyhow::ensure!(min >= 1 && min <= max, bad());
+    Ok((Duration::from_secs(min), Duration::from_secs(max)))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,8 +71,19 @@ async fn main() -> anyhow::Result<()> {
 
     log::info!("my peer_id={my_peer_id} looking for peer_id={peer_id}, target {TARGET_LINKS} holes");
 
+    // Набор дыр динамический; для проверок его можно ускорить: HOLES_MIN, HOLES_MAX, HOLE_AGE=«мин-макс» (с).
+    let pool = PoolPolicy {
+        min_active: env_number("HOLES_MIN", PoolPolicy::default().min_active)?,
+        max_total: env_number("HOLES_MAX", PoolPolicy::default().max_total)?,
+        ..PoolPolicy::default()
+    };
+    anyhow::ensure!(
+        pool.min_active >= 1 && pool.min_active <= pool.max_total && pool.max_total <= TARGET_LINKS as usize,
+        "HOLES_MIN должно быть от 1 до HOLES_MAX, а HOLES_MAX — не больше {TARGET_LINKS}"
+    );
+    let options = MultiLinkOptions { pool, hole_age: env_age_range("HOLE_AGE", DEFAULT_HOLE_AGE)?, ..MultiLinkOptions::default() };
     let (multilink, mut incoming) =
-        MultiLink::start("", stun_addrs, mqtt_addr, mqtt_ca_pem, my_peer_id, peer_id).await?;
+        MultiLink::start_with("", stun_addrs, mqtt_addr, mqtt_ca_pem, my_peer_id, peer_id, options).await?;
 
     log::info!("введите текст и нажмите Enter: он уйдёт пиру по одной из живых дыр");
 

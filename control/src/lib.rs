@@ -77,6 +77,19 @@ pub fn new_key() -> String {
     base64url_encode(&bytes)
 }
 
+/// `CONTROL_ADDR` службы: выключено, если не задан или `off`; `0.0.0.0` не принимаем — только
+/// конкретный адрес (loopback или LAN), иначе управление было бы видно из WAN.
+pub fn parse_control_addr(value: Option<&str>) -> Result<Option<SocketAddr>> {
+    match value.map(str::trim) {
+        None | Some("") | Some("off") => Ok(None),
+        Some(text) => {
+            let addr: SocketAddr = text.parse().context("CONTROL_ADDR: ожидается ip:порт или off")?;
+            anyhow::ensure!(!addr.ip().is_unspecified(), "CONTROL_ADDR: не 0.0.0.0 — только адрес LAN или 127.0.0.1 (иначе управление видно из WAN)");
+            Ok(Some(addr))
+        }
+    }
+}
+
 /// Ключ из файла службы; если файла нет — создаёт новый (на Unix — с правами 600).
 pub fn load_or_create_key(path: &Path) -> Result<String> {
     if let Ok(text) = std::fs::read_to_string(path) {
@@ -304,6 +317,15 @@ mod tests {
         assert_eq!(read_raw(&mut b).await.unwrap().unwrap(), b"one");
         assert_eq!(read_raw(&mut b).await.unwrap().unwrap(), b"second");
         assert!(read_raw(&mut b).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn control_addr_is_off_by_default_and_never_wildcard() {
+        assert_eq!(parse_control_addr(None).unwrap(), None);
+        assert_eq!(parse_control_addr(Some("off")).unwrap(), None);
+        assert_eq!(parse_control_addr(Some(" 192.168.1.1:47001 ")).unwrap(), Some("192.168.1.1:47001".parse().unwrap()));
+        assert!(parse_control_addr(Some("0.0.0.0:47001")).is_err());
+        assert!(parse_control_addr(Some("router")).is_err());
     }
 
     #[test]

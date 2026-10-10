@@ -56,7 +56,7 @@ use uuid::Uuid;
 
 use crate::auth::{peer_name, PairSecret, RecvKeys, SendKeys};
 use crate::codec;
-use crate::holes::{plan, Action, HoleInfo, HoleState, PoolPolicy};
+use crate::holes::{plan, Action, PoolPolicy};
 use crate::multilink::{jittered, send_command, AbortOnDrop, HoleCmd, HoleFactory, SlotBase, SlotId, SlotPhase};
 use crate::port_pool::{PortLease, PortPool};
 use crate::proto::{lite, peer_message, Lite, PeerMessage, Rendezvous};
@@ -277,11 +277,8 @@ pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConf
         factory,
         msg_tx,
         holes: HashMap::new(),
-        next_epoch: 0,
-        closed: VecDeque::new(),
         // С запасом на сливаемые дыры: клиент открывает замену, пока старая ещё закрывается.
-        max_holes: config.pool.max_total * 2,
-        client_started: 0,
+        core: KnockCore::new(config.pool.max_total * 2),
     };
     Ok(vec![AbortOnDrop(tokio::spawn(actor.run(knocks, msg_rx, guard)))])
 }
@@ -317,10 +314,95 @@ async fn listen(socket: Arc<UdpSocket>, mut commands: mpsc::Receiver<Command>) {
     }
 }
 
+/// Решение по запросу знакомства.
+#[derive(Debug, PartialEq)]
+enum KnockAction {
+    /// Запрос не по делу — отбросить молча.
+    Ignore,
+    /// Дыра с таким номером и сессией уже есть — ответить её записью, если готова.
+    Existing,
+    /// Завести дыру (`replace` — прошлая дыра с этим номером брошена клиентом и ей на смену).
+    Spawn { epoch: u32, replace: bool },
+}
+
+#[derive(Debug, PartialEq)]
+struct KnockDecision {
+    /// Клиент перезапущен (время запуска в запросе выросло): все его прошлые дыры закрыть до `action`.
+    restarted: bool,
+    action: KnockAction,
+}
+
+/// Решения сервера по запросам знакомства одного клиента — чистое ядро без сети и задач (оболочка —
+/// `ClientActor`): какие дыры заводить, какие запросы отбрасывать, когда клиент перезапущен.
+struct KnockCore {
+    /// Дыры клиента: номер → (эпоха заведения, сессия клиента).
+    holes: HashMap<SlotId, (u32, Uuid)>,
+    /// Недавно закрытые (номер, сессия клиента): запоздалый запрос их не воскрешает.
+    closed: VecDeque<(SlotId, Uuid)>,
+    next_epoch: u32,
+    max_holes: usize,
+    /// Время запуска процесса клиента по его последнему запросу (`0` — ещё не знаем).
+    client_started: u64,
+}
+
+impl KnockCore {
+    fn new(max_holes: usize) -> Self {
+        Self { holes: HashMap::new(), closed: VecDeque::new(), next_epoch: 0, max_holes, client_started: 0 }
+    }
+
+    fn knock(&mut self, slot: SlotId, session: Uuid, started_ms: u64) -> KnockDecision {
+        let mut restarted = false;
+        if started_ms > self.client_started {
+            restarted = self.client_started != 0;
+            if restarted {
+                self.holes.clear();
+            }
+            self.closed.clear();
+            self.client_started = started_ms;
+        } else if started_ms != 0 && started_ms < self.client_started {
+            // Запоздалый запрос прошлого экземпляра клиента.
+            return KnockDecision { restarted: false, action: KnockAction::Ignore };
+        }
+        let ignore = |restarted| KnockDecision { restarted, action: KnockAction::Ignore };
+        if self.closed.contains(&(slot, session)) {
+            return ignore(restarted);
+        }
+        let replace = match self.holes.get(&slot) {
+            Some(&(_, known)) if known == session => return KnockDecision { restarted, action: KnockAction::Existing },
+            Some(_) => true,
+            None => {
+                if self.holes.len() >= self.max_holes {
+                    return ignore(restarted);
+                }
+                false
+            }
+        };
+        self.next_epoch = self.next_epoch.wrapping_add(1);
+        self.holes.insert(slot, (self.next_epoch, session));
+        KnockDecision { restarted, action: KnockAction::Spawn { epoch: self.next_epoch, replace } }
+    }
+
+    /// Задача дыры закончилась. `true` — это текущая дыра номера (а не вытесненная прошлая).
+    /// `retry` — по нашей вине (не нашёлся порт): номер не «закрыт», следующий запрос заведёт дыру заново.
+    fn on_ended(&mut self, slot: SlotId, epoch: u32, retry: bool) -> bool {
+        let Some(&(current, session)) = self.holes.get(&slot) else { return false };
+        if current != epoch {
+            return false;
+        }
+        self.holes.remove(&slot);
+        if !retry {
+            self.closed.push_back((slot, session));
+            if self.closed.len() > CLOSED_MEMORY {
+                self.closed.pop_front();
+            }
+        }
+        true
+    }
+}
+
 /// Дыра клиента на сервере: что отвечать на знакомство и задача дыры.
 struct ServerHoleRec {
     epoch: u32,
-    client_session: Uuid,
     offer: Option<Rendezvous>,
     _task: AbortOnDrop,
 }
@@ -337,11 +419,8 @@ struct ClientActor {
     factory: HoleFactory,
     msg_tx: mpsc::UnboundedSender<HoleMsg>,
     holes: HashMap<SlotId, ServerHoleRec>,
-    next_epoch: u32,
-    closed: VecDeque<(SlotId, Uuid)>,
-    max_holes: usize,
-    /// Время запуска процесса клиента по его последнему запросу (`0` — ещё не знаем).
-    client_started: u64,
+    /// Решения по запросам знакомства (чистое ядро).
+    core: KnockCore,
 }
 
 impl ClientActor {
@@ -365,15 +444,8 @@ impl ClientActor {
                 }
             }
             HoleMsg::Ended { slot, epoch, retry } => {
-                if let Some(hole) = self.holes.get(&slot).filter(|h| h.epoch == epoch) {
-                    let client_session = hole.client_session;
+                if self.core.on_ended(slot, epoch, retry) {
                     self.holes.remove(&slot);
-                    if !retry {
-                        self.closed.push_back((slot, client_session));
-                        if self.closed.len() > CLOSED_MEMORY {
-                            self.closed.pop_front();
-                        }
-                    }
                 }
             }
         }
@@ -383,43 +455,30 @@ impl ClientActor {
     async fn knock(&mut self, knock: Knock) {
         let Some(request) = unwrap(&knock.packet, &mut self.recv, &self.pair) else { return };
         let slot = request.slot;
-        let started = request.registered_at_unix_ms;
-        if started > self.client_started {
-            // Клиент перезапущен (время запуска выросло): его прошлые дыры мертвы, не ждём тайм-аута потери.
-            if self.client_started != 0 && !self.holes.is_empty() {
-                log::info!("клиент перезапущен: закрываем его прошлые дыры ({})", self.holes.len());
-                self.holes.clear();
-            }
-            self.closed.clear();
-            self.client_started = started;
-        } else if started != 0 && started < self.client_started {
-            return; // запоздалый запрос прошлого экземпляра клиента
+        let decision = self.core.knock(slot, request.session_id, request.registered_at_unix_ms);
+        if decision.restarted && !self.holes.is_empty() {
+            // Клиент перезапущен: его прошлые дыры мертвы, не ждём тайм-аута потери.
+            log::info!("клиент перезапущен: закрываем его прошлые дыры ({})", self.holes.len());
+            self.holes.clear();
         }
-        // Запоздалый запрос уже закрытой дыры её не воскрешает.
-        if self.closed.contains(&(slot, request.session_id)) {
-            return;
-        }
-        match self.holes.get(&slot) {
-            // Тот же номер с новой сессией: так делает прошлая версия клиента (фиксированные слоты
-            // 0..9 перерегистрируются после потери дыры). Прошлая дыра этого номера брошена.
-            Some(hole) if hole.client_session != request.session_id => {
-                log::debug!("знакомство: дыра {slot} перерегистрирована клиентом {}, новая сессия {}", knock.from, request.session_id);
-                if let Some(mut old) = self.holes.remove(&slot) {
-                    // Дожидаемся конца старой задачи: её уборка (реестр, команды, фазы) не должна
-                    // задеть новую дыру с тем же номером.
-                    old._task.0.abort();
-                    let _ = (&mut old._task.0).await;
+        match decision.action {
+            KnockAction::Ignore => return,
+            KnockAction::Existing => {}
+            KnockAction::Spawn { epoch, replace } => {
+                if replace {
+                    // Тот же номер с новой сессией: так делает прошлая версия клиента (фиксированные
+                    // слоты 0..9 перерегистрируются после потери дыры). Прошлая дыра брошена.
+                    log::debug!("знакомство: дыра {slot} перерегистрирована клиентом {}, новая сессия {}", knock.from, request.session_id);
+                    if let Some(mut old) = self.holes.remove(&slot) {
+                        // Дожидаемся конца старой задачи: её уборка (реестр, команды, фазы) не должна
+                        // задеть новую дыру с тем же номером.
+                        old._task.0.abort();
+                        let _ = (&mut old._task.0).await;
+                    }
+                } else {
+                    log::debug!("знакомство: дыра {slot}, клиент {}, сессия {}", knock.from, request.session_id);
                 }
-                self.spawn_hole(slot, request.session_id);
-            }
-            Some(_) => {}
-            None => {
-                if self.holes.len() >= self.max_holes {
-                    log::debug!("знакомство: у клиента {} уже {} дыр, запрос дыры {slot} отброшен", knock.from, self.holes.len());
-                    return;
-                }
-                log::debug!("знакомство: дыра {slot}, клиент {}, сессия {}", knock.from, request.session_id);
-                self.spawn_hole(slot, request.session_id);
+                self.spawn_hole(slot, epoch, request.session_id);
             }
         }
         if let Some(offer) = self.holes.get(&slot).and_then(|h| h.offer.clone()) {
@@ -427,9 +486,7 @@ impl ClientActor {
         }
     }
 
-    fn spawn_hole(&mut self, slot: SlotId, client_session: Uuid) {
-        self.next_epoch = self.next_epoch.wrapping_add(1);
-        let epoch = self.next_epoch;
+    fn spawn_hole(&mut self, slot: SlotId, epoch: u32, client_session: Uuid) {
         let hole = ServerHole {
             public_ip: self.public_ip,
             ports: self.ports.clone(),
@@ -439,7 +496,7 @@ impl ClientActor {
             base: self.factory.make(slot, true, true),
         };
         let task = AbortOnDrop(tokio::spawn(hole.run(client_session)));
-        self.holes.insert(slot, ServerHoleRec { epoch, client_session, offer: None, _task: task });
+        self.holes.insert(slot, ServerHoleRec { epoch, offer: None, _task: task });
     }
 }
 
@@ -642,19 +699,9 @@ impl Manager {
 
     fn evaluate(&mut self) {
         let now = Instant::now();
-        let infos: Vec<HoleInfo> = {
+        let infos = {
             let registry = self.factory.registry.lock().unwrap();
-            self.holes
-                .iter()
-                .map(|(&id, rec)| {
-                    let age = now.duration_since(rec.opened);
-                    match registry.hole_info(id) {
-                        Some((state, loss_out, loss_in)) => HoleInfo { id, state, age, max_age: rec.max_age, loss_out, loss_in },
-                        // Ещё не в реестре: идёт знакомство и пробив.
-                        None => HoleInfo { id, state: HoleState::Warming, age, max_age: rec.max_age, loss_out: None, loss_in: None },
-                    }
-                })
-                .collect()
+            crate::holes::snapshot(&registry, self.holes.iter().map(|(&id, rec)| (id, rec.opened, rec.max_age)), now)
         };
         for action in plan(&infos, now.duration_since(self.last_open), &self.pool) {
             match action {
@@ -789,6 +836,9 @@ impl ClientHole {
 }
 
 #[cfg(test)]
+mod integration;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -845,7 +895,8 @@ mod tests {
     /// тот же номер с новой сессией: сервер обязан завести дыру заново, а не молчать.
     #[tokio::test]
     async fn server_follows_a_legacy_client_that_reregisters_the_same_slot() {
-        use crate::multilink::{Discovery, MultiLink, MultiLinkOptions};
+        use crate::discovery::Discovery;
+        use crate::multilink::{MultiLink, MultiLinkOptions};
         let (server_id, client_id) = (Uuid::new_v4(), Uuid::new_v4());
         let boot_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let bootstrap = Bootstrap::bind(boot_port, 48200..=48299).await.unwrap();
@@ -885,5 +936,77 @@ mod tests {
         assert_eq!(second.slot, 3);
         assert_ne!(first.session_id, second.session_id, "новая сессия клиента — новая дыра сервера");
         assert_ne!(first.addr, second.addr, "новая дыра занимает другой порт");
+    }
+
+    fn knock_core() -> KnockCore {
+        KnockCore::new(4)
+    }
+
+    #[test]
+    fn a_new_number_gets_a_hole_and_a_repeated_knock_finds_it() {
+        let (mut core, session) = (knock_core(), Uuid::new_v4());
+        assert!(matches!(core.knock(7, session, 100).action, KnockAction::Spawn { replace: false, .. }));
+        assert_eq!(core.knock(7, session, 100).action, KnockAction::Existing, "повторный запрос раз в секунду дыры не множит");
+    }
+
+    #[test]
+    fn the_same_number_with_a_new_session_replaces_the_hole_of_a_legacy_client() {
+        let mut core = knock_core();
+        let first = match core.knock(3, Uuid::new_v4(), 0).action {
+            KnockAction::Spawn { epoch, .. } => epoch,
+            other => panic!("{other:?}"),
+        };
+        let second = match core.knock(3, Uuid::new_v4(), 0).action {
+            KnockAction::Spawn { epoch, replace: true } => epoch,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(first, second);
+        // Конец вытесненной дыры текущую не трогает.
+        assert!(!core.on_ended(3, first, false));
+        assert!(core.on_ended(3, second, false));
+    }
+
+    #[test]
+    fn a_late_knock_of_a_closed_hole_does_not_revive_it_but_a_retry_does() {
+        let (mut core, session) = (knock_core(), Uuid::new_v4());
+        let KnockAction::Spawn { epoch, .. } = core.knock(9, session, 0).action else { panic!() };
+        assert!(core.on_ended(9, epoch, false));
+        assert_eq!(core.knock(9, session, 0).action, KnockAction::Ignore);
+        // Не нашёлся порт — номер не закрыт, клиент попробует снова.
+        let other = Uuid::new_v4();
+        let KnockAction::Spawn { epoch, .. } = core.knock(10, other, 0).action else { panic!() };
+        assert!(core.on_ended(10, epoch, true));
+        assert!(matches!(core.knock(10, other, 0).action, KnockAction::Spawn { .. }));
+    }
+
+    #[test]
+    fn a_restarted_client_closes_its_old_holes_and_old_knocks_are_ignored() {
+        let mut core = knock_core();
+        let old = Uuid::new_v4();
+        core.knock(1, old, 1_000);
+        core.knock(2, old, 1_000);
+        let decision = core.knock(500, Uuid::new_v4(), 2_000);
+        assert!(decision.restarted, "время запуска выросло — клиент перезапущен");
+        assert!(matches!(decision.action, KnockAction::Spawn { .. }));
+        assert_eq!(core.holes.len(), 1, "прошлые дыры закрыты");
+        assert_eq!(core.knock(1, old, 1_000).action, KnockAction::Ignore, "запоздалый запрос прошлого экземпляра");
+        // Прошлая версия клиента время запуска не шлёт (0) — на решение это не влияет.
+        assert!(matches!(core.knock(5, Uuid::new_v4(), 0).action, KnockAction::Spawn { .. }));
+        // Первый запрос вообще — не «перезапуск».
+        assert!(!knock_core().knock(1, Uuid::new_v4(), 777).restarted);
+    }
+
+    #[test]
+    fn a_client_cannot_hold_more_holes_than_the_limit() {
+        let mut core = knock_core();
+        for slot in 0..4 {
+            assert!(matches!(core.knock(slot, Uuid::new_v4(), 0).action, KnockAction::Spawn { .. }));
+        }
+        assert_eq!(core.knock(4, Uuid::new_v4(), 0).action, KnockAction::Ignore, "предел дыр на клиента");
+        // Существующим и перерегистрации номеру предел не мешает.
+        let session = Uuid::new_v4();
+        let KnockAction::Spawn { epoch, .. } = core.knock(2, session, 0).action else { panic!() };
+        assert!(core.on_ended(2, epoch, false));
+        assert!(matches!(core.knock(4, Uuid::new_v4(), 0).action, KnockAction::Spawn { .. }), "место освободилось");
     }
 }

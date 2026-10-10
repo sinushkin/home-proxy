@@ -27,7 +27,9 @@
 //!   (по умолчанию; сравнить STUN по маршруту по умолчанию и через каждый адаптер, `bypass`),
 //!   IP-адрес адаптера или `off`;
 //!   REORDER_WAIT_MS — сколько мс ждать недостающий TCP-пакет при восстановлении порядка (8;
-//!   0 — выключить); DATA_HOLES — через сколько дыр слать данные (0 — через все живые).
+//!   0 — выключить); DATA_HOLES — через сколько дыр слать данные (0 — через все живые);
+//!   HOLES_MIN (4), HOLES_MAX (10), HOLE_AGE (`60-180`, секунды) — динамический набор дыр: не
+//!   меньше стольких в работе, не больше стольких всего, дыры стареют и заменяются.
 //!
 //! Логи: `RUST_LOG` (по умолчанию `info`), `LOG_TARGET=syslog` — в syslog,
 //! `LOG_FILE=путь` — в файл.
@@ -48,7 +50,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use connection::multilink::{Discovery, MultiLinkOptions, DEFAULT_REORDER_WAIT, TARGET_LINKS};
+use connection::holes::PoolPolicy;
+use connection::discovery::Discovery;
+use connection::multilink::{MultiLinkOptions, DEFAULT_HOLE_AGE, DEFAULT_REORDER_WAIT, TARGET_LINKS};
 use tokio::sync::mpsc;
 use settings::Settings;
 use uuid::Uuid;
@@ -100,6 +104,9 @@ pub struct Common {
     pub dns: Vec<std::net::Ipv4Addr>,
     pub reorder_wait: Duration,
     pub data_holes: u8,
+    /// Динамический набор дыр: сколько держать и как долго живёт дыра (`HOLES_MIN`, `HOLES_MAX`, `HOLE_AGE`).
+    pub pool: PoolPolicy,
+    pub hole_age: (Duration, Duration),
     /// Адрес протокола управления (трей); `None` — выключен.
     pub control: Option<std::net::SocketAddr>,
     pub key_file: PathBuf,
@@ -161,6 +168,8 @@ impl Common {
                 Some(value) => value.trim().parse().context("DATA_HOLES: ожидается число дыр 0..=255")?,
                 None => 0,
             },
+            pool: holes_settings(&get)?.0,
+            hole_age: holes_settings(&get)?.1,
             control: match get("CONTROL_ADDR").as_deref().map(str::trim) {
                 Some("off") | Some("") => None,
                 Some(addr) => Some(addr.parse().context("CONTROL_ADDR: ожидается ip:порт или off")?),
@@ -190,6 +199,32 @@ impl Common {
             },
         })
     }
+}
+
+/// Динамический набор дыр из настроек: `HOLES_MIN` (4 — не меньше стольких в работе), `HOLES_MAX`
+/// (10), `HOLE_AGE` (`60-180` — срок жизни дыры в секундах, случайный в этих пределах).
+pub fn holes_settings(get: &impl Fn(&str) -> Option<String>) -> Result<(PoolPolicy, (Duration, Duration))> {
+    let number = |name: &str, default: usize| -> Result<usize> {
+        get(name).map_or(Ok(default), |v| v.trim().parse().with_context(|| format!("{name}: ожидается число")))
+    };
+    let defaults = PoolPolicy::default();
+    let pool = PoolPolicy { min_active: number("HOLES_MIN", defaults.min_active)?, max_total: number("HOLES_MAX", defaults.max_total)?, ..defaults };
+    anyhow::ensure!(
+        pool.min_active >= 1 && pool.min_active <= pool.max_total && pool.max_total <= TARGET_LINKS as usize,
+        "HOLES_MIN должно быть от 1 до HOLES_MAX, а HOLES_MAX — не больше {TARGET_LINKS}"
+    );
+    let age = match get("HOLE_AGE") {
+        None => DEFAULT_HOLE_AGE,
+        Some(value) => {
+            let bad = || anyhow::anyhow!("HOLE_AGE: ожидается «мин-макс» в секундах, например 60-180");
+            let value = value.trim();
+            let (min, max) = value.split_once('-').unwrap_or((value, value));
+            let (min, max): (u64, u64) = (min.trim().parse().map_err(|_| bad())?, max.trim().parse().map_err(|_| bad())?);
+            anyhow::ensure!(min >= 1 && min <= max, bad());
+            (Duration::from_secs(min), Duration::from_secs(max))
+        }
+    };
+    Ok((pool, age))
 }
 
 /// Пиры: `PEER_<n>_MY_ID` / `PEER_<n>_PEER_ID` (n = 1, 2, … подряд) или один — `MY_ID` / `PEER_ID`.
@@ -371,6 +406,8 @@ async fn run<D: hp_tun::device::PacketDevice>(
         data_holes: common.data_holes,
         bind_ip: binding.ip,
         bind_ifindex: binding.ifindex,
+        pool: common.pool,
+        hole_age: common.hole_age,
         ..MultiLinkOptions::default()
     };
     // hp-stats (фича `stats`, PLAN-ML.md): сборщик запускается один раз на процесс; `_stats_task`

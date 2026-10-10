@@ -7,6 +7,8 @@
   `hp-router`), клиент, строка подключения, ссылка сопряжения для QR.
 - **`hp-tray`** (`tray/`) — трей для Windows и Linux на Slint: значок с цветом состояния, окно со
   статусом службы, телефонами, дырами и потерями, добавление телефона по QR.
+- **Службы, к которым подключаются трей и `hpctl`:** `hp-server` (и `vps-server`), `hp-router`, `vps-client`
+  (у последнего один «пир» — VPS-сервер; `CONTROL_ADDR`, `vps-client --connection-string`).
 - **`hpctl`** (`src/bin/hpctl.rs`) — то же из консоли, без графики: `status`, `pair`, `remove <имя>`.
 - **`luci-app-homeproxy`** ([`../OpenWRT/luci-app-homeproxy`](../OpenWRT/luci-app-homeproxy/)) —
   страница LuCI роутера: показать и скопировать строку подключения, выпустить новую.

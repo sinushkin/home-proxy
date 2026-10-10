@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use connection::codec;
-use connection::multilink::{Discovery, MultiLink, MultiLinkOptions};
+use connection::discovery::Discovery;
+use connection::multilink::{MultiLink, MultiLinkOptions};
 use connection::proto::{lite, peer_message, Data, Lite, PeerMessage};
 use uuid::Uuid;
 

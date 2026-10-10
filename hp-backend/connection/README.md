@@ -143,39 +143,46 @@ LinkRegistry.remove → новый цикл (свежая сессия, зано
 
 ## Карта модулей
 
-- `link_id.rs` — `PeerLinkId` (симметричная свёртка двух сессий).
-- `stun.rs` — минимальный STUN-клиент (RFC 5389, IPv4): наш публичный адрес.
-  `query` ждёт ответ среди чужого трафика (на сокет слота уже стучится пир),
-  `parse_servers` разбирает список `ip:порт,ip2:порт`, `describe_nat` пишет в лог,
-  если серверы видят сокет по-разному (другой адрес — другой маршрут, другой порт —
-  NAT с зависимостью от адресата).
-- `rendezvous.rs` — MQTT 5: `connect()` → `(Registrar, поток PeerSession)`,
-  `Registrar::publish_slot()` с TTL. Слои клиент → канал → `event_loop`
-  расписаны в doc-комментарии `connect()`/типов.
-- `port_utils.rs` — `sweep_bounds()` (диапазон) и `zigzag_ports()` (порядок);
-  примеры — doc-тесты (`cargo test --doc`).
-- `punch.rs` — пробив ОДНОЙ дыры: `establish()` → `PeerLink` c `PeerLinkId` и
-  `LinkSender`; keep-alive снаружи. `PeerLink::lost()` — потеря по тишине.
-- `multilink.rs` — менеджер набора: `MultiLink::start()`, `LinkRegistry`,
-  общий keepalive, перерегистрация.
+Крейт делится на **общее** (собирается всегда) и два **режима** под фичами Cargo `p2p` и `vps`
+(по умолчанию включены оба). Общее о режимах не знает: режим подключается к `MultiLink` через
+`MultiLink::start_mode`, а `discovery.rs` — тонкий слой с `Discovery` и точками входа
+`start_discovery`/`start`/`start_with`.
+
+Общее (шифрование, пакеты, дыры):
+
 - `auth.rs` — имена, секрет пары, ключи и подпись пакетов (см. «Идентификация»).
 - `codec.rs` — подпись + protobuf, XOR первых `MASKED_PREFIX` (24 + 128) байт 16-байтным
   вектором (`XorKey`): подпись и заголовки скрыты, нагрузку (обычно TLS) маскировать незачем.
 - `wire.rs` — быстрый путь кодека для пакетов данных (без выделения памяти, байт-в-байт как prost).
-- `xor.rs` — сам XOR: ядра под SSE2/NEON, AVX2 и AVX-512, выбор в рантайме.
-- `label.rs` — метка набора дыр в логах (`[phone] `, `[server] `).
-- `reorder.rs` — восстановление порядка TCP-пакетов на приёме по корзине и номеру (см.
-  `../../Performance.md`).
-- `p2p.rs` — стейт-машина P2P-слота: STUN → анонс (MQTT / виртуал-брокер) → запись пира →
-  пробив в окне 80 с.
-- `vps.rs` — стейт-машины VPS-режима (сервер и клиент) и порт знакомства (см. ниже).
-- В `multilink.rs` — только общее для обоих режимов; слот любого режима, получив дыру, отдаёт
-  её `SlotBase::hold` (в реестре, пока не потеряна или не помечена плохой).
+- `xor.rs` — сам XOR: ядра под SSE2/NEON, AVX2 и AVX-512, выбор в рантайме. `pool.rs` — банк буферов.
+- `punch.rs` — пробив ОДНОЙ дыры: `establish()` → `PeerLink` c `PeerLinkId` и `LinkSender`; keep-alive
+  снаружи. `PeerLink::lost()` — потеря по тишине. `port_utils.rs` — `sweep_bounds()`/`zigzag_ports()`.
+- `multilink.rs` — `MultiLink`: реестр дыр, общий keep-alive, статистика, приём, `HoleFactory`/
+  `SlotBase` (держать и сливать дыру), `start_mode`. `holes.rs` — политика набора (`plan`),
+  `drain.rs` — слив по подтверждению (конечный автомат), `dedup.rs`, `reorder.rs` — порядок TCP-пакетов
+  (см. `../../Performance.md`), `link_id.rs` — `PeerLinkId`, `label.rs`, `bind.rs`, `port_pool.rs`.
+- `rendezvous.rs` — запись знакомства: подписанная секретом пары, `PeerSession`; MQTT тут нет.
+
+P2P (фича `p2p`, каталог `p2p/`; оба за NAT):
+
+- `p2p/mod.rs` — менеджер набора дыр без ролей и задача дыры: STUN → анонс (по живым дырам или MQTT) →
+  запись пира → пробив.
+- `p2p/mqtt.rs` — MQTT 5: `connect()` → `(Registrar, поток PeerSession)`, `Registrar::publish_slot()` с TTL.
+- `p2p/stun.rs` — минимальный STUN-клиент (RFC 5389, IPv4): наш публичный адрес; `parse_servers`,
+  `describe_nat` (разные адреса у серверов — разные маршруты, разные порты — NAT с зависимостью от
+  адресата). Доступен и как `connection::stun`.
+
+VPS (фича `vps`, каталог `vps/`; у сервера белый IP, ни STUN, ни MQTT):
+
+- `vps/mod.rs` — порт знакомства, актор клиента на сервере, менеджер набора на клиенте (см. ниже).
+
+Клиент одного режима собирается без другого: `vps-client` берёт только `vps` (без MQTT/TLS на MIPS
+1,4 МБ вместо 2,2), клиент телефона — только `p2p`.
 
 ## VPS-режим (крейты `vps-server`, `vps-client`)
 
 Если у сервера белый IP, пробивать ничего не нужно: нет STUN, MQTT и перебора портов
-(`connection/src/vps.rs`, `Discovery::VpsServer` / `Discovery::VpsClient`).
+(`connection/src/vps/`, `Discovery::VpsServer` / `Discovery::VpsClient`).
 
 Своя стейт-машина, с P2P не смешивается: инициатор всего — клиент, у сервера нет ни окон
 пробива, ни анонсов, которые снимаются.

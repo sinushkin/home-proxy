@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 tokio = { workspace = true }
 prost = { workspace = true }
-rumqttc = { workspace = true }
+rumqttc = { workspace = true, optional = true }
 uuid = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
@@ -19,6 +19,12 @@ hmac = { workspace = true }
 hp-stats = { path = "../stats", optional = true }
 
 [features]
+# Режимы знакомства: P2P (оба за NAT: STUN + MQTT + пробив) и VPS (у сервера белый IP). Общее —
+# шифрование, пакеты, дыры и набор дыр — собирается всегда; клиенту одного режима другой не нужен
+# (VPS-клиент без MQTT/TLS заметно меньше — важно для флеша роутера).
+default = ["p2p", "vps"]
+p2p = ["dep:rumqttc"]
+vps = []
 stats = ["dep:hp-stats"]
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

@@ -109,6 +109,25 @@ fn worst_loss(h: &HoleInfo) -> f32 {
     h.loss_out.unwrap_or(0.0).max(h.loss_in.unwrap_or(0.0))
 }
 
+/// Снимок набора для `plan()`: состояние и потери берутся из реестра дыр, возраст и срок жизни — из
+/// записей менеджера (`id`, когда открыл, назначенный срок). Дыры, которых ещё нет в реестре, —
+/// `Warming` (идёт знакомство и пробив). Общий для менеджеров VPS-клиента и P2P.
+pub(crate) fn snapshot(
+    registry: &crate::multilink::LinkRegistry,
+    records: impl Iterator<Item = (HoleId, std::time::Instant, Duration)>,
+    now: std::time::Instant,
+) -> Vec<HoleInfo> {
+    records
+        .map(|(id, opened, max_age)| {
+            let age = now.duration_since(opened);
+            match registry.hole_info(id) {
+                Some((state, loss_out, loss_in)) => HoleInfo { id, state, age, max_age, loss_out, loss_in },
+                None => HoleInfo { id, state: HoleState::Warming, age, max_age, loss_out: None, loss_in: None },
+            }
+        })
+        .collect()
+}
+
 /// Решает, что делать с набором `holes` прямо сейчас. `since_last_open` — сколько прошло с
 /// последнего `Action::Open` (вызывающий отслеживает это сам: политика не хранит состояние между
 /// вызовами). Порядок правил — приоритет: более ранние строго важнее последующих, дальнейшие не
