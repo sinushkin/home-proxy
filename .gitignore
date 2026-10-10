@@ -42,3 +42,6 @@ Infrastructure.md
 
 # Настройки и GUID связок (setup/state), не коммитятся
 setup/state/
+
+# Тестовый стенд (tests/run.sh)
+tests/out/

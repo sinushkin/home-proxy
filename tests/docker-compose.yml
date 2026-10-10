@@ -1,0 +1,59 @@
+# Стенд проверки setup/*.sh на чистых системах. Запуск — tests/run.sh (параметры там).
+# Все машины в одной сети 172.29.77.0/24: подсеть содержит и ssh-адрес хоста (шлюз .1), поэтому
+# полный туннель клиента (/1-маршруты) его не перехватывает — connected-маршрут /24 точнее.
+x-systemd: &systemd
+  privileged: true            # TUN, iptables, sysctl, systemd внутри
+  tmpfs: [/run, /run/lock, /tmp]
+  stop_signal: SIGRTMIN+3
+
+x-build-args: &args
+  APT_PROXY: ${APT_PROXY:-}
+
+services:
+  # Кэш пакетов apt: сборщик образов ходит к нему через host.docker.internal (шлюз docker0, 172.17.0.1).
+  # Свой прокси в сети (например, http://192.168.3.2:3142) — APT_PROXY=… ./run.sh (локальный не поднимается).
+  proxy:
+    image: sameersbn/apt-cacher-ng:latest
+    profiles: [proxy]
+    ports: ["${PROXY_BIND:-172.17.0.1}:3142:3142"]
+    volumes: [apt-cache:/var/cache/apt-cacher-ng]
+    restart: unless-stopped
+
+  srv-debian12:
+    <<: *systemd
+    build: {context: ., dockerfile: images/deb.Dockerfile, extra_hosts: ["host.docker.internal:host-gateway"], args: {<<: *args, BASE: "debian:12"}}
+    image: hpt-debian12
+    networks: {hpt: {ipv4_address: 172.29.77.11}}
+  srv-debian13:
+    <<: *systemd
+    build: {context: ., dockerfile: images/deb.Dockerfile, extra_hosts: ["host.docker.internal:host-gateway"], args: {<<: *args, BASE: "debian:13"}}
+    image: hpt-debian13
+    networks: {hpt: {ipv4_address: 172.29.77.12}}
+  srv-ubuntu2404:
+    <<: *systemd
+    build: {context: ., dockerfile: images/deb.Dockerfile, extra_hosts: ["host.docker.internal:host-gateway"], args: {<<: *args, BASE: "ubuntu:24.04"}}
+    image: hpt-ubuntu2404
+    networks: {hpt: {ipv4_address: 172.29.77.13}}
+  srv-ubuntu2204:
+    <<: *systemd
+    build: {context: ., dockerfile: images/deb.Dockerfile, extra_hosts: ["host.docker.internal:host-gateway"], args: {<<: *args, BASE: "ubuntu:22.04"}}
+    image: hpt-ubuntu2204
+    networks: {hpt: {ipv4_address: 172.29.77.14}}
+
+  cli-debian:
+    <<: *systemd
+    build: {context: ., dockerfile: images/deb.Dockerfile, extra_hosts: ["host.docker.internal:host-gateway"], args: {<<: *args, BASE: "debian:13", CLIENT_USER: "1"}}
+    image: hpt-client-debian
+    networks: {hpt: {ipv4_address: 172.29.77.21}}
+  cli-manjaro:
+    <<: *systemd
+    build: {context: ., dockerfile: images/manjaro.Dockerfile}
+    image: hpt-client-manjaro
+    networks: {hpt: {ipv4_address: 172.29.77.22}}
+
+networks:
+  hpt:
+    ipam: {config: [{subnet: 172.29.77.0/24, gateway: 172.29.77.1}]}
+
+volumes:
+  apt-cache:
