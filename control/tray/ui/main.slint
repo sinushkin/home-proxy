@@ -33,6 +33,8 @@ export struct PeerRow {
     addresses: string,
     /// Подпись колонки адресов дыр: «адрес телефона» или «адрес сервера».
     addr-title: string,
+    /// Какая служба ведёт этот пир (пусто, если служба одна).
+    service: string,
     loss: string,
     reorder: string,
     registration: string,
@@ -123,6 +125,7 @@ component PeerCard inherits Rectangle {
                 HorizontalLayout {
                     spacing: 12px;
                     Text { text: peer.state; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
+                    if peer.service != "": Text { text: "· " + peer.service; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
                     Text { text: peer.addresses; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
                     Text { text: peer.reorder; font-size: 12px; color: Palette.foreground.transparentize(0.3); }
                     Rectangle { horizontal-stretch: 1; }

@@ -3,11 +3,14 @@
 //!
 //! Тонкий клиент протокола управления (`hp-control`): GUID телефонов не хранит, всё берёт у
 //! службы (`hp-server` на ПК или `hp-router` на роутере). Единственное, что трей помнит, —
-//! строку подключения `homeproxy-control://<ip:порт>/<ключ>`: пользователь вставляет её при
-//! первом запуске (кнопка «Служба…» — сменить), трей хранит её в `tray.conf` в каталоге
-//! настроек пользователя (права 600). По файлам службы трей не ходит.
+//! строки подключения `homeproxy-control://<ip:порт>/<ключ>`: пользователь вставляет их при
+//! первом запуске (кнопка «Служба…» добавляет ещё одну службу; та же служба с новым ключом
+//! заменяет прежнюю строку), трей хранит их в `tray.conf` в каталоге настроек пользователя
+//! (по строке на службу, права 600). Окно показывает все службы сразу (`hp-server` и `vps-client`
+//! вместе, например). По файлам службы трей не ходит.
 //!
-//! Запуск: `hp-tray [--connect строка] [--hidden]`. `--connect` — сразу запомнить строку;
+//! Запуск: `hp-tray [--connect строка] [--config файл] [--hidden]` (`--config` — свой файл настроек,
+//! чтобы вести отдельный набор служб). `--connect` — сразу добавить строку к списку;
 //! `--hidden` — не показывать окно при старте (для автозапуска: окно открывается из трея).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -40,29 +43,41 @@ const RECONNECT: Duration = Duration::from_secs(2);
 /// сетевой переналадки): чтение просто зависает навсегда на formально ещё «открытом» сокете.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Текущая строка подключения; её смена переподключает подписку на статус.
-type Connection = watch::Receiver<Option<String>>;
+/// Строки подключения ко всем службам; их смена переподключает подписки на статус.
+type Connections = watch::Receiver<Vec<String>>;
+
+/// Одна служба, к которой подключён трей (`hp-server`, `vps-client`, `hp-router`).
+#[derive(Default)]
+pub struct ServiceState {
+    pub conn: String,
+    pub status: Option<Status>,
+    pub error: Option<String>,
+}
 
 /// Что окно помнит между статусами.
 #[derive(Default)]
 pub struct UiState {
-    pub status: Option<Status>,
-    pub error: Option<String>,
-    /// Строка подключения задана.
-    pub configured: bool,
+    /// Службы в порядке строк подключения; пусто — ничего не выбрано.
+    pub services: Vec<ServiceState>,
     pub expanded: HashSet<String>,
     /// Показанный QR: имя телефона и срок пакета.
     pub pairing: Option<(String, u64)>,
 }
 
 fn usage() -> ! {
-    eprintln!("использование: hp-tray [--connect строка-подключения] [--hidden]");
+    eprintln!("использование: hp-tray [--connect строка-подключения] [--config файл-настроек] [--hidden]");
     std::process::exit(2);
 }
+
+/// Файл настроек, заданный `--config` (чтобы рядом работал второй трей, например для другой службы).
+static CONFIG_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Файл настроек трея: `$XDG_CONFIG_HOME/home-proxy/tray.conf` (или `~/.config/…`), на Windows —
 /// `%APPDATA%\home-proxy\tray.conf`.
 fn config_file() -> Option<PathBuf> {
+    if let Some(path) = CONFIG_OVERRIDE.get() {
+        return Some(path.clone());
+    }
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else {
@@ -71,18 +86,34 @@ fn config_file() -> Option<PathBuf> {
     base.map(|dir| dir.join("home-proxy").join("tray.conf"))
 }
 
-fn load_connection() -> Option<String> {
-    let text = std::fs::read_to_string(config_file()?).ok()?;
-    let line = text.lines().map(str::trim).find(|l| l.starts_with(hp_control::CONNECTION_PREFIX))?;
-    hp_control::parse_connection_string(line).ok().map(|_| line.to_string())
+/// Строки подключения из `tray.conf` (по одной в строке; повреждённые пропускаются).
+fn load_connections() -> Vec<String> {
+    let Some(text) = config_file().and_then(|path| std::fs::read_to_string(path).ok()) else { return Vec::new() };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with(hp_control::CONNECTION_PREFIX) && hp_control::parse_connection_string(l).is_ok())
+        .map(String::from)
+        .collect()
 }
 
-fn save_connection(connection: &str) -> Result<()> {
+fn save_connections(list: &[String]) -> Result<()> {
     let path = config_file().context("не найден каталог настроек пользователя")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    hp_control::write_private(&path, &format!("{connection}\n")).with_context(|| format!("запись {}", path.display()))
+    let text: String = list.iter().map(|c| format!("{c}\n")).collect();
+    hp_control::write_private(&path, &text).with_context(|| format!("запись {}", path.display()))
+}
+
+/// Добавляет строку к списку; служба с тем же адресом заменяется (у неё сменился ключ).
+fn merge_connection(list: &mut Vec<String>, new: &str) -> Result<()> {
+    let (addr, _) = hp_control::parse_connection_string(new)?;
+    let new = new.trim().to_string();
+    match list.iter().position(|c| hp_control::parse_connection_string(c).is_ok_and(|(a, _)| a == addr)) {
+        Some(i) => list[i] = new,
+        None => list.push(new),
+    }
+    Ok(())
 }
 
 struct Args {
@@ -97,62 +128,74 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--connect" => parsed.connect = Some(args.next().unwrap_or_else(|| usage())),
             "--hidden" => parsed.hidden = true,
+            "--config" => {
+                let _ = CONFIG_OVERRIDE.set(PathBuf::from(args.next().unwrap_or_else(|| usage())));
+            }
             _ => usage(),
         }
     }
     parsed
 }
 
-async fn connect(connection: &Connection) -> Result<Client> {
-    let text = connection.borrow().clone().context("строка подключения не задана")?;
+async fn connect(text: Option<String>) -> Result<Client> {
+    let text = text.context("нет службы, которая это умеет")?;
     let (client, _) = Client::connect_string(&text).await?;
     Ok(client)
 }
 
-/// Подписка на статус по строке `text`: возвращается только с ошибкой (обрыв, чужой ключ).
-async fn subscribe(text: Option<String>, ui: &slint::Weak<MainWindow>, state: &Arc<Mutex<UiState>>, tray: &tray::Tray) -> Result<()> {
-    let text = text.context("строка подключения не задана")?;
-    let (mut client, _) = Client::connect_string(&text).await?;
+/// Подписка на статус службы номер `index`: возвращается только с ошибкой (обрыв, чужой ключ).
+async fn subscribe(index: usize, text: &str, ui: &slint::Weak<MainWindow>, state: &Arc<Mutex<UiState>>, tray: &tray::Tray) -> Result<()> {
+    let (mut client, _) = Client::connect_string(text).await?;
     client.send(Body::Subscribe(Subscribe { interval_ms: STATUS_INTERVAL_MS })).await?;
     loop {
         let body = tokio::time::timeout(STATUS_TIMEOUT, client.recv())
             .await
             .map_err(|_| anyhow::anyhow!("служба молчит дольше {}с", STATUS_TIMEOUT.as_secs()))??;
         if let Body::Status(status) = body {
-            {
-                let mut state = state.lock().unwrap();
-                state.status = Some(status);
-                state.error = None;
-                state.configured = true;
-            }
+            set_service(state, index, text, |service| {
+                service.status = Some(status);
+                service.error = None;
+            });
             refresh(ui, state, tray);
         }
     }
 }
 
-/// Подписка на статус; при обрыве или смене строки подключения — переподключение.
-async fn status_loop(mut connection: Connection, ui: slint::Weak<MainWindow>, state: Arc<Mutex<UiState>>, tray: tray::Tray) {
+/// Меняет службу `index`, если список за это время не сменился (в нём та же строка).
+fn set_service(state: &Arc<Mutex<UiState>>, index: usize, text: &str, change: impl FnOnce(&mut ServiceState)) {
+    let mut state = state.lock().unwrap();
+    if let Some(service) = state.services.get_mut(index).filter(|s| s.conn == text) {
+        change(service);
+    }
+}
+
+/// Подписка на одну службу с переподключением при обрыве.
+async fn service_loop(index: usize, text: String, ui: slint::Weak<MainWindow>, state: Arc<Mutex<UiState>>, tray: tray::Tray) {
     loop {
-        let text = connection.borrow_and_update().clone();
-        let configured = text.is_some();
-        let changed = tokio::select! {
-            result = subscribe(text, &ui, &state, &tray) => {
-                if let Err(e) = result {
-                    let mut locked = state.lock().unwrap();
-                    locked.status = None;
-                    locked.configured = configured;
-                    locked.error = configured.then(|| format!("{e:#}"));
-                }
-                refresh(&ui, &state, &tray);
-                false
-            }
-            _ = connection.changed() => true,
-        };
-        if !changed {
-            tokio::select! {
-                _ = tokio::time::sleep(RECONNECT) => {}
-                _ = connection.changed() => {}
-            }
+        if let Err(e) = subscribe(index, &text, &ui, &state, &tray).await {
+            set_service(&state, index, &text, |service| {
+                service.status = None;
+                service.error = Some(format!("{e:#}"));
+            });
+            refresh(&ui, &state, &tray);
+        }
+        tokio::time::sleep(RECONNECT).await;
+    }
+}
+
+/// Подписки на статус всех служб; смена списка строк подключения пересоздаёт их.
+async fn status_loop(mut connections: Connections, ui: slint::Weak<MainWindow>, state: Arc<Mutex<UiState>>, tray: tray::Tray) {
+    loop {
+        let list = connections.borrow_and_update().clone();
+        state.lock().unwrap().services = list.iter().map(|conn| ServiceState { conn: conn.clone(), ..Default::default() }).collect();
+        refresh(&ui, &state, &tray);
+        // Задачи останавливаются вместе с набором (дроп `JoinSet`), когда список поменялся.
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, conn) in list.into_iter().enumerate() {
+            tasks.spawn(service_loop(index, conn, ui.clone(), state.clone(), tray.clone()));
+        }
+        if connections.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -167,11 +210,12 @@ fn refresh(ui: &slint::Weak<MainWindow>, state: &Arc<Mutex<UiState>>, tray: &tra
 
 fn main() -> Result<()> {
     let args = parse_args();
+    let mut list = load_connections();
     if let Some(text) = &args.connect {
-        hp_control::parse_connection_string(text)?;
-        save_connection(text)?;
+        merge_connection(&mut list, text)?;
+        save_connections(&list)?;
     }
-    let (connection_tx, connection) = watch::channel(load_connection());
+    let (connection_tx, connection) = watch::channel(list);
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     let window = MainWindow::new().context("не удалось создать окно")?;
     let state = Arc::new(Mutex::new(UiState::default()));
@@ -189,7 +233,7 @@ fn main() -> Result<()> {
         move || {
             if let Some(window) = ui.upgrade() {
                 window.set_setup_error(Default::default());
-                window.set_setup_can_cancel(connection.borrow().is_some());
+                window.set_setup_can_cancel(!connection.borrow().is_empty());
                 window.set_setup_visible(true);
             }
         }
@@ -208,13 +252,20 @@ fn main() -> Result<()> {
                 // Строку проверяем подключением и только потом запоминаем.
                 let checked = async {
                     let (_, welcome) = Client::connect_string(&text).await?;
-                    save_connection(&text)?;
-                    anyhow::Ok(welcome)
+                    // Служба добавляется к уже подключённым; с тем же адресом — заменяет прежнюю строку.
+                    let mut list = connection_tx.borrow().clone();
+                    merge_connection(&mut list, &text)?;
+                    save_connections(&list)?;
+                    anyhow::Ok((welcome, list))
                 }
                 .await;
-                if checked.is_ok() {
-                    let _ = connection_tx.send(Some(text));
-                }
+                let checked = match checked {
+                    Ok((welcome, list)) => {
+                        let _ = connection_tx.send(list);
+                        Ok(welcome)
+                    }
+                    Err(e) => Err(e),
+                };
                 let _ = ui.upgrade_in_event_loop(move |window| {
                     window.set_setup_busy(false);
                     match checked {
@@ -231,7 +282,7 @@ fn main() -> Result<()> {
         move |index| {
             let Some(window) = ui.upgrade() else { return };
             let mut state = state.lock().unwrap();
-            let name = state.status.as_ref().and_then(|s| s.peers.get(index as usize)).map(|p| p.name.clone());
+            let name = view::peer_rows(&state).get(index as usize).map(|(_, p)| p.name.clone());
             if let Some(name) = name
                 && !state.expanded.remove(&name)
             {
@@ -242,15 +293,17 @@ fn main() -> Result<()> {
     });
 
     window.on_add_phone({
-        let (ui, state, connection, runtime) = (window.as_weak(), state.clone(), connection.clone(), runtime.handle().clone());
+        let (ui, state, runtime) = (window.as_weak(), state.clone(), runtime.handle().clone());
         move || {
             if let Some(window) = ui.upgrade() {
                 window.set_busy(true);
             }
-            let (ui, state, connection) = (ui.clone(), state.clone(), connection.clone());
+            // Пару выпускает та служба, что это умеет (hp-server или hp-router).
+            let target = state.lock().unwrap().services.iter().find(|s| s.status.as_ref().is_some_and(|st| st.pairing_supported)).map(|s| s.conn.clone());
+            let (ui, state) = (ui.clone(), state.clone());
             runtime.spawn(async move {
                 let result = async {
-                    let mut client = connect(&connection).await?;
+                    let mut client = connect(target).await?;
                     match client.request(Body::CreatePairing(CreatePairing {})).await? {
                         Body::Pairing(pairing) => Ok(pairing),
                         other => anyhow::bail!("неожиданный ответ: {other:?}"),
@@ -293,12 +346,20 @@ fn main() -> Result<()> {
     });
 
     window.on_remove_peer({
-        let (ui, connection, runtime) = (window.as_weak(), connection.clone(), runtime.handle().clone());
+        let (ui, state, runtime) = (window.as_weak(), state.clone(), runtime.handle().clone());
         move |name| {
-            let (ui, connection, name) = (ui.clone(), connection.clone(), name.to_string());
+            // Удаляет та служба, у которой этот телефон есть.
+            let target = state
+                .lock()
+                .unwrap()
+                .services
+                .iter()
+                .find(|s| s.status.as_ref().is_some_and(|st| st.peers.iter().any(|p| p.name.as_str() == name.as_str() && p.removable)))
+                .map(|s| s.conn.clone());
+            let (ui, name) = (ui.clone(), name.to_string());
             runtime.spawn(async move {
                 let result = async {
-                    let mut client = connect(&connection).await?;
+                    let mut client = connect(target).await?;
                     client.request(Body::RemovePeer(RemovePeer { name: name.clone() })).await
                 }
                 .await;
@@ -332,8 +393,8 @@ fn main() -> Result<()> {
         }
     });
 
-    let configured = connection.borrow().is_some();
-    state.lock().unwrap().configured = configured;
+    let configured = !connection.borrow().is_empty();
+    state.lock().unwrap().services = connection.borrow().iter().map(|conn| ServiceState { conn: conn.clone(), ..Default::default() }).collect();
     view::render(&window, &state.lock().unwrap());
     if !configured {
         // Первый запуск: сначала строка подключения.
@@ -346,4 +407,24 @@ fn main() -> Result<()> {
     drop(tray);
     runtime.shutdown_timeout(Duration::from_millis(200));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(addr: &str, key: char) -> String {
+        format!("{}{addr}/{}", hp_control::CONNECTION_PREFIX, key.to_string().repeat(22))
+    }
+
+    #[test]
+    fn a_new_service_is_added_and_the_same_address_is_replaced() {
+        let mut list = vec![conn("192.168.3.1:47001", 'A')];
+        merge_connection(&mut list, &conn("127.0.0.1:47002", 'B')).unwrap();
+        assert_eq!(list.len(), 2, "другой адрес — другая служба");
+        merge_connection(&mut list, &format!("  {}  ", conn("192.168.3.1:47001", 'C'))).unwrap();
+        assert_eq!(list, vec![conn("192.168.3.1:47001", 'C'), conn("127.0.0.1:47002", 'B')], "тот же адрес — новый ключ на месте старого");
+        assert!(merge_connection(&mut list, "мусор").is_err());
+        assert_eq!(list.len(), 2);
+    }
 }

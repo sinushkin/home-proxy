@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hp_control::proto::{HoleStatus, PeerStatus, Status};
 use slint::{Model, ModelRc, SharedString, VecModel};
 
-use crate::{HoleRow, MainWindow, PeerRow, UiState};
+use crate::{HoleRow, MainWindow, PeerRow, ServiceState, UiState};
 
 /// Порог потерь: до него дыра хорошая, после `BAD_LOSS` — плохая.
 const WARN_LOSS: f32 = 0.02;
@@ -115,11 +115,19 @@ fn phones(status: &Status) -> Vec<&PeerStatus> {
     status.peers.iter().filter(|p| !p.pending && !is_vps(p)).collect()
 }
 
-/// Уровень и подсказка для значка трея.
-pub fn summary(state: &UiState) -> (u8, String) {
-    let Some(status) = &state.status else {
-        let text = if state.configured { "Home Proxy: нет связи со службой" } else { "Home Proxy: служба не выбрана" };
-        return (0, text.into());
+/// Подпись службы в списке: что она сама о себе сообщила (`hp-server`, `vps-client`), пока статуса
+/// нет — её адрес из строки подключения.
+fn service_label(service: &ServiceState) -> String {
+    match &service.status {
+        Some(status) if !status.service.is_empty() => status.service.clone(),
+        _ => hp_control::parse_connection_string(&service.conn).map(|(addr, _)| addr.to_string()).unwrap_or_default(),
+    }
+}
+
+/// Уровень и подсказка по одной службе.
+fn service_summary(service: &ServiceState) -> (u8, String) {
+    let Some(status) = &service.status else {
+        return (0, "Home Proxy: нет связи со службой".into());
     };
     let vps = status.peers.iter().find(|p| is_vps(p));
     if status.service == "vps-client" {
@@ -149,72 +157,104 @@ pub fn summary(state: &UiState) -> (u8, String) {
     (level, format!("Home Proxy: на связи {connected} из {}\n{}", peers.len(), lines.join("\n")))
 }
 
+/// Уровень и подсказка для значка трея: худшая из служб (служба без связи — красная).
+pub fn summary(state: &UiState) -> (u8, String) {
+    match state.services.as_slice() {
+        [] => (0, "Home Proxy: служба не выбрана".into()),
+        [one] => service_summary(one),
+        many => {
+            let parts: Vec<(u8, String)> = many.iter().map(service_summary).collect();
+            let level = parts.iter().map(|(level, _)| (*level).max(1)).min().unwrap_or(0);
+            (level, parts.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n"))
+        }
+    }
+}
+
+/// Все пиры всех служб подряд, с номером службы: порядок строк списка в окне.
+pub fn peer_rows(state: &UiState) -> Vec<(usize, &PeerStatus)> {
+    state
+        .services
+        .iter()
+        .enumerate()
+        .flat_map(|(i, service)| service.status.iter().flat_map(move |status| status.peers.iter().map(move |peer| (i, peer))))
+        .collect()
+}
+
+fn headline(status: &Status) -> String {
+    let real = phones(status);
+    if status.service == "vps-client" {
+        match status.peers.iter().find(|p| is_vps(p)) {
+            Some(vps) => format!("VPS {}: {}/{} дыр в работе", vps.name, vps.live, vps.target),
+            None => "Нет данных о VPS".to_string(),
+        }
+    } else if real.is_empty() {
+        "Служба работает, телефонов нет".to_string()
+    } else {
+        format!("На связи телефонов: {} из {}", real.iter().filter(|p| p.live > 0).count(), real.len())
+    }
+}
+
+fn details(status: &Status) -> String {
+    let bind = if status.bind.is_empty() { String::new() } else { format!(" · дыры через {}", status.bind) };
+    format!("{} · режим {}{bind} · работает {}", status.service, status.mode, duration(status.uptime_s))
+}
+
+fn traffic(status: &Status) -> String {
+    let Some(t) = status.traffic.as_ref() else { return String::new() };
+    let lan = if status.service == "hp-router" {
+        format!("LAN → VPS {} · VPS → LAN {} · ", grouped(t.lan_to_vps), grouped(t.vps_to_lan))
+    } else {
+        String::new()
+    };
+    let (to, from) = if status.service == "vps-client" { ("серверу", "сервера") } else { ("телефонам", "телефонов") };
+    format!(
+        "{lan}пакетов к {to} {} · от {from} {} · TCP по порядку {} · отброшено {}",
+        grouped(t.to_peers),
+        grouped(t.from_peers),
+        grouped(t.ordered),
+        grouped(t.dropped)
+    )
+}
+
 pub fn render(window: &MainWindow, state: &UiState) {
     let (level, _) = summary(state);
+    let multi = state.services.len() > 1;
     window.set_overall(i32::from(level));
-    window.set_connected(state.status.is_some());
-    window.set_error(state.error.clone().map(|e| format!("Служба недоступна: {e}")).unwrap_or_default().into());
+    window.set_connected(state.services.iter().any(|s| s.status.is_some()));
+    let errors: Vec<String> = state
+        .services
+        .iter()
+        .filter_map(|s| s.error.as_ref().map(|e| if multi { format!("{}: {e}", service_label(s)) } else { e.clone() }))
+        .collect();
+    window.set_error(if errors.is_empty() { String::new() } else { format!("Служба недоступна: {}", errors.join("; ")) }.into());
 
-    let Some(status) = &state.status else {
-        if state.configured {
-            window.set_headline("Нет связи со службой".into());
-            window.set_details("Проверьте, что служба запущена. Если строку подключения меняли — вставьте новую («Служба…»).".into());
-        } else {
+    let live: Vec<(&ServiceState, &Status)> = state.services.iter().filter_map(|s| s.status.as_ref().map(|st| (s, st))).collect();
+    if live.is_empty() {
+        if state.services.is_empty() {
             window.set_headline("Служба не выбрана".into());
             window.set_details("Нажмите «Служба…» и вставьте строку подключения homeproxy-control://…".into());
+        } else {
+            window.set_headline("Нет связи со службой".into());
+            window.set_details("Проверьте, что служба запущена. Если строку подключения меняли — вставьте новую («Служба…»).".into());
         }
         window.set_traffic(SharedString::new());
         sync_peers(window, Vec::new());
         render_pairing(window, state);
         return;
-    };
+    }
 
-    let real = phones(status);
-    let connected = real.iter().filter(|p| p.live > 0).count();
-    let client_of_vps = status.service == "vps-client";
-    window.set_headline(
-        if client_of_vps {
-            match status.peers.iter().find(|p| is_vps(p)) {
-                Some(vps) => format!("VPS {}: {}/{} дыр в работе", vps.name, vps.live, vps.target),
-                None => "Нет данных о VPS".to_string(),
-            }
-        } else if real.is_empty() {
-            "Служба работает, телефонов нет".to_string()
-        } else {
-            format!("На связи телефонов: {connected} из {}", real.len())
-        }
-        .into(),
-    );
-    let bind = if status.bind.is_empty() { String::new() } else { format!(" · дыры через {}", status.bind) };
-    window.set_details(format!("{} · режим {}{bind} · работает {}", status.service, status.mode, duration(status.uptime_s)).into());
-    window.set_traffic(
-        status
-            .traffic
-            .as_ref()
-            .map(|t| {
-                let lan = if status.service == "hp-router" {
-                    format!("LAN → VPS {} · VPS → LAN {} · ", grouped(t.lan_to_vps), grouped(t.vps_to_lan))
-                } else {
-                    String::new()
-                };
-                let (to, from) = if client_of_vps { ("серверу", "сервера") } else { ("телефонам", "телефонов") };
-                format!(
-                    "{lan}пакетов к {to} {} · от {from} {} · TCP по порядку {} · отброшено {}",
-                    grouped(t.to_peers),
-                    grouped(t.from_peers),
-                    grouped(t.ordered),
-                    grouped(t.dropped)
-                )
-            })
-            .unwrap_or_default()
-            .into(),
-    );
-    window.set_pairing_supported(status.pairing_supported);
+    // Несколько служб: в каждой строке подпись службы, чтобы было видно, чьё что.
+    let prefixed = |service: &ServiceState, text: String| if multi && !text.is_empty() { format!("{}: {text}", service_label(service)) } else { text };
+    window.set_headline(live.iter().map(|(_, st)| headline(st)).collect::<Vec<_>>().join(" · ").into());
+    window.set_details(live.iter().map(|(s, st)| prefixed(s, details(st))).collect::<Vec<_>>().join("\n").into());
+    window.set_traffic(live.iter().map(|(s, st)| prefixed(s, traffic(st))).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n").into());
+    window.set_pairing_supported(live.iter().any(|(_, st)| st.pairing_supported));
 
-    let rows: Vec<PeerRow> = status
-        .peers
-        .iter()
-        .map(|peer| {
+    let rows: Vec<PeerRow> = peer_rows(state)
+        .into_iter()
+        .map(|(si, peer)| {
+            let service = &state.services[si];
+            let client_of_vps = service.status.as_ref().is_some_and(|st| st.service == "vps-client");
             let (out, inn) = mean_loss(peer);
             let holes: Vec<HoleRow> = peer
                 .holes
@@ -233,6 +273,7 @@ pub fn render(window: &MainWindow, state: &UiState) {
             PeerRow {
                 name: peer.name.clone().into(),
                 title: if is_vps(peer) && client_of_vps { format!("VPS-сервер {}", peer.name).into() } else if is_vps(peer) { "VPS (шлюз дома)".into() } else { format!("Телефон {}", peer.name).into() },
+                service: if multi { service_label(service) } else { String::new() }.into(),
                 state: state_text(peer).into(),
                 level: peer_level(peer),
                 live: peer.live as i32,
@@ -276,7 +317,7 @@ fn sync_peers(window: &MainWindow, rows: Vec<PeerRow>) {
 /// Подпись под QR: сколько осталось, подключился ли телефон.
 fn render_pairing(window: &MainWindow, state: &UiState) {
     let Some((name, expires)) = &state.pairing else { return };
-    let peer = state.status.as_ref().and_then(|s| s.peers.iter().find(|p| &p.name == name));
+    let peer = peer_rows(state).into_iter().map(|(_, p)| p).find(|p| &p.name == name);
     let (level, text) = match peer {
         Some(p) if !p.pending => (3, format!("Телефон {name} подключён — окно можно закрыть")),
         Some(p) if p.pending && p.live > 0 => (3, format!("Телефон {name} подключается…")),
@@ -325,34 +366,47 @@ mod tests {
         assert_eq!(hole_level(&hole(0.0, 0.3)), 1);
     }
 
+    fn one(status: Status) -> UiState {
+        UiState { services: vec![ServiceState { status: Some(status), ..Default::default() }], ..Default::default() }
+    }
+
     #[test]
     fn tray_summary() {
-        let mut state = UiState::default();
-        assert_eq!(summary(&state).0, 0);
+        assert_eq!(summary(&UiState::default()).0, 0, "служб нет");
+        assert_eq!(summary(&UiState { services: vec![ServiceState::default()], ..Default::default() }).0, 0, "службы без связи");
         let peer = |name: &str, live| PeerStatus { name: name.into(), live, target: 10, ..Default::default() };
-        state.status = Some(Status { peers: vec![peer("a", 10), peer("b", 10)], ..Default::default() });
-        assert_eq!(summary(&state).0, 3);
+        assert_eq!(summary(&one(Status { peers: vec![peer("a", 10), peer("b", 10)], ..Default::default() })).0, 3);
         // Набор динамический: четыре дыры в работе — норма, меньше — предупреждение.
-        state.status = Some(Status { peers: vec![peer("a", 5), peer("b", 4)], ..Default::default() });
-        assert_eq!(summary(&state).0, 3);
-        state.status = Some(Status { peers: vec![peer("a", 10), peer("b", 3)], ..Default::default() });
-        assert_eq!(summary(&state).0, 2);
-        state.status = Some(Status { peers: vec![peer("a", 0)], ..Default::default() });
-        assert_eq!(summary(&state).0, 1);
+        assert_eq!(summary(&one(Status { peers: vec![peer("a", 5), peer("b", 4)], ..Default::default() })).0, 3);
+        assert_eq!(summary(&one(Status { peers: vec![peer("a", 10), peer("b", 3)], ..Default::default() })).0, 2);
+        assert_eq!(summary(&one(Status { peers: vec![peer("a", 0)], ..Default::default() })).0, 1);
         // Роутер: без связи с VPS — красный, даже если телефоны на связи.
         let vps = |live| PeerStatus { name: "VPS".into(), kind: "vps".into(), live, target: 10, ..Default::default() };
-        state.status = Some(Status { peers: vec![vps(0), peer("a", 10)], ..Default::default() });
-        assert_eq!(summary(&state).0, 1);
-        state.status = Some(Status { peers: vec![vps(10), peer("a", 10)], ..Default::default() });
-        assert_eq!(summary(&state).0, 3);
+        assert_eq!(summary(&one(Status { peers: vec![vps(0), peer("a", 10)], ..Default::default() })).0, 1);
+        assert_eq!(summary(&one(Status { peers: vec![vps(10), peer("a", 10)], ..Default::default() })).0, 3);
         // vps-client: один пир — сервер.
-        state.status = Some(Status { service: "vps-client".into(), peers: vec![vps(6)], ..Default::default() });
-        let (level, text) = summary(&state);
+        let (level, text) = summary(&one(Status { service: "vps-client".into(), peers: vec![vps(6)], ..Default::default() }));
         assert_eq!(level, 3);
         assert!(text.contains("6/10 дыр до VPS"), "{text}");
-        state.status = Some(Status { service: "vps-client".into(), peers: vec![vps(2)], ..Default::default() });
-        assert_eq!(summary(&state).0, 2);
-        state.status = Some(Status { service: "vps-client".into(), peers: vec![vps(0)], ..Default::default() });
-        assert_eq!(summary(&state).0, 1);
+        assert_eq!(summary(&one(Status { service: "vps-client".into(), peers: vec![vps(2)], ..Default::default() })).0, 2);
+        assert_eq!(summary(&one(Status { service: "vps-client".into(), peers: vec![vps(0)], ..Default::default() })).0, 1);
+    }
+
+    #[test]
+    fn several_services_show_the_worst_one_and_list_all_peers() {
+        let peer = |name: &str, live| PeerStatus { name: name.into(), live, target: 10, ..Default::default() };
+        let vps = PeerStatus { name: "VPS".into(), kind: "vps".into(), live: 6, target: 10, ..Default::default() };
+        let client = ServiceState { status: Some(Status { service: "vps-client".into(), peers: vec![vps], ..Default::default() }), ..Default::default() };
+        let server = ServiceState { status: Some(Status { service: "hp-server".into(), peers: vec![peer("phone", 10)], ..Default::default() }), ..Default::default() };
+        let mut state = UiState { services: vec![client, server], ..Default::default() };
+        assert_eq!(summary(&state).0, 3);
+        let rows = peer_rows(&state);
+        assert_eq!(rows.iter().map(|(i, p)| (*i, p.name.as_str())).collect::<Vec<_>>(), vec![(0, "VPS"), (1, "phone")], "обе службы в одном списке");
+        // Одна из служб пропала: значок не зелёный, подсказка называет обе.
+        state.services[1].status = None;
+        let (level, text) = summary(&state);
+        assert_eq!(level, 1, "служба без связи красит значок");
+        assert!(text.contains("vps-client") && text.contains("нет связи"), "{text}");
+        assert_eq!(peer_rows(&state).len(), 1, "у пропавшей службы пиров нет");
     }
 }
