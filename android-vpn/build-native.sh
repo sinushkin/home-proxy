@@ -62,9 +62,6 @@ for abi in $ABIS; do
   ls -la "$out/libhomeproxy.so"
 done
 
-# Старый конфиг WireGuard из assets больше не нужен (VPN — свой TUN).
-rm -f "$HERE/app/src/main/assets/wg.conf"
-
 # CA брокера — публичный сертификат, кладём в assets (в git не попадает).
 CA="$HERE/../cert/out/ca.crt"
 if [[ -f "$CA" ]]; then

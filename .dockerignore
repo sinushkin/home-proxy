@@ -4,7 +4,6 @@ target-android
 hp-backend/target
 android-vpn
 cert/out
-wireguard/out
 **/.env
 mosquitto
 coturn

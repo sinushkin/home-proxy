@@ -23,8 +23,6 @@ android-vpn/.kotlin/
 # Настройки с полными GUID (секрет пары)
 *.env
 !*.env.example
-# Прежняя схема с WireGuard: локальные ключи, если остались
-wireguard/out/
 
 # Образ WSL2 (сборка wsl/build.sh)
 wsl/out/
