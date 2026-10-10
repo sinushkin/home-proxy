@@ -66,6 +66,11 @@ install_openwrt() {
   objdump -T "$bin" | grep -q '__atomic_.*_8' && die "в vps-client 64-битные атомики: на MIPS32 не запустится"
 
   step "Роутер $CLI: TUN, файлы, служба"
+  # Default через туннель (работающий OpenVPN): vps-client примет его за аплинк и заведёт маршрут до сервера
+  # через него — петля, интернет пропадает. Сначала остановите прежний VPN (default вернётся на WAN).
+  if ssh_to "$CLI" "ip route show default | grep -q 'dev tun'" && [[ "${FORCE_DEFAULT_TUN:-0}" != 1 ]]; then
+    die "на $CLI default-маршрут идёт через tun-интерфейс (работает другой VPN?): остановите его и повторите (FORCE_DEFAULT_TUN=1 — всё равно продолжить)"
+  fi
   if ! ssh_to "$CLI" 'test -c /dev/net/tun'; then
     echo "нет /dev/net/tun — ставим kmod-tun"
     ssh_to "$CLI" 'if command -v apk >/dev/null; then apk update >/dev/null && apk add kmod-tun >/dev/null; else opkg update >/dev/null && opkg install kmod-tun >/dev/null; fi'
