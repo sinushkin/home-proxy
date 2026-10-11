@@ -1,11 +1,9 @@
 #!/bin/sh
-# Хук vps-client: туннель снимается (маршруты уже сняты). Возвращаем DNS, как было.
+# Хук vps-client: туннель снимается (маршруты уже сняты). Убираем runtime-DNS, dnsmasq берёт resolv от WAN.
 if command -v uci >/dev/null 2>&1 && uci -q show dhcp >/dev/null 2>&1; then
-	uci -q delete dhcp.@dnsmasq[0].server
-	uci -q delete dhcp.@dnsmasq[0].noresolv
-	uci commit dhcp
+	rm -f /tmp/dnsmasq.d/hp-tun.conf
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1
-	echo "on-tun-down: OpenWrt, dnsmasq вернул resolv от WAN"
+	echo "on-tun-down: OpenWrt, runtime-DNS снят, dnsmasq берёт resolv от WAN"
 elif command -v resolvectl >/dev/null 2>&1; then
 	resolvectl revert "$TUN_DEV" 2>/dev/null
 	echo "on-tun-down: systemd-resolved, $TUN_DEV сброшен"

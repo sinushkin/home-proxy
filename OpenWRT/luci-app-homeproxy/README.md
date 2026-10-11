@@ -16,6 +16,7 @@
 | `root/usr/share/rpcd/acl.d/luci-app-homeproxy.json` | права: чтение — только `--connection-string`, запись — только `--new-connection-string`, для каждой из двух служб с её файлом настроек (`/etc/hp-router/router.env`, `/etc/vps-client/vps-client.conf`) |
 | `test/find.test.js` | проверка выбора службы на заглушках: `node test/find.test.js` |
 | `root/etc/init.d/hp-router` | служба procd `hp-router` (`install.sh` кладёт её, только если на роутере есть `/usr/bin/hp-router`) |
+| `root/usr/libexec/hp-router-run` | обёртка запуска: при падении службы снимает runtime-DNS туннеля (`RUNTIME-DNS.md` в корне репозитория) |
 | `Makefile` | сборка ipk в фиде LuCI (OpenWrt SDK) |
 | `install.sh` | установка без SDK: файлы по ssh, сброс кэша LuCI, `rpcd reload` |
 

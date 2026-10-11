@@ -10,7 +10,7 @@ tar -C htdocs -cf - . | ssh "$router" 'tar -C /www -xf -'
 if ssh "$router" 'test -x /usr/bin/hp-router'; then
 	tar -C root -cf - . | ssh "$router" 'tar -C / -xf -'
 else
-	tar -C root --exclude=./etc/init.d -cf - . | ssh "$router" 'tar -C / -xf -'
+	tar -C root --exclude=./etc/init.d --exclude=./usr/libexec/hp-router-run -cf - . | ssh "$router" 'tar -C / -xf -'
 fi
 ssh "$router" 'rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache; /etc/init.d/rpcd reload'
 echo "готово: LuCI → Службы → Home Proxy"

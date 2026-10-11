@@ -1,0 +1,25 @@
+#!/bin/sh
+# Запуск hp-router под procd: если служба завершилась без on-tun-down.sh (падение, kill -9, OOM),
+# runtime-DNS туннеля (/tmp/dnsmasq.d/hp-tun.conf) снимается, и dnsmasq возвращается на DNS
+# провайдера. При штатной остановке хук уже снял файл — тогда ничего не делаем.
+# Использование: hp-router-run <hp-router> --config <router.env>
+RT=/tmp/dnsmasq.d/hp-tun.conf
+
+"$@" &
+pid=$!
+# SIGTERM от procd — службе: она снимает маршруты и ждёт on-tun-down.sh.
+trap 'kill -TERM "$pid" 2>/dev/null' TERM INT
+wait "$pid"
+rc=$?
+# wait прерывается сигналом раньше службы — дождаться её завершения.
+while kill -0 "$pid" 2>/dev/null; do
+	wait "$pid"
+	rc=$?
+done
+
+if [ -f "$RT" ]; then
+	rm -f "$RT"
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	echo "hp-router-run: служба завершилась (код $rc) без on-tun-down, runtime-DNS снят, dnsmasq на DNS провайдера"
+fi
+exit "$rc"

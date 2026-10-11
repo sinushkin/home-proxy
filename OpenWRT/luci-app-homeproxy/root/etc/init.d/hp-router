@@ -12,7 +12,8 @@ CONF=/etc/hp-router/router.env
 start_service() {
 	[ -f "$CONF" ] || { echo "hp-router: нет $CONF" >&2; return 1; }
 	procd_open_instance
-	procd_set_param command "$PROG" --config "$CONF"
+	# Обёртка снимает runtime-DNS туннеля, если служба упала без on-tun-down.sh.
+	procd_set_param command /usr/libexec/hp-router-run "$PROG" --config "$CONF"
 	procd_set_param respawn 3600 5 0
 	# SIGTERM: служба снимает маршруты туннеля и ждёт on-tun-down.sh (до 30 с).
 	procd_set_param term_timeout 40
