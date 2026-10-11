@@ -7,7 +7,8 @@
 #
 #   setup/vps-server.sh <ssh-алиас сервера>
 #
-# Переменные (необязательно): SERVER_PORT (40600), SERVER_SLOTS (40601-40699), SERVER_TUN (hp-vps).
+# Переменные (необязательно): SERVER_PORT (40600), SERVER_SLOTS (40601-40699), SERVER_TUN (hp-vps),
+# SERVER_ADDR (10.94.0.1/24: адрес сервера в туннеле и подсеть клиентов).
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -15,7 +16,7 @@ SRV="${1:?использование: $0 <ssh-алиас сервера>}"
 SERVER_PORT="${SERVER_PORT:-40600}"
 SERVER_SLOTS="${SERVER_SLOTS:-40601-40699}"
 SERVER_TUN="${SERVER_TUN:-hp-vps}"
-SERVER_ADDR="10.94.0.1/24"
+SERVER_ADDR="${SERVER_ADDR:-10.94.0.1/24}"
 
 step "Инструменты"
 require_build_tools
