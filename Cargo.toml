@@ -12,6 +12,7 @@ members = [
     "hp-server",
     "vps-server",
     "vps-client",
+    "vps-relay",
     "hp-router",
     "control",
     "control/tray",

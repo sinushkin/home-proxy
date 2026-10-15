@@ -102,6 +102,16 @@ impl Routes {
         log::info!("маршруты: туннель снят, всё через {}", self.uplink);
     }
 
+    /// Ещё один адрес мимо туннеля (релей, который разрешил сервер); маршрут ставится сразу.
+    pub async fn add_bypass(&mut self, ip: Ipv4Addr) -> Result<()> {
+        if self.bypass.contains(&ip) {
+            return Ok(());
+        }
+        self.bypass.push(ip);
+        log::info!("маршруты: {ip} мимо туннеля (через {})", self.uplink);
+        self.ensure().await
+    }
+
     /// Сверка раз в 10 с. Ошибка — аплинк сменился: сокеты дыр привязаны к старому, нужен
     /// перезапуск службы.
     pub async fn check(&mut self) -> Result<()> {

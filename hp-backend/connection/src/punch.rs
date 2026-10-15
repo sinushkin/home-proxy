@@ -95,6 +95,8 @@ pub enum LinkEvent {
     PeerPidReport { slot: crate::multilink::SlotId, report: PidReport },
     /// hp-stats: ответ сервера на нашу пробу синхронизации часов (`TimeProbe`).
     PeerTimeEcho { slot: crate::multilink::SlotId, echo: TimeEcho },
+    /// VPS-режим: сервер разрешил часть дыр вести через релей.
+    PeerRelayOffer(crate::proto::RelayOffer),
 }
 
 #[derive(Clone, Debug)]
@@ -308,11 +310,21 @@ impl LinkSender {
         self.send_lite(lite::Payload::Drain(crate::proto::Drain { slot })).await;
     }
 
+    /// VPS-сервер: разрешение клиенту вести часть дыр через релей.
+    pub async fn send_relay_offer(&self, offer: crate::proto::RelayOffer) {
+        self.send_lite(lite::Payload::RelayOffer(offer)).await;
+    }
+
     /// Служебное сообщение (адрес в туннеле) по этой дыре.
     pub async fn send_control(&self, control: crate::multilink::Control) {
         let payload = match control {
             crate::multilink::Control::AddressRequest(r) => lite::Payload::AddressRequest(r),
             crate::multilink::Control::AddressAssign(a) => lite::Payload::AddressAssign(a),
+            crate::multilink::Control::RelayHello(m) => lite::Payload::RelayHello(m),
+            crate::multilink::Control::RelayKnock(m) => lite::Payload::RelayKnock(m),
+            crate::multilink::Control::RelayReply(m) => lite::Payload::RelayReply(m),
+            crate::multilink::Control::RelayOpen(m) => lite::Payload::RelayOpen(m),
+            crate::multilink::Control::RelayReady(m) => lite::Payload::RelayReady(m),
         };
         self.send_lite(payload).await;
     }
@@ -703,6 +715,25 @@ async fn handle_lite(lite: Lite, slot: crate::multilink::SlotId, events: &mpsc::
         // Перехватывается раньше, в `receive_loop` (нужен прямой доступ к сокету для быстрого
         // ответа); сюда дойти не должен, но матч должен быть исчерпывающим.
         Some(lite::Payload::TimeProbe(_)) => {}
+        Some(lite::Payload::RelayHello(m)) => {
+            let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::RelayHello(m))).await;
+        }
+        Some(lite::Payload::RelayKnock(m)) => {
+            let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::RelayKnock(m))).await;
+        }
+        Some(lite::Payload::RelayReply(m)) => {
+            let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::RelayReply(m))).await;
+        }
+        Some(lite::Payload::RelayOpen(m)) => {
+            let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::RelayOpen(m))).await;
+        }
+        Some(lite::Payload::RelayReady(m)) => {
+            let _ = events.send(LinkEvent::PeerControl(crate::multilink::Control::RelayReady(m))).await;
+        }
+        Some(lite::Payload::RelayOffer(offer)) => {
+            log::debug!("слот {slot}: получено разрешение релеев {:?} ({}%)", offer.relays, offer.share);
+            let _ = events.send(LinkEvent::PeerRelayOffer(offer)).await;
+        }
         None => {}
     }
 }

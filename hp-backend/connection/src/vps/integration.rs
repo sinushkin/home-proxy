@@ -286,3 +286,56 @@ fn read_csv_rows(dir: &std::path::Path) -> Vec<Vec<String>> {
     }
     rows
 }
+
+/// Релей приходит к серверу сам (по GUID), сервер разрешает его клиенту (`RelayOffer`), и новые дыры
+/// клиента идут через релей: знакомство на порт релея, дыра на порт его сессии, данные в обе
+/// стороны доходят. До разрешения дыры — напрямую.
+#[tokio::test]
+async fn relay_comes_to_the_server_and_carries_new_client_holes() {
+    use super::relay;
+    let (server_id, client_id, relay_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let free_port = || std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (bootstrap_port, relay_bootstrap) = (free_port(), free_port());
+    let (slots, sessions) = (47400..=47459u16, 48400..=48459u16);
+    let bootstrap = Bootstrap::bind(bootstrap_port, slots.clone()).await.unwrap().with_relay_share(100);
+    let localhost = "127.0.0.1".parse().unwrap();
+    let relay_options = quick_options(2, 3, LONG_AGE);
+    let _accepted = relay::accept(&bootstrap, localhost, server_id, relay_id, relay_options).await.unwrap();
+    let _relay = relay::start(relay::RelayConfig {
+        server: SocketAddr::from(([127, 0, 0, 1], bootstrap_port)),
+        my_id: relay_id,
+        server_id,
+        public_ip: None,
+        bootstrap_port: relay_bootstrap,
+        ports: sessions.clone(),
+        options: relay_options,
+    })
+    .await
+    .unwrap();
+
+    // Короткий срок жизни дыр: после разрешения набор обновляется и новые дыры идут через релей.
+    let age = (Duration::from_secs(3), Duration::from_secs(4));
+    let ((server, mut server_rx), (client, mut client_rx)) =
+        start_pair(&bootstrap, bootstrap_port, server_id, client_id, quick_options(2, 4, age)).await;
+
+    wait_until("разрешение релея у клиента", 20, || client.relay().borrow().is_some()).await;
+    let grant = client.relay().borrow().clone().unwrap();
+    assert_eq!(grant.relays, vec![SocketAddr::from(([127, 0, 0, 1], relay_bootstrap))], "адрес релея — как видит сервер");
+    let via_relay = |link: &MultiLink| link.live_links().iter().filter(|(_, a)| a.is_some_and(|a| sessions.contains(&a.port()))).count();
+    wait_until("дыры клиента через релей", 40, || via_relay(&client) >= 2 && client.live_count() >= 2).await;
+    for (_, addr) in client.live_links() {
+        let port = addr.unwrap().port();
+        assert!(sessions.contains(&port) || slots.contains(&port), "дыра клиента — на релей или на сервер: {port}");
+    }
+
+    client.send_data(b"ping").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), server_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(got.payload, b"ping");
+    server.send_data(b"pong").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), client_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(got.payload, b"pong");
+
+    // Релей пропал: через ~10 с тишины сервер убирает его и сразу сообщает клиенту пустой список.
+    drop(_relay);
+    wait_until("клиент узнал, что релея больше нет", 20, || client.relay().borrow().is_none()).await;
+}

@@ -5399,6 +5399,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vps-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "connection",
+ "hp-logging",
+ "log",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "vps-server"
 version = "0.1.0"
 dependencies = [

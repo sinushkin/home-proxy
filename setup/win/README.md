@@ -9,6 +9,7 @@
 | `vps-server.bat <сервер>` | как `vps-server.sh`: `/opt/hp-vps` (бинарник, `vps.env`, `clients.txt`) и служба `hp-vps-server` |
 | `vps-client.bat <сервер> [имя]` | этот ПК как клиент: GUID, строка в `clients.txt` сервера, сборка/копия `vps-client.exe`, `wintun.dll`, хуки, задача планировщика «home-proxy vps-client» (SYSTEM, при загрузке), проверка набора дыр (не меньше 4 в работе) |
 | `vps-client-remove.bat` | убрать клиента с этого ПК (сервер не трогает) |
+| `vps-relay.bat <релей> <сервер>` | как `vps-relay.sh`: `/opt/hp-relay` и служба `hp-vps-relay` на релее, GUID релея в `relays.txt` сервера (`SERVER_DIR`, `SERVER_UNIT` — другой экземпляр; `RELAY_PUBLIC_IP=auto` — адрес, как видит сервер). Бинарь — `VPS_RELAY_BIN` (собрать на Linux/WSL) |
 | `vps-prepare.bat <сервер>` | фаервол/NAT сервера: запускает `setup/vps-prepare.sh` через bash из Git for Windows |
 | `vps-client-router-vps-server.bat <сервер>` | сервер + этот ПК |
 

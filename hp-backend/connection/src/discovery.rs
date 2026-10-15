@@ -101,6 +101,7 @@ async fn start_mode_of(discovery: Discovery, ctx: ModeContext) -> Result<ModeSta
                 bind_ifindex: ctx.options.bind_ifindex,
                 pool: ctx.options.pool,
                 hole_age: ctx.options.hole_age,
+                relay: ctx.relay.clone(),
             };
             let tasks = crate::vps::start_client(&ctx.label, config, ctx.factory.clone()).await?;
             Ok(ModeStarted { tasks, hole_records: None, registration: None })

@@ -77,7 +77,9 @@ pub struct PoolPolicy {
     /// даёт 3–5% и гонял бы набор по кругу из-за шума (радиоканал теряет пакеты и без плохих дыр).
     pub cull_min_sample: u64,
     /// Новую дыру не сравниваем по потерям первые `grace` — ещё не накопила выборку/не остыла от
-    /// всплеска на старте.
+    /// всплеска на старте. Потери считаются нарастающим итогом с открытия, а отчёт пира приходит с
+    /// задержкой (наш `sent` уже ушёл вперёд), поэтому у молодой дыры они завышены примерно на
+    /// «задержка отчёта / возраст»: при 10 с под нагрузкой это давало 5–15% и набор гонялся по кругу.
     pub grace: Duration,
 }
 
@@ -88,9 +90,9 @@ impl Default for PoolPolicy {
             max_total: 10,
             add_interval: Duration::from_secs(10),
             bad_loss: 0.5,
-            cull_loss: 0.03,
+            cull_loss: 0.05,
             cull_min_sample: 200,
-            grace: Duration::from_secs(10),
+            grace: Duration::from_secs(25),
         }
     }
 }
@@ -312,11 +314,11 @@ mod tests {
     fn planned_loss_cull_needs_a_real_sample_not_one_lost_packet() {
         let policy = PoolPolicy::default();
         let mut holes: Vec<_> = (0..6).map(|i| active(i, 50)).collect();
-        // 3.5% на 30 пакетах — один потерянный: шум, дыру не трогаем.
-        holes[2].loss_in = Some(0.035);
+        // 5.5% на 30 пакетах — пара потерянных: шум, дыру не трогаем.
+        holes[2].loss_in = Some(0.055);
         holes[2].sample = 30;
         assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![]);
-        // Те же 3.5% на большой выборке — уже закономерность, худшая уходит.
+        // Те же 5.5% на большой выборке — уже закономерность, худшая уходит.
         holes[2].sample = policy.cull_min_sample;
         assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![Action::Retire(2)]);
         // А однозначно плохая дыра (>50%) сливается и на малой выборке: ждать нечего.
@@ -369,9 +371,9 @@ mod tests {
     fn small_losses_do_not_cull_a_hole_but_noticeable_ones_do() {
         let policy = PoolPolicy::default();
         let mut holes: Vec<HoleInfo> = (0..6).map(|i| active(i, 30)).collect();
-        holes[3].loss_in = Some(0.02); // случайная потеря: ниже порога чистки
-        assert_eq!(plan(&holes, Duration::ZERO, &policy), Vec::new(), "потери 2% — не повод менять дыру");
-        holes[3].loss_in = Some(0.05);
-        assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![Action::Retire(3)], "потери 5% — меняем");
+        holes[3].loss_in = Some(0.04); // случайная потеря: ниже порога чистки
+        assert_eq!(plan(&holes, Duration::ZERO, &policy), Vec::new(), "потери 4% — не повод менять дыру");
+        holes[3].loss_in = Some(0.07);
+        assert_eq!(plan(&holes, Duration::ZERO, &policy), vec![Action::Retire(3)], "потери 7% — меняем");
     }
 }

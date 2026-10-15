@@ -191,6 +191,7 @@ Linux и на Windows (`MODE=netstack`): дыры 10/10, замена дыр н�
 | `hp-backend/` | Rust-библиотеки: протокол, подпись и пробив (`connection`), TUN (`tun`), ядро и JNI для Android (`client`, `android-lib`), логи; `peer` для живых проверок |
 | `hp-router/` | роутер OpenWrt: шлюз дома к VPS + пир для телефонов |
 | `vps-server/`, `vps-client/` | VPS с белым IP: без STUN, MQTT и пробива (клиент — роутер или хост) |
+| `vps-relay/` | релей VPS-сервера: второй адрес для части дыр клиентов, приходит к серверу сам |
 | `hp-server/` | служба на домашнем ПК (схема без роутера) |
 | `android-vpn/` | приложение для Android (Kotlin): свой VPN на TUN |
 | `OpenWRT/` | сборка под роутеры, настройка TUN и ускорение (`Tun.md`) |

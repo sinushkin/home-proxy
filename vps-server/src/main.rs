@@ -14,6 +14,11 @@
 //!   VPS_BOOTSTRAP_PORT — порт знакомства (40000);
 //!   VPS_PORTS — диапазон портов слотов `начало-конец` (40001-49999), общий для всех клиентов;
 //!   CLIENTS_FILE — файл клиентов (clients.txt);
+//!   RELAYS_FILE — файл релеев `vps-relay` (relays.txt; нет файла — без релеев): GUID релея на
+//!   строку. Релей приходит к серверу сам (как клиент), сервер раз в минуту сообщает клиентам
+//!   подключённые релеи, и часть новых дыр клиенты ведут через них (`connection::vps::relay`).
+//!   Читается при запуске; имя релея (первая группа GUID) не должно совпадать с именем клиента;
+//!   VPS_RELAY_SHARE — доля новых дыр клиентов через релеи, % (50);
 //!   TUN_ADDR (`10.80.0.1/16`), TUN_NAME, TUN_MTU, ADDRESS_FILE, REORDER_WAIT_MS, DATA_HOLES,
 //!   RUST_LOG, LOG_FILE — как у `hp-server` (адреса клиентам и их телефонам раздаёт сервер);
 //!   NAT подсети туннеля наружу настраивается отдельно;
@@ -29,6 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use connection::auth::peer_name;
 use connection::discovery::Discovery;
+use connection::multilink::MultiLinkOptions;
 use connection::vps;
 use hp_server::settings::Settings;
 use hp_server::{Peer, PeerChange};
@@ -162,14 +168,52 @@ async fn run(settings: Settings) -> Result<()> {
         .context("MY_ID: некорректный GUID")?;
     let (public_ip, bootstrap_port, ports) = public_settings(&settings)?;
     let common = hp_server::Common::from_settings_without_peers(&settings)?;
-    let bootstrap = vps::Bootstrap::bind(bootstrap_port, ports.clone()).await?;
+    let share = match settings.get("VPS_RELAY_SHARE") {
+        Some(v) => v.trim().parse::<u8>().ok().filter(|&s| s <= 100).context("VPS_RELAY_SHARE: процент от 0 до 100")?,
+        None => vps::relay::DEFAULT_SHARE,
+    };
+    let bootstrap = vps::Bootstrap::bind(bootstrap_port, ports.clone()).await?.with_relay_share(share);
     log::info!("vps-server: белый IP {public_ip}, порт знакомства {bootstrap_port}, порты слотов {}-{}", ports.start(), ports.end());
+    // Релеи приходят сами; держим их подключения всё время работы.
+    let mut relays = Vec::new();
+    for relay_id in relay_ids(&settings) {
+        relays.push(vps::relay::accept(&bootstrap, public_ip, server_id, relay_id, MultiLinkOptions::default()).await?);
+    }
+    if !relays.is_empty() {
+        log::info!("vps-server: релеев {}, доля новых дыр клиентов через них {share}%", relays.len());
+    }
     let discovery = Discovery::VpsServer { public_ip, bootstrap };
     let path = clients_file(&settings);
     log::info!("vps-server: клиенты из {}", path.display());
     let (changes_tx, changes_rx) = mpsc::channel(64);
     tokio::spawn(watch_clients(path, server_id, discovery, changes_tx));
-    hp_server::serve_with_changes(Vec::new(), common, Some(changes_rx)).await
+    let result = hp_server::serve_with_changes(Vec::new(), common, Some(changes_rx)).await;
+    drop(relays);
+    result
+}
+
+/// GUID релеев из `RELAYS_FILE` (relays.txt рядом с настройками); нет файла — релеев нет. Релей с
+/// именем клиента (первая группа GUID) пропускаем: порт знакомства различает их по имени.
+fn relay_ids(settings: &Settings) -> Vec<Uuid> {
+    let path = settings.resolve(&settings.get("RELAYS_FILE").unwrap_or_else(|| "relays.txt".into()));
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let (relays, problems) = parse_clients(&text);
+    for problem in problems {
+        log::warn!("{}: {problem}", path.display());
+    }
+    let clients: HashSet<String> = std::fs::read_to_string(clients_file(settings))
+        .map(|text| parse_clients(&text).0.iter().map(peer_name).collect())
+        .unwrap_or_default();
+    relays
+        .into_iter()
+        .filter(|id| {
+            let clash = clients.contains(&peer_name(id));
+            if clash {
+                log::warn!("{}: релей {} совпадает по имени с клиентом, пропущен", path.display(), peer_name(id));
+            }
+            !clash
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {

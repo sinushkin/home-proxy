@@ -38,6 +38,17 @@
 //! просроченной, помечает её `Draining` (данные по ней больше не шлёт), сообщает пиру `Drain`
 //! по нескольким дырам, ещё ~2 с принимает и закрывает; порт возвращается в банк.
 //!
+//! **Релеи** (`vps-relay`, необязательно, модуль `relay`): для клиента релей — ещё один такой же
+//! сервер, поток делится по дырам между двумя адресами. Релей сам приходит к серверу как VPS-клиент
+//! по своему GUID (`relays.txt` сервера) и сообщает свой порт знакомства (`RelayHello`); сервер
+//! никуда не ходит. Раз в минуту сервер шлёт каждому клиенту `RelayOffer` — порты знакомства
+//! подключённых релеев и долю дыр (действует `RELAY_VALID`); пока разрешения нет, клиент ходит
+//! только напрямую. Знакомство через релей: клиент стучится на порт знакомства релея, релей
+//! передаёт запрос серверу (`RelayKnock`, ключей клиентов он не знает), сервер заводит дыру на
+//! своём порту P и поручает релею сессию (`RelayOpen` → `RelayReady` с портом релея Q); ответ
+//! клиенту («твоя дыра — `релей:Q`») уходит через релей (`RelayReply`). Дальше релей перекладывает
+//! пакеты Q ↔ `сервер:P`, подпись — сквозная клиент ↔ сервер.
+//!
 //! Обмен на порту знакомства — обычный `PeerMessage::Lite` с `Rendezvous` внутри (номер дыры — в
 //! записи), подписанный и замаскированный ключами знакомства из секрета пары
 //! (`auth::PairSecret::bootstrap_keys`); сама запись тоже подписана. Без полного GUID обеих
@@ -100,6 +111,11 @@ const BIND_ATTEMPTS: usize = 64;
 pub fn parse_server(value: &str) -> Option<SocketAddr> {
     let value = value.trim();
     value.parse().ok().or_else(|| Some(SocketAddr::new(value.parse().ok()?, DEFAULT_BOOTSTRAP_PORT)))
+}
+
+/// Вести ли новую дыру через релей: держим долю `share` % среди дыр набора (`relayed` из `total`).
+fn relay_wanted(share: u8, relayed: usize, total: usize) -> bool {
+    relayed * 100 < usize::from(share.min(100)) * (total + 1)
 }
 
 /// Общее для обеих сторон: кто мы, кто пир, секрет пары.
@@ -167,6 +183,8 @@ pub struct Bootstrap {
     commands: mpsc::Sender<Command>,
     socket: Arc<UdpSocket>,
     ports: Arc<PortPool>,
+    /// Релеи процесса: кто подключён, их порты знакомства, поручения сессий (`relay::Relays`).
+    relays: Arc<relay::Relays>,
 }
 
 impl std::fmt::Debug for Bootstrap {
@@ -178,6 +196,8 @@ impl std::fmt::Debug for Bootstrap {
 enum Command {
     Register { name: String, token: Uuid, knocks: mpsc::Sender<Knock> },
     Unregister { name: String, token: Uuid },
+    /// Запрос знакомства клиента `name`, пришедший через релей.
+    Inject { name: String, knock: Knock },
 }
 
 /// Регистрация клиента: общий сокет для ответов, канал его запросов и страж, который снимает
@@ -211,7 +231,23 @@ impl Bootstrap {
         let (commands, commands_rx) = mpsc::channel(COMMAND_QUEUE);
         log::info!("VPS-сервер: порт знакомства {port}");
         tokio::spawn(listen(socket.clone(), commands_rx));
-        Ok(Self { commands, socket, ports: PortPool::new(ports) })
+        Ok(Self { commands, socket, ports: PortPool::new(ports), relays: Arc::new(relay::Relays::default()) })
+    }
+
+    /// Доля новых дыр клиентов через подключённые релеи, % (по умолчанию `relay::DEFAULT_SHARE`).
+    pub fn with_relay_share(self, share: u8) -> Self {
+        self.relays.set_share(share);
+        self
+    }
+
+    /// Запрос знакомства, пришедший через релей `relay`: дальше — как пришедший напрямую.
+    async fn inject(&self, packet: &[u8], from: SocketAddr, relay: String) {
+        if packet.len() <= NAME_LEN {
+            return;
+        }
+        let Ok(name) = std::str::from_utf8(&packet[..NAME_LEN]) else { return };
+        let knock = Knock { packet: packet[NAME_LEN..].to_vec(), from, via: Some(relay) };
+        let _ = self.commands.send(Command::Inject { name: name.to_string(), knock }).await;
     }
 
     /// Банк портов слотов процесса.
@@ -248,6 +284,8 @@ pub(crate) struct ServerConfig {
 struct Knock {
     packet: Vec<u8>,
     from: SocketAddr,
+    /// Пришёл через релей (его имя): ответ — через него же, дыра — сессией на нём.
+    via: Option<String>,
 }
 
 /// Сообщения дыр сервера актору своего клиента.
@@ -267,20 +305,28 @@ pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConf
 
     let (send, recv) = config.pair.secret.bootstrap_keys();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+    let relays = config.bootstrap.relays.clone();
+    let is_relay = relays.is_relay(&name);
     let actor = ClientActor {
         socket,
+        relays: relays.clone(),
         pair: config.pair,
         send,
         recv,
         public_ip: config.public_ip,
         ports: config.bootstrap.ports(),
-        factory,
+        factory: factory.clone(),
         msg_tx,
         holes: HashMap::new(),
         // С запасом на сливаемые дыры: клиент открывает замену, пока старая ещё закрывается.
         core: KnockCore::new(config.pool.max_total * 2),
     };
-    Ok(vec![AbortOnDrop(tokio::spawn(actor.run(knocks, msg_rx, guard)))])
+    let mut tasks = vec![AbortOnDrop(tokio::spawn(actor.run(knocks, msg_rx, guard)))];
+    // Клиентам — разрешение релеев; самим релеям — нет.
+    if !is_relay {
+        tasks.push(AbortOnDrop(tokio::spawn(relay::announce(relays, factory.registry.clone()))));
+    }
+    Ok(tasks)
 }
 
 /// Листенер порта знакомства: команды регистрации и раздача запросов по открытому имени.
@@ -296,10 +342,15 @@ async fn listen(socket: Arc<UdpSocket>, mut commands: mpsc::Receiver<Command>) {
                 }
                 let Ok(name) = std::str::from_utf8(&buf[..NAME_LEN]) else { continue };
                 if let Some((_, knocks)) = clients.get(name) {
-                    let _ = knocks.try_send(Knock { packet: buf[NAME_LEN..n].to_vec(), from });
+                    let _ = knocks.try_send(Knock { packet: buf[NAME_LEN..n].to_vec(), from, via: None });
                 }
             }
             command = commands.recv() => match command {
+                Some(Command::Inject { name, knock }) => {
+                    if let Some((_, knocks)) = clients.get(&name) {
+                        let _ = knocks.try_send(knock);
+                    }
+                }
                 Some(Command::Register { name, token, knocks }) => {
                     clients.insert(name, (token, knocks));
                 }
@@ -411,6 +462,8 @@ struct ServerHoleRec {
 /// Блокировок нет: состояние меняет только эта задача, дыры пишут ей через канал.
 struct ClientActor {
     socket: Arc<UdpSocket>,
+    /// Релеи процесса: через них — ответы на знакомство и сессии дыр, пришедших через релей.
+    relays: Arc<relay::Relays>,
     pair: Pair,
     send: SendKeys,
     recv: RecvKeys,
@@ -478,16 +531,23 @@ impl ClientActor {
                 } else {
                     log::debug!("знакомство: дыра {slot}, клиент {}, сессия {}", knock.from, request.session_id);
                 }
-                self.spawn_hole(slot, epoch, request.session_id);
+                self.spawn_hole(slot, epoch, request.session_id, knock.via.clone());
             }
         }
         if let Some(offer) = self.holes.get(&slot).and_then(|h| h.offer.clone()) {
-            let _ = self.socket.send_to(&codec::encode(&wrap(offer), &self.send), knock.from).await;
+            let packet = codec::encode(&wrap(offer), &self.send);
+            match &knock.via {
+                Some(relay) => self.relays.reply(relay, knock.from, packet).await,
+                None => {
+                    let _ = self.socket.send_to(&packet, knock.from).await;
+                }
+            }
         }
     }
 
-    fn spawn_hole(&mut self, slot: SlotId, epoch: u32, client_session: Uuid) {
+    fn spawn_hole(&mut self, slot: SlotId, epoch: u32, client_session: Uuid, via: Option<String>) {
         let hole = ServerHole {
+            relay: via.map(|name| (self.relays.clone(), name)),
             public_ip: self.public_ip,
             ports: self.ports.clone(),
             pair: self.pair.clone(),
@@ -502,6 +562,8 @@ impl ClientActor {
 
 /// Рабочая задача одной дыры сервера (один проход, потом дыра не возвращается).
 struct ServerHole {
+    /// Дыра через релей (реестр и имя релея): клиенту — порт сессии на релее, а не наш.
+    relay: Option<(Arc<relay::Relays>, String)>,
     public_ip: IpAddr,
     ports: Arc<PortPool>,
     pair: Pair,
@@ -531,7 +593,20 @@ impl ServerHole {
         };
         let port = port_lease.port();
         let my_session = Uuid::new_v4();
-        let record = self.pair.record(slot, my_session, SocketAddr::new(self.public_ip, port), 0);
+        let endpoint = match &self.relay {
+            None => SocketAddr::new(self.public_ip, port),
+            Some((relays, name)) => match relays.open(name, port).await {
+                Some(endpoint) => {
+                    log::info!("{label}дыра {slot}: через релей {name}, клиенту — {endpoint}");
+                    endpoint
+                }
+                None => {
+                    log::warn!("{label}дыра {slot}: релей {name} не завёл сессию, закрываем");
+                    return false;
+                }
+            },
+        };
+        let record = self.pair.record(slot, my_session, endpoint, 0);
         let _ = self.messages.send(HoleMsg::Offer { slot, epoch: self.epoch, record });
         log::info!("{label}дыра {slot}: ждём клиента на порту {port}");
         self.base.phase(SlotPhase::Punching);
@@ -575,6 +650,8 @@ pub(crate) struct ClientConfig {
     pub bind_ifindex: Option<u32>,
     pub pool: PoolPolicy,
     pub hole_age: (Duration, Duration),
+    /// Релей, разрешённый сервером (`RelayOffer`).
+    pub relay: watch::Receiver<Option<crate::multilink::RelayGrant>>,
 }
 
 /// Сокет знакомства клиента: запросы серверу и разбор ответов по дырам.
@@ -586,8 +663,8 @@ struct ClientBootstrap {
 }
 
 impl ClientBootstrap {
-    /// Шлёт запрос раз в `ASK_INTERVAL`, пока хэндл жив.
-    fn ask(self: &Arc<Self>, record: Rendezvous) -> AbortOnDrop {
+    /// Шлёт запрос на порт знакомства `to` (сервер или релей) раз в `ASK_INTERVAL`, пока хэндл жив.
+    fn ask(self: &Arc<Self>, record: Rendezvous, to: SocketAddr) -> AbortOnDrop {
         let this = self.clone();
         AbortOnDrop(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(ASK_INTERVAL);
@@ -596,7 +673,7 @@ impl ClientBootstrap {
                 // Каждый раз заново: у каждого пакета свой счётчик в подписи.
                 let mut packet = this.name.clone().into_bytes();
                 packet.extend_from_slice(&codec::encode(&wrap(record.clone()), &this.send));
-                let _ = this.socket.send_to(&packet, this.server).await;
+                let _ = this.socket.send_to(&packet, to).await;
             }
         }))
     }
@@ -642,6 +719,8 @@ pub(crate) async fn start_client(label: &crate::label::Label, config: ClientConf
         offers: offers.clone(),
         pool: config.pool,
         hole_age: config.hole_age,
+        relay: config.relay,
+        next_relay: 0,
         holes: HashMap::new(),
         // Номера монотонные и не переиспользуются; старт случайный (до миллиона — чтобы в статусе
         // номера были короткими), чтобы перезапущенный клиент не пересёкся с номерами прошлого запуска.
@@ -660,6 +739,7 @@ pub(crate) async fn start_client(label: &crate::label::Label, config: ClientConf
 struct HoleRec {
     opened: Instant,
     max_age: Duration,
+    via_relay: bool,
     _task: AbortOnDrop,
 }
 
@@ -674,6 +754,10 @@ struct Manager {
     offers: Offers,
     pool: PoolPolicy,
     hole_age: (Duration, Duration),
+    /// Релеи, разрешённые сервером: пока разрешение действует, часть новых дыр — через них.
+    relay: watch::Receiver<Option<crate::multilink::RelayGrant>>,
+    /// Какой релей из списка следующий (по кругу).
+    next_relay: usize,
     holes: HashMap<SlotId, HoleRec>,
     next_id: SlotId,
     last_open: Instant,
@@ -723,6 +807,17 @@ impl Manager {
         self.next_id = self.next_id.wrapping_add(1);
         self.last_open = now;
         let max_age = jittered(self.hole_age.0, self.hole_age.1);
+        let relayed = self.holes.values().filter(|h| h.via_relay).count();
+        let relay = {
+            let grant = self.relay.borrow();
+            grant
+                .as_ref()
+                .filter(|g| g.valid(now) && relay_wanted(g.share, relayed, self.holes.len()))
+                .map(|g| g.relays[self.next_relay % g.relays.len()])
+        };
+        if relay.is_some() {
+            self.next_relay = self.next_relay.wrapping_add(1);
+        }
         let (offer_tx, offer_rx) = watch::channel(None);
         self.offers.lock().unwrap().insert(id, offer_tx);
         let hole = ClientHole {
@@ -735,9 +830,10 @@ impl Manager {
             offers: self.offers.clone(),
             ended: self.ended_tx.clone(),
             started_ms: self.started_ms,
+            relay,
         };
         let task = AbortOnDrop(tokio::spawn(hole.run()));
-        self.holes.insert(id, HoleRec { opened: now, max_age, _task: task });
+        self.holes.insert(id, HoleRec { opened: now, max_age, via_relay: relay.is_some(), _task: task });
     }
 }
 
@@ -752,6 +848,8 @@ struct ClientHole {
     offers: Offers,
     ended: mpsc::UnboundedSender<SlotId>,
     started_ms: u64,
+    /// Дыра идёт через релей: его порт знакомства (иначе — напрямую на сервер).
+    relay: Option<SocketAddr>,
 }
 
 impl ClientHole {
@@ -776,7 +874,10 @@ impl ClientHole {
         };
         let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let my_session = Uuid::new_v4();
-        let asking = self.boot.ask(self.pair.record(slot, my_session, SocketAddr::from(([0, 0, 0, 0], port)), self.started_ms));
+        let asking = self.boot.ask(
+            self.pair.record(slot, my_session, SocketAddr::from(([0, 0, 0, 0], port)), self.started_ms),
+            self.relay.unwrap_or(self.boot.server),
+        );
         let deadline = tokio::time::sleep(OPEN_TIMEOUT);
         tokio::pin!(deadline);
 
@@ -794,17 +895,21 @@ impl ClientHole {
                 }
             };
             self.offer_rx.mark_unchanged();
-            log::info!("{label}дыра {slot}: идём на порт сервера {}", offer.addr);
+            let target = offer.addr;
+            match self.relay {
+                Some(relay) => log::info!("{label}дыра {slot}: идём на порт релея {target} (знакомство через {relay})"),
+                None => log::info!("{label}дыра {slot}: идём на порт сервера {target}"),
+            }
             self.base.phase(SlotPhase::Punching);
-            // Сокет говорит только с этим портом сервера: ядру не искать маршрут на каждый пакет,
-            // чужие адреса отсекаются в ядре.
-            if let Err(e) = socket.connect(offer.addr).await {
-                log::warn!("{label}дыра {slot}: connect к {}: {e}", offer.addr);
+            // Сокет говорит только с этим портом сервера (или релея): ядру не искать маршрут на
+            // каждый пакет, чужие адреса отсекаются в ядре.
+            if let Err(e) = socket.connect(target).await {
+                log::warn!("{label}дыра {slot}: connect к {target}: {e}");
             }
             let attempt = punch::establish(
                 socket.clone(),
                 port,
-                vec![offer.addr],
+                vec![target],
                 self.pair.identity(slot, my_session, offer.session_id),
                 PunchConfig { margin: 0, ..PunchConfig::default() },
                 self.base.events.clone(),
@@ -835,12 +940,28 @@ impl ClientHole {
     }
 }
 
+pub mod relay;
+
 #[cfg(test)]
 mod integration;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_share_alternates_holes() {
+        // Набор растёт с нуля: через релей через раз.
+        let (mut relayed, mut picks) = (0, Vec::new());
+        for total in 0..6 {
+            let pick = relay_wanted(50, relayed, total);
+            relayed += usize::from(pick);
+            picks.push(pick);
+        }
+        assert_eq!(picks, [true, false, true, false, true, false]);
+        assert!((0..10).all(|n| relay_wanted(100, n, n)));
+        assert!(!relay_wanted(0, 0, 0));
+    }
 
     #[test]
     fn server_address_with_or_without_port() {

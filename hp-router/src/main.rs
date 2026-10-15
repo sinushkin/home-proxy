@@ -635,6 +635,9 @@ async fn run(config: Config) -> Result<()> {
     let mut last = None;
     // procd останавливает службу SIGTERM: сначала снимаем туннель и зовём on-tun-down.sh.
     let mut shutdown = hp_tun::platform::NativeShutdown::new()?;
+    // Релеи, которые разрешил VPS: их адреса — мимо туннеля (сокеты дыр и так привязаны к аплинку,
+    // маршрут — для порядка).
+    let mut relay = vps.relay();
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -644,6 +647,18 @@ async fn run(config: Config) -> Result<()> {
             }
         }
         router.housekeeping();
+        if relay.has_changed().unwrap_or(false) {
+            let relays = relay.borrow_and_update().as_ref().map(|g| g.relays.clone()).unwrap_or_default();
+            if let Some(routes) = &mut routes {
+                for addr in relays {
+                    if let std::net::IpAddr::V4(ip) = addr.ip()
+                        && let Err(e) = routes.add_bypass(ip).await
+                    {
+                        return shutdown_tunnel(Some(routes), &hooks, Err(e)).await;
+                    }
+                }
+            }
+        }
         if let Some(routes) = &mut routes
             && last_routes.elapsed() >= ROUTES_INTERVAL
         {

@@ -18,6 +18,9 @@ const MAX_GAP: u64 = RING as u64 - 1;
 /// Сколько пакетов держим на одну сессию.
 const RING: usize = 512;
 const MAX_SESSIONS: usize = 16;
+/// Номер меньше ожидаемого после такой тишины в сессии — не опоздавший, а новая нумерация
+/// (отправитель перезапущен): сессию начинаем заново.
+const IDLE_RESET: Duration = Duration::from_secs(3);
 
 /// Пределы адаптивного ожидания.
 pub const MIN_WAIT: Duration = Duration::from_millis(3);
@@ -267,8 +270,23 @@ impl Resequencer {
             .sessions
             .entry(index)
             .or_insert_with(|| Session { next: counter, held: HeldRing::new(), last_seen: now, skipped: HashMap::new() });
+        let idle = now.saturating_duration_since(session.last_seen);
         session.last_seen = now;
 
+        if counter < session.next && (session.next - counter > MAX_GAP || idle >= IDLE_RESET) {
+            // Номер ушёл назад дальше окна или после тишины: отправитель начал нумерацию заново
+            // (перезапуск клиента). Без сброса все его пакеты считались бы опоздавшими и шли без
+            // восстановления порядка, пока номера не догонят прошлый запуск.
+            let before = out.len();
+            flush(session, out);
+            stats.forced += (out.len() - before) as u64;
+            log::debug!("порядок: сессия {index:#x}: новая нумерация {} -> {counter}, сессия начата заново", session.next);
+            session.skipped.clear();
+            session.next = counter + 1;
+            stats.in_order += 1;
+            out.push(packet);
+            return;
+        }
         if counter < session.next {
             stats.late += 1;
             let noticed = session.skipped.remove(&counter);
@@ -456,6 +474,38 @@ mod tests {
         assert_eq!(r.stats().timed_out, 2);
         // дальше нумерация продолжается с 4
         assert_eq!(counters(&r.push(pkt(1, 4), start + WAIT)), vec![4]);
+    }
+
+    #[test]
+    fn restarted_sender_starts_a_new_session_instead_of_being_late_forever() {
+        let mut r = Resequencer::new(WAIT);
+        let now = Instant::now();
+        for counter in 100_000..100_010 {
+            r.push(pkt(1, counter), now);
+        }
+        // Отправитель перезапущен: нумерация с нуля, сразу же (без паузы).
+        assert_eq!(counters(&r.push(pkt(1, 0), now)), vec![0]);
+        assert!(r.push(pkt(1, 2), now).is_empty(), "после сброса порядок снова восстанавливается");
+        assert_eq!(counters(&r.push(pkt(1, 1), now)), vec![1, 2]);
+        assert_eq!(r.stats().late, 0);
+    }
+
+    #[test]
+    fn small_step_back_after_silence_is_a_new_numbering_too() {
+        let mut r = Resequencer::new(WAIT);
+        let start = Instant::now();
+        for counter in 0..50 {
+            r.push(pkt(1, counter), start);
+        }
+        // Недалеко назад, но поток молчал дольше IDLE_RESET — это новая нумерация.
+        let later = start + IDLE_RESET;
+        assert_eq!(counters(&r.push(pkt(1, 3), later)), vec![3]);
+        assert!(r.push(pkt(1, 5), later).is_empty());
+        assert_eq!(counters(&r.push(pkt(1, 4), later)), vec![4, 5]);
+        assert_eq!(r.stats().late, 0);
+        // А без паузы небольшой шаг назад — по-прежнему просто опоздавший.
+        assert_eq!(counters(&r.push(pkt(1, 1), later)), vec![1]);
+        assert_eq!(r.stats().late, 1);
     }
 
     #[test]

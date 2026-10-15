@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::auth::PairSecret;
@@ -85,6 +85,12 @@ pub struct Incoming {
 pub enum Control {
     AddressRequest(crate::proto::AddressRequest),
     AddressAssign(crate::proto::AddressAssign),
+    /// Сервер ↔ релей `vps-relay` (VPS-режим, `vps::relay`).
+    RelayHello(crate::proto::RelayHello),
+    RelayKnock(crate::proto::RelayKnock),
+    RelayReply(crate::proto::RelayReply),
+    RelayOpen(crate::proto::RelayOpen),
+    RelayReady(crate::proto::RelayReady),
 }
 
 /// Сколько служебных сообщений держим, пока приложение их не забрало.
@@ -474,6 +480,8 @@ pub(crate) type RegistrationSource = Arc<dyn Fn() -> Option<PeerRegistration> + 
 /// Что `MultiLink` даёт режиму знакомства при запуске.
 pub(crate) struct ModeContext {
     pub label: Label,
+    /// Разрешённый сервером релей (VPS-клиент; `control_loop` обновляет по `RelayOffer`).
+    pub relay: watch::Receiver<Option<RelayGrant>>,
     pub factory: HoleFactory,
     /// Секрет пары (ключи, подписи записей).
     pub pair: PairSecret,
@@ -556,8 +564,35 @@ fn limit_slots(slots: &mut [SlotId], max: u8) -> usize {
     if max > 0 { slots.len().min(usize::from(max)) } else { slots.len() }
 }
 
+/// Релеи, разрешённые сервером (`RelayOffer`, VPS-режим): куда и какую долю новых дыр, до когда.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayGrant {
+    /// Порты знакомства релеев `ip:порт` (для клиента релей — такой же сервер).
+    pub relays: Vec<SocketAddr>,
+    /// Доля новых дыр через релеи, %.
+    pub share: u8,
+    /// Разрешение действует до этого момента (сервер повторяет его раз в минуту).
+    pub expires: Instant,
+}
+
+impl RelayGrant {
+    /// Разрешение из сообщения сервера, полученного в `now`; `None` — релеев нет или доля нулевая.
+    fn from_offer(offer: &crate::proto::RelayOffer, now: Instant) -> Option<Self> {
+        let relays: Vec<SocketAddr> = offer.relays.iter().filter_map(|a| a.trim().parse().ok()).collect();
+        let share = u8::try_from(offer.share.min(100)).ok().filter(|&s| s > 0)?;
+        (!relays.is_empty()).then(|| Self { relays, share, expires: now + Duration::from_secs(u64::from(offer.valid_secs)) })
+    }
+
+    /// Действует ли сейчас.
+    pub fn valid(&self, now: Instant) -> bool {
+        now < self.expires
+    }
+}
+
 pub struct MultiLink {
     registry: Arc<Mutex<LinkRegistry>>,
+    /// Релей, разрешённый сервером (VPS-клиент): приложение пускает его адрес мимо туннеля.
+    relay: watch::Receiver<Option<RelayGrant>>,
     my_peer_id: Uuid,
     peer_id: Uuid,
     picker: Mutex<SlotPicker>,
@@ -620,8 +655,10 @@ impl MultiLink {
         };
 
         let bind_ip = options.bind_ip.unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let (relay_tx, relay_rx) = watch::channel(None);
         let started = mode(ModeContext {
             label: label.clone(),
+            relay: relay_rx.clone(),
             factory: factory.clone(),
             pair: pair.clone(),
             my_peer_id,
@@ -654,7 +691,7 @@ impl MultiLink {
             events_rx,
             registry.clone(),
             (ctl.clone(), dynamic),
-            hole_records,
+            (hole_records, relay_tx),
             (incoming_tx, control_tx),
             options,
             reorder_wait_ms.clone(),
@@ -668,6 +705,7 @@ impl MultiLink {
 
         let multilink = Self {
             registry,
+            relay: relay_rx,
             my_peer_id,
             peer_id,
             picker: Mutex::new(SlotPicker::default()),
@@ -770,6 +808,12 @@ impl MultiLink {
         Ok(link.slot)
     }
 
+    /// Релеи, разрешённые сервером (VPS-клиент): `changed()` — когда разрешение появилось, сменилось
+    /// или отозвано (продление срока не будит). Приложение пускает адреса релеев мимо туннеля.
+    pub fn relay(&self) -> watch::Receiver<Option<RelayGrant>> {
+        self.relay.clone()
+    }
+
     /// Приёмник служебных сообщений пира; отдаётся один раз (дальше `None`). Пока его не
     /// забрали, сообщения сверх небольшого запаса отбрасываются.
     pub fn take_control(&self) -> Option<mpsc::Receiver<Control>> {
@@ -778,6 +822,12 @@ impl MultiLink {
 
     pub fn live_count(&self) -> usize {
         self.registry.lock().unwrap().live_count()
+    }
+
+    /// Пакетов отправлено и получено по всем живым дырам (у закрытых дыр счётчики уходят вместе
+    /// с ними): по изменению видно, идёт ли обмен.
+    pub fn packet_totals(&self) -> (u64, u64) {
+        self.registry.lock().unwrap().links().iter().map(|l| l.sender.stats()).fold((0, 0), |(s, r), (ls, lr)| (s + ls, r + lr))
     }
 
     /// Бросить дыру `slot`. Фиксированный слот (P2P) регистрируется заново на новых портах, пиру
@@ -984,7 +1034,7 @@ async fn control_loop(
     mut events: mpsc::Receiver<LinkEvent>,
     registry: Arc<Mutex<LinkRegistry>>,
     (ctl, dynamic): (HoleCtl, bool),
-    hole_records: Option<mpsc::Sender<Rendezvous>>,
+    (hole_records, relay): (Option<mpsc::Sender<Rendezvous>>, watch::Sender<Option<RelayGrant>>),
     (incoming, control): (mpsc::Sender<Incoming>, mpsc::Sender<Control>),
     options: MultiLinkOptions,
     reorder_wait_ms: Arc<AtomicU32>,
@@ -1106,6 +1156,22 @@ async fn control_loop(
                 }
                 None => log::debug!("{label}Rendezvous по дыре в VPS-режиме пропущен"),
             },
+            // VPS-клиент: сервер разрешил (или отозвал) релей; повтор только продлевает срок.
+            LinkEvent::PeerRelayOffer(offer) => {
+                let grant = RelayGrant::from_offer(&offer, Instant::now());
+                relay.send_if_modified(|current| {
+                    let same = |a: &Option<RelayGrant>| a.as_ref().map(|g| (g.relays.clone(), g.share));
+                    let changed = same(current) != same(&grant);
+                    if changed {
+                        match &grant {
+                            Some(g) => log::info!("{label}сервер разрешил релеи {:?} ({}% новых дыр)", g.relays, g.share),
+                            None => log::info!("{label}сервер отозвал релеи"),
+                        }
+                    }
+                    *current = grant;
+                    changed
+                });
+            }
             // hp-stats (сервер): отчёт клиента о принятых номерах пакетов вниз.
             LinkEvent::PeerPidReport { report, .. } => {
                 #[cfg(feature = "stats")]
@@ -1554,7 +1620,7 @@ mod tests {
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
             (HoleCtl::default(), false),
-            None,
+            (None, watch::channel(None).0),
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: wait, ..MultiLinkOptions::default() },
             Arc::new(AtomicU32::new(0)),
@@ -1596,7 +1662,7 @@ mod tests {
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
             (HoleCtl::default(), false),
-            None,
+            (None, watch::channel(None).0),
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
             Arc::new(AtomicU32::new(0)),
@@ -1637,7 +1703,7 @@ mod tests {
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
             (HoleCtl::default(), false),
-            None,
+            (None, watch::channel(None).0),
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::ZERO, ..MultiLinkOptions::default() },
             Arc::new(AtomicU32::new(0)),
@@ -1677,7 +1743,7 @@ mod tests {
             events_rx,
             Arc::new(Mutex::new(LinkRegistry::default())),
             (HoleCtl::default(), false),
-            None,
+            (None, watch::channel(None).0),
             (incoming_tx, mpsc::channel(4).0),
             MultiLinkOptions { reorder_wait: Duration::from_millis(500), reorder_clients: false, ..MultiLinkOptions::default() },
             Arc::new(AtomicU32::new(0)),

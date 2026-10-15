@@ -160,7 +160,8 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       `[server] `; пустая ничего не печатает).
     - `src/reorder.rs` — буфер порядка TCP-пакетов на приёме (по корзине потока и номеру от
       отправителя: `Ordered`, `WrappedData` с корзиной — ключ ещё и по клиенту), адаптивное
-      ожидание 3–30 мс по p99 отставания. Пакеты без номера идут сразу. (Раньше разбирал
+      ожидание 3–30 мс по p99 отставания. Пакеты без номера идут сразу. Номер назад дальше окна (511)
+      или после 3 с тишины — отправитель перезапущен, сессия начинается заново. (Раньше разбирал
       счётчик из заголовка WireGuard.)
     - `src/p2p/mod.rs` — P2P-режим (оба пира за NAT), динамический набор дыр **без ролей**: каждая сторона
       сама держит набор (`holes::plan` по всем дырам) и открывает дыру, когда нужно — кто начал, тот
@@ -184,7 +185,7 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       не смешиваются. **Набор дыр динамический**: дыра «поработала — умерла», номер (`SlotId`, u32)
       монотонный, назначает клиент. Клиентский `Manager` раз в секунду зовёт `holes::plan`
       (`PoolPolicy`: в работе ≥ `min_active` = 4, всего ≤ `max_total` = 10, +1 дыра в 10 с, срок
-      жизни дыры случайный 3–10 мин (180–600 с), худшая по потерям уходит раньше, но плановая чистка по потерям (3%) — только на выборке ≥ 200
+      жизни дыры случайный 3–10 мин (180–600 с), худшая по потерям уходит раньше, но плановая чистка по потерям (> 5%, дыра старше `grace` = 25 с) — только на выборке ≥ 200
       пакетов `cull_min_sample`: на 20–30 пакетах один потерянный гонял бы набор по кругу) и открывает/сливает дыры;
       сервер реактивный: на запрос знакомства с новым номером `ClientActor` заводит `ServerHole`
       (порт из банка, `max_total × 2` дыр на клиента, недавно закрытые `(номер, сессия)` не
@@ -199,7 +200,18 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       `OPEN_TIMEOUT` (12 с). `MultiLink::start_discovery` с `Discovery::{StunMqtt, VpsServer,
       VpsClient}`, `MultiLink::move_slot` (слив). В `multilink.rs` — общее: реестр (`LiveLink` с
       `opened_at`/`state`), `HoleFactory`/`SlotBase`/`HoleCmd`, keep-alive, статистика, приём.
-      Настройки клиента: `HOLES_MIN`, `HOLES_MAX`, `HOLE_AGE` (`vps-client`).
+      Настройки клиента: `HOLES_MIN`, `HOLES_MAX`, `HOLE_AGE` (`vps-client`). **Релеи**
+      (`vps/relay.rs`, `vps-relay`): для клиента релей — ещё один такой же сервер. Релей приходит к
+      серверу сам, как VPS-клиент по своему GUID (`relays.txt`, `relay::accept`), с белого или серого
+      адреса, и сообщает свой порт знакомства (`RelayHello`; без адреса — как видит сервер). Сервер
+      раз в минуту шлёт клиенту `RelayOffer` (порты знакомства релеев, доля `VPS_RELAY_SHARE`,
+      действует 3 мин, `MultiLink::relay()`); пока разрешение действует, клиент ведёт долю новых
+      дыр через релеи по кругу, без него — только напрямую. Знакомство через релей: `RelayKnock` →
+      дыра сервера на порту P → `RelayOpen`/`RelayReady` (сессия релея Q ↔ сервер:P) → ответ клиенту
+      `RelayReply` с порта знакомства релея; подпись сквозная, ключей клиентов релей не знает.
+      Keep-alive релея — `RelayHello` раз в 5 с (если и так ничего не ушло); от релея нет пакетов
+      10 с — сервер убирает его и сразу шлёт клиентам новый список (пустой — дыры только напрямую).
+      Адреса релеев клиент пускает мимо туннеля (`Routes::add_bypass`).
     - `src/bind.rs` — `udp(ip, port, ifindex)`: сокет слота на адресе и, на Linux, на интерфейсе
       (`SO_BINDTOIFINDEX`, без прав на ядре 5.7+): там маршрут выбирается по назначению, и сокет с
       адресом `eth0` без привязки к интерфейсу всё равно ушёл бы в VPN. На Windows хватает адреса.
@@ -282,6 +294,9 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   (`hpctl`, трей) — `CONTROL_ADDR`, `vps-client --connection-string`. TCP идёт
   `Ordered` (номер в корзине потока, порядок восстанавливает `reorder`), прочее — `Data` сразу.
   Android их не использует. `OpenWRT/Tun.md`.
+- `vps-relay/` — релей VPS-сервера (обёртка над `connection::vps::relay`): к серверу приходит сам
+  по GUID (`VPS_SERVER`, `MY_ID`, `SERVER_ID`), клиентам — такой же сервер (`RELAY_PUBLIC_IP`,
+  `RELAY_BOOTSTRAP_PORT`, `RELAY_PORTS`); ключей клиентов не знает. `vps-relay/README.md`.
 - `control/` — крейт `hp-control`: протокол управления службой (`proto/control.proto`, кадр
   `u32` BE + protobuf; только loopback/LAN), `secure.rs` — канал, зашифрованный ключом из строки
   подключения `homeproxy-control://<ip:порт>/<ключ>` (рукопожатие с nonce обеих сторон, ключи
@@ -307,7 +322,10 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   адрес в строке — LAN роутера, ssh-туннель не нужен; на `o1` работает с `hp-router`),
   плюс `/etc/init.d/hp-router` (procd; бинарник `/usr/bin`, настройки `/etc/hp-router`).
   Полные GUID — секрет пары: в статус и в логи идут только имена (`peer_name`). `control/README.md`.
-- `setup/win/` — `.bat`-аналоги `setup/*.sh` для Windows: `vps-server.bat` (Linux-сервер по ssh, GUID уже работающего сервера не меняет), `vps-client.bat` (этот ПК как клиент: задача планировщика, Wintun, хуки `.ps1`), `vps-client-remove.bat`, `vps-prepare.bat` (через bash из Git for Windows), `DRY_RUN=1`; `.bat` только ASCII, CRLF (`.gitattributes`). `setup/win/README.md`.
+- `setup/vps-relay.sh <релей> <сервер>` — релей `vps-relay` (`/opt/hp-relay`, служба `hp-vps-relay`), GUID —
+  в `relays.txt` сервера (`SERVER_DIR`/`SERVER_UNIT` — другой экземпляр); удалённые части общие с
+  `.bat` — `setup/win/remote/{relay-install,server-add-relay}.sh`.
+- `setup/win/` — `.bat`-аналоги `setup/*.sh` для Windows: `vps-server.bat` (Linux-сервер по ssh, GUID уже работающего сервера не меняет), `vps-relay.bat`, `vps-client.bat` (этот ПК как клиент: задача планировщика, Wintun, хуки `.ps1`), `vps-client-remove.bat`, `vps-prepare.bat` (через bash из Git for Windows), `DRY_RUN=1`; `.bat` только ASCII, CRLF (`.gitattributes`). `setup/win/README.md`.
 - `wsl/` — образ для WSL2 (Alpine + `iptables` + статический `hp-server`): `Dockerfile`,
   `build.sh` (→ `wsl/out/homeproxy-wsl.tar.gz`, в git нет), `rootfs/` (`wsl.conf` с `[boot] command`,
   `homeproxy-start` — пересылка, `MASQUERADE` подсети туннеля, запуск службы в цикле;
@@ -385,6 +403,10 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       = false`), порядок возвращает конечный получатель по (клиент, корзина).
     - `Ordered { flow, seq, payload }` — TUN-режим: TCP-пакет с номером в
       корзине потока, получатель восстанавливает порядок; UDP/ICMP идут `Data`.
+    - `RelayOffer { relays, share, valid_secs }` — VPS-режим: сервер разрешает клиенту вести долю
+      новых дыр через релеи `vps-relay` (раз в минуту; прошлые клиенты вариант пропускают).
+    - `RelayHello`/`RelayKnock`/`RelayReply`/`RelayOpen`/`RelayReady` — сервер ↔ релей по дырам
+      релея (`Control::Relay*`, `vps/relay.rs`).
     - `Rendezvous {...}` — виртуал-брокер: тот же `Rendezvous`, что ушёл бы в
       MQTT, но отправленный напрямую по этой дыре, чтобы договориться о других
       слотах без брокера.
@@ -440,7 +462,10 @@ NAT/провайдерами.
 
 - `profit` — STUN + MQTT (см. выше). `peer` там не запускаем.
 - `ruhor` (SSH-алиас, root@203.0.113.20) — настоящий VPS с публичным IP
-  прямо на интерфейсе, **без NAT**, ufw нет, входящий UDP не фильтруется. Это
+  прямо на интерфейсе, **без NAT**. Входящий трафик фильтруется: `INPUT` — `DROP`, цепочка
+  `FW-INPUT` (iptables-nft, `netfilter-persistent`, `/etc/iptables/rules.v4`; ставил equalizer);
+  UDP открыт только для 51410–51420 и 40700–40799 (`vps-relay`). Новые порты — туда же. На нём
+  `vps-relay` (`/opt/hp-relay`, служба `hp-vps-relay`) — релей для `hp-vps-dev` на `ihor`. Это
   единственный хост, с которым пробив реально проходит (из локальной сети —
   как обычный исходящий UDP, поэтому широкую развёртку он не проверяет).
   Toolchain'а на нём нет и ставить его не надо: бинарник собираем локально и

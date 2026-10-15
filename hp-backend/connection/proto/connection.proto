@@ -91,6 +91,14 @@ message Lite {
     PidReport pid_report = 12;
     TimeProbe time_probe = 13;
     TimeEcho time_echo = 14;
+    // VPS-режим: сервер разрешает клиенту вести часть дыр через релей (см. `RelayOffer`).
+    RelayOffer relay_offer = 16;
+    // VPS-режим, сервер ↔ релей `vps-relay` (по дырам релея к серверу, см. `connection::vps`).
+    RelayHello relay_hello = 17;
+    RelayKnock relay_knock = 18;
+    RelayReply relay_reply = 19;
+    RelayOpen relay_open = 20;
+    RelayReady relay_ready = 21;
   }
   // hp-stats: порядковый номер пакета вниз (направление сервер → клиент), общий счётчик
   // направления в `MultiLink`. Ставится только на нагрузочные `Data`/`WrappedData`/`Ordered`,
@@ -235,4 +243,49 @@ message DeleteLink {
 // теряя данные в пути (в отличие от `DeleteLink`, который означает «дыра уже потеряна»).
 message Drain {
   uint32 slot = 1;
+}
+
+// VPS-режим: сервер разрешает клиенту вести часть новых дыр через релеи `vps-relay`. Для клиента
+// релей — такой же сервер: знакомство на его порт, дыра на выданный им порт. Сервер шлёт разрешение
+// раз в минуту по живым дырам; действует `valid_secs` с момента получения, без него (или с пустым
+// списком) клиент ходит на сервер напрямую. Прошлые версии клиента вариант не разберут и пропустят.
+message RelayOffer {
+  // Порты знакомства подключённых релеев, `ip:порт`.
+  repeated string relays = 1;
+  // Доля новых дыр через релеи, % (0..=100).
+  uint32 share = 2;
+  uint32 valid_secs = 3;
+}
+
+// Релей → сервер (раз в 30 с): где его порт знакомства для клиентов. Пустой `public_ip` — сервер
+// берёт адрес, с которого пришёл релей.
+message RelayHello {
+  string public_ip = 1;
+  uint32 bootstrap_port = 2;
+}
+
+// Релей → сервер: запрос знакомства клиента, пришедший на порт знакомства релея, как есть (с
+// открытым именем клиента), и откуда он пришёл (`ip:порт`). Проверяет его сервер: релей ключей
+// клиентов не знает.
+message RelayKnock {
+  bytes packet = 1;
+  string from = 2;
+}
+
+// Сервер → релей: ответ клиенту на знакомство — отправить с порта знакомства релея на `to`.
+message RelayReply {
+  bytes packet = 1;
+  string to = 2;
+}
+
+// Сервер → релей: заведи сессию — порт для клиента, пересылка на порт дыры сервера `server_port`.
+message RelayOpen {
+  uint32 token = 1;
+  uint32 server_port = 2;
+}
+
+// Релей → сервер: сессия `token` заведена, порт для клиента — `port`.
+message RelayReady {
+  uint32 token = 1;
+  uint32 port = 2;
 }

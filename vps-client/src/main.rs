@@ -292,8 +292,20 @@ async fn run() -> Result<()> {
     let mut status = tokio::time::interval(STATUS_INTERVAL);
     let mut check = tokio::time::interval(ROUTES_CHECK);
     let mut shutdown = NativeShutdown::new()?;
+    // Релеи, которые разрешил сервер: их адреса — мимо туннеля (иначе дыры через релей ушли бы в TUN).
+    let mut relay = link.relay();
     loop {
         tokio::select! {
+            Ok(()) = relay.changed() => {
+                let relays = relay.borrow_and_update().as_ref().map(|g| g.relays.clone()).unwrap_or_default();
+                if let Some(routes) = routes.as_mut() {
+                    for addr in relays {
+                        if let IpAddr::V4(ip) = addr.ip() {
+                            routes.add_bypass(ip).await?;
+                        }
+                    }
+                }
+            }
             _ = status.tick() => {
                 let now = (link.live_count(), bridge.stats().snapshot());
                 if Some(now) != last {
