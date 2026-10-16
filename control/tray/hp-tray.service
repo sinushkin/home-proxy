@@ -1,0 +1,14 @@
+# Пользовательская служба systemd для значка home-proxy в трее (Linux): стартует вместе с графической
+# сессией и перезапускается при падении. Установка — control/README.md, «Трей при входе в систему».
+[Unit]
+Description=Home Proxy — значок в трее
+PartOf=graphical-session.target
+After=graphical-session.target plasma-plasmashell.service
+
+[Service]
+ExecStart=%h/.local/bin/hp-tray --hidden
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

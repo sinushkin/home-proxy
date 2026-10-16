@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hp_control::proto::{HoleStatus, PeerStatus, Status};
+use hp_control::proto::{HoleCounters, HoleStatus, PeerStatus, RelayStatus, Status};
 use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::{HoleRow, MainWindow, PeerRow, ServiceState, UiState};
@@ -65,13 +65,87 @@ fn hole_level(hole: &HoleStatus) -> i32 {
     }
 }
 
-/// Средние потери по дырам, где они известны: (к телефону, от телефона).
-fn mean_loss(peer: &PeerStatus) -> (f32, f32) {
+/// Средние потери по дырам, где они известны: (к пиру, от пира).
+fn mean_loss(holes: &[HoleStatus]) -> (f32, f32) {
     let mean = |values: Vec<f32>| if values.is_empty() { -1.0 } else { values.iter().sum::<f32>() / values.len() as f32 };
     (
-        mean(peer.holes.iter().map(|h| h.loss_out).filter(|l| *l >= 0.0).collect()),
-        mean(peer.holes.iter().map(|h| h.loss_in).filter(|l| *l >= 0.0).collect()),
+        mean(holes.iter().map(|h| h.loss_out).filter(|l| *l >= 0.0).collect()),
+        mean(holes.iter().map(|h| h.loss_in).filter(|l| *l >= 0.0).collect()),
     )
+}
+
+fn loss_text(holes: &[HoleStatus]) -> String {
+    let (out, inn) = mean_loss(holes);
+    if out < 0.0 && inn < 0.0 { String::new() } else { format!("потери ↑{} ↓{}", percent(out), percent(inn)) }
+}
+
+/// Счётчики событий дыр с запуска (из памяти службы); пусто — служба их не сообщает.
+fn counters_text(c: Option<&HoleCounters>) -> String {
+    let Some(c) = c else { return String::new() };
+    format!(
+        "с запуска: открыто {}, слито нами {} и пиром {}, потеряно {}, плохих {}",
+        grouped(c.opened.into()),
+        grouped(c.drained_by_us.into()),
+        grouped(c.drained_by_peer.into()),
+        grouped(c.lost.into()),
+        grouped(c.bad.into())
+    )
+}
+
+fn hole_rows(holes: &[HoleStatus]) -> Vec<HoleRow> {
+    holes
+        .iter()
+        .map(|h| HoleRow {
+            slot: h.slot as i32,
+            addr: if h.via.is_empty() { h.peer_addr.clone() } else { format!("{} · через релей {}", h.peer_addr, h.via) }.into(),
+            sent: grouped(h.sent).into(),
+            received: grouped(h.received).into(),
+            loss_out: percent(h.loss_out).into(),
+            loss_in: percent(h.loss_in).into(),
+            age: if h.draining { format!("{}, слив", hp_control::age_text(h.age_secs)) } else { hp_control::age_text(h.age_secs) }.into(),
+            level: hole_level(h),
+        })
+        .collect()
+}
+
+/// Карточка в окне: пир службы или релей VPS-сервера.
+pub enum Card<'a> {
+    Peer(&'a PeerStatus),
+    Relay(&'a RelayStatus),
+}
+
+impl Card<'_> {
+    /// Ключ раскрытия карточки (имена пиров и релеев не пересекаются: у релея — приставка).
+    pub fn key(&self) -> String {
+        match self {
+            Card::Peer(p) => p.name.clone(),
+            Card::Relay(r) => format!("релей {}", r.name),
+        }
+    }
+}
+
+/// Все карточки окна по порядку: у каждой службы сначала пиры, потом её релеи.
+pub fn cards(state: &UiState) -> Vec<(usize, Card<'_>)> {
+    state
+        .services
+        .iter()
+        .enumerate()
+        .flat_map(|(i, service)| {
+            service.status.iter().flat_map(move |status| {
+                status.peers.iter().map(move |p| (i, Card::Peer(p))).chain(status.relays.iter().map(move |r| (i, Card::Relay(r))))
+            })
+        })
+        .collect()
+}
+
+fn relay_level(relay: &RelayStatus) -> i32 {
+    if !relay.alive || relay.live == 0 {
+        1
+    } else if relay.live < HEALTHY_HOLES {
+        2
+    } else {
+        3
+    }
 }
 
 /// Сколько дыр в работе считаем здоровым набором: столько держит политика набора как минимум
@@ -250,26 +324,36 @@ pub fn render(window: &MainWindow, state: &UiState) {
     window.set_traffic(live.iter().map(|(s, st)| prefixed(s, traffic(st))).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n").into());
     window.set_pairing_supported(live.iter().any(|(_, st)| st.pairing_supported));
 
-    let rows: Vec<PeerRow> = peer_rows(state)
+    let rows: Vec<PeerRow> = cards(state)
         .into_iter()
-        .map(|(si, peer)| {
+        .map(|(si, card)| {
             let service = &state.services[si];
+            let key = card.key();
+            let peer = match card {
+                Card::Peer(peer) => peer,
+                Card::Relay(relay) => {
+                    return PeerRow {
+                        name: key.clone().into(),
+                        title: format!("Релей {}", relay.name).into(),
+                        service: if multi { service_label(service) } else { String::new() }.into(),
+                        state: if relay.alive { "на связи" } else { "не на связи" }.into(),
+                        level: relay_level(relay),
+                        live: relay.live as i32,
+                        target: 10,
+                        addresses: if relay.addr.is_empty() { "порт ещё не сообщил".to_string() } else { format!("для клиентов {}", relay.addr) }.into(),
+                        addr_title: "адрес релея".into(),
+                        reorder: SharedString::new(),
+                        registration: SharedString::new(),
+                        counters: counters_text(relay.counters.as_ref()).into(),
+                        loss: loss_text(&relay.holes).into(),
+                        pending: false,
+                        removable: false,
+                        expanded: state.expanded.contains(&key),
+                        holes: ModelRc::new(VecModel::from(hole_rows(&relay.holes))),
+                    };
+                }
+            };
             let client_of_vps = service.status.as_ref().is_some_and(|st| st.service == "vps-client");
-            let (out, inn) = mean_loss(peer);
-            let holes: Vec<HoleRow> = peer
-                .holes
-                .iter()
-                .map(|h| HoleRow {
-                    slot: h.slot as i32,
-                    addr: h.peer_addr.clone().into(),
-                    sent: grouped(h.sent).into(),
-                    received: grouped(h.received).into(),
-                    loss_out: percent(h.loss_out).into(),
-                    loss_in: percent(h.loss_in).into(),
-                    age: if h.draining { format!("{}, слив", hp_control::age_text(h.age_secs)) } else { hp_control::age_text(h.age_secs) }.into(),
-                    level: hole_level(h),
-                })
-                .collect();
             PeerRow {
                 name: peer.name.clone().into(),
                 title: if is_vps(peer) && client_of_vps { format!("VPS-сервер {}", peer.name).into() } else if is_vps(peer) { "VPS (шлюз дома)".into() } else { format!("Телефон {}", peer.name).into() },
@@ -282,11 +366,12 @@ pub fn render(window: &MainWindow, state: &UiState) {
                 addr_title: if is_vps(peer) { "адрес сервера" } else { "адрес телефона" }.into(),
                 reorder: reorder_text(peer).into(),
                 registration: hp_control::registration_text(peer, now_unix() * 1000).unwrap_or_default().into(),
-                loss: if out < 0.0 && inn < 0.0 { SharedString::new() } else { format!("потери ↑{} ↓{}", percent(out), percent(inn)).into() },
+                counters: counters_text(peer.counters.as_ref()).into(),
+                loss: loss_text(&peer.holes).into(),
                 pending: peer.pending,
                 removable: peer.removable,
-                expanded: state.expanded.contains(&peer.name),
-                holes: ModelRc::new(VecModel::from(holes)),
+                expanded: state.expanded.contains(&key),
+                holes: ModelRc::new(VecModel::from(hole_rows(&peer.holes))),
             }
         })
         .collect();
@@ -408,5 +493,19 @@ mod tests {
         assert_eq!(level, 1, "служба без связи красит значок");
         assert!(text.contains("vps-client") && text.contains("нет связи"), "{text}");
         assert_eq!(peer_rows(&state).len(), 1, "у пропавшей службы пиров нет");
+    }
+
+    #[test]
+    fn relays_of_a_vps_server_follow_its_peers_as_cards() {
+        let peer = PeerStatus { name: "41d56858".into(), live: 8, target: 10, ..Default::default() };
+        let relay = RelayStatus { name: "127a118f".into(), addr: "203.0.113.20:40700".into(), alive: true, live: 10, ..Default::default() };
+        let server = ServiceState { status: Some(Status { service: "hp-server".into(), peers: vec![peer], relays: vec![relay], ..Default::default() }), ..Default::default() };
+        let state = UiState { services: vec![server], ..Default::default() };
+        let keys: Vec<String> = cards(&state).iter().map(|(_, c)| c.key()).collect();
+        assert_eq!(keys, vec!["41d56858".to_string(), "релей 127a118f".to_string()], "сначала пиры службы, потом её релеи");
+        let dead = RelayStatus { alive: false, live: 3, ..Default::default() };
+        assert_eq!(relay_level(&dead), 1, "релей не на связи — красный");
+        let hole = HoleStatus { peer_addr: "203.0.113.20:5000".into(), via: "127a118f".into(), ..Default::default() };
+        assert!(hole_rows(&[hole])[0].addr.contains("через релей 127a118f"));
     }
 }

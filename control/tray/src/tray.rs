@@ -11,23 +11,41 @@ use slint::ComponentHandle;
 
 use crate::MainWindow;
 
+/// Показать окно; ошибку — в stderr (у службы — в журнал), молча не глотаем.
+fn show_window(window: &MainWindow) {
+    if let Err(e) = window.show() {
+        eprintln!("hp-tray: окно не показать: {e}");
+    }
+    // Wayland показывает окно только после первого кадра, а окно, показанное из уже идущего цикла
+    // событий (запуск с --hidden, «Открыть» из значка), само его не рисует: просим кадр явно.
+    window.window().request_redraw();
+}
+
 fn show(ui: &slint::Weak<MainWindow>) {
-    let _ = ui.upgrade_in_event_loop(|window| {
-        let _ = window.show();
-    });
+    if let Err(e) = ui.upgrade_in_event_loop(|window| show_window(&window)) {
+        eprintln!("hp-tray: «Открыть» не дошло до окна: {e}");
+    }
 }
 
 fn add_phone(ui: &slint::Weak<MainWindow>) {
-    let _ = ui.upgrade_in_event_loop(|window| {
-        let _ = window.show();
+    let result = ui.upgrade_in_event_loop(|window| {
+        show_window(&window);
         window.invoke_add_phone();
     });
+    if let Err(e) = result {
+        eprintln!("hp-tray: «Добавить телефон» не дошло до окна: {e}");
+    }
 }
 
 fn quit() {
-    let _ = slint::invoke_from_event_loop(|| {
-        let _ = slint::quit_event_loop();
+    let result = slint::invoke_from_event_loop(|| {
+        if let Err(e) = slint::quit_event_loop() {
+            eprintln!("hp-tray: выход: {e}");
+        }
     });
+    if let Err(e) = result {
+        eprintln!("hp-tray: выход не дошёл до окна: {e}");
+    }
 }
 
 #[derive(Clone)]

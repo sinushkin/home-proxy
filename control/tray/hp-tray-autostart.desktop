@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Home Proxy (трей)
+Comment=Запускает пользовательскую службу hp-tray.service (сессия без systemd, например Plasma с systemdBoot=false)
+Exec=systemctl --user start hp-tray.service
+Icon=network-vpn
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-phase=2

@@ -282,7 +282,7 @@ fn main() -> Result<()> {
         move |index| {
             let Some(window) = ui.upgrade() else { return };
             let mut state = state.lock().unwrap();
-            let name = view::peer_rows(&state).get(index as usize).map(|(_, p)| p.name.clone());
+            let name = view::cards(&state).get(index as usize).map(|(_, card)| card.key());
             if let Some(name) = name
                 && !state.expanded.remove(&name)
             {

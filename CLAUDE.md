@@ -329,6 +329,12 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   адрес в строке — LAN роутера, ssh-туннель не нужен; на `o1` работает с `hp-router`),
   плюс `/etc/init.d/hp-router` (procd; бинарник `/usr/bin`, настройки `/etc/hp-router`).
   Полные GUID — секрет пары: в статус и в логи идут только имена (`peer_name`). `control/README.md`.
+- `setup/hp-status.sh` — отчёт на сервере из памяти служб (`hpctl status`/`events` по всем
+  `vps-server`/`hp-server` с `--config`; копия — `~/hp-status.sh` на `ihor`). Раздел «Проверка статусов»
+  в `README.md`.
+- `control/tray/hp-tray.service` (user-служба systemd, `--hidden`) и `hp-tray-autostart.desktop` (для
+  Plasma с `systemdBoot=false`: `graphical-session.target` там не поднимается) — трей при входе в
+  систему, `control/README.md`. На этом ПК установлены (`~/.local/bin/hp-tray`).
 - `setup/vps-relay.sh <релей> <сервер>` — релей `vps-relay` (`/opt/hp-relay`, служба `hp-vps-relay`), GUID —
   в `relays.txt` сервера (`SERVER_DIR`/`SERVER_UNIT` — другой экземпляр); удалённые части общие с
   `.bat` — `setup/win/remote/{relay-install,server-add-relay}.sh`.
