@@ -32,7 +32,7 @@ use uuid::Uuid;
 use super::{lease_and_bind, Bootstrap, NAME_LEN};
 use crate::auth::peer_name;
 use crate::discovery::Discovery;
-use crate::multilink::{AbortOnDrop, Control, LinkRegistry, MultiLink, MultiLinkOptions};
+use crate::multilink::{AbortOnDrop, Control, LinkRegistry, LinkStatus, MultiLink, MultiLinkOptions};
 use crate::port_pool::{PortLease, PortPool};
 use crate::proto::{RelayHello, RelayKnock, RelayOffer, RelayOpen, RelayReady, RelayReply};
 
@@ -66,6 +66,19 @@ const BUF: usize = 2048;
 // ---------------------------------------------------------------------------------------------
 // Сервер
 // ---------------------------------------------------------------------------------------------
+
+/// Релей в статусе сервера.
+#[derive(Clone, Debug)]
+pub struct RelayInfo {
+    /// Имя — первая группа GUID релея.
+    pub name: String,
+    /// Порт знакомства релея для клиентов (из `RelayHello`); `None` — ещё не сообщил.
+    pub public: Option<SocketAddr>,
+    /// На связи (пакеты от релея за последние `SILENCE`): только такие уходят клиентам.
+    pub alive: bool,
+    /// Дыры релея к серверу; `None` — связь с релеем не заведена.
+    pub link: Option<LinkStatus>,
+}
 
 /// Релеи процесса сервера (общие для всех клиентов, живут в `Bootstrap`).
 pub(crate) struct Relays {
@@ -103,6 +116,17 @@ struct Entry {
 impl Relays {
     pub(crate) fn set_share(&self, share: u8) {
         self.inner.lock().unwrap().share = Some(share.min(100));
+    }
+
+    pub(crate) fn status(&self) -> Vec<RelayInfo> {
+        let inner = self.inner.lock().unwrap();
+        let mut relays: Vec<RelayInfo> = inner
+            .relays
+            .iter()
+            .map(|(name, e)| RelayInfo { name: name.clone(), public: e.public, alive: e.alive, link: e.link.upgrade().map(|l| l.status()) })
+            .collect();
+        relays.sort_by(|a, b| a.name.cmp(&b.name));
+        relays
     }
 
     pub(crate) fn is_relay(&self, name: &str) -> bool {

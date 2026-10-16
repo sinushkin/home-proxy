@@ -72,6 +72,8 @@ pub struct Service<D: PacketDevice> {
     started: Instant,
     mode: Mode,
     bind: Option<IpAddr>,
+    /// VPS-сервер: порт знакомства — откуда брать релеи для статуса.
+    relays: std::sync::OnceLock<connection::vps::Bootstrap>,
     /// hp-stats (фича `stats`, PLAN-ML.md): прикрепляется к каждому новому набору дыр (`add`).
     #[cfg(feature = "stats")]
     stats: Option<hp_stats::StatsHandle>,
@@ -105,9 +107,15 @@ impl<D: PacketDevice> Service<D> {
             started: Instant::now(),
             mode,
             bind,
+            relays: std::sync::OnceLock::new(),
             #[cfg(feature = "stats")]
             stats,
         }
+    }
+
+    /// VPS-сервер: показывать в статусе релеи этого порта знакомства.
+    pub fn set_relays(&self, bootstrap: connection::vps::Bootstrap) {
+        let _ = self.relays.set(bootstrap);
     }
 
     pub fn hub(&self) -> &Hub<D> {
@@ -262,20 +270,7 @@ impl<D: PacketDevice> Service<D> {
                     .into(),
                     live: status.in_work() as u32,
                     target: TARGET_LINKS,
-                    holes: status
-                        .holes
-                        .iter()
-                        .map(|h| proto::HoleStatus {
-                            slot: h.slot,
-                            peer_addr: h.peer_addr.map(|a| a.to_string()).unwrap_or_default(),
-                            sent: h.sent,
-                            received: h.received,
-                            loss_out: h.loss_out.unwrap_or(-1.0),
-                            loss_in: h.loss_in.unwrap_or(-1.0),
-                            age_secs: h.age.as_secs().min(u64::from(u32::MAX)) as u32,
-                            draining: h.state == connection::holes::HoleState::Draining,
-                        })
-                        .collect(),
+                    holes: crate::status::holes(&status),
                     addresses: self.hub.addresses_of(e.peer.peer_id).iter().map(|a| a.to_string()).collect(),
                     pending: matches!(e.origin, Origin::Pending(_)),
                     pending_expires_unix: match e.origin {
@@ -287,6 +282,8 @@ impl<D: PacketDevice> Service<D> {
                     reorder_wait_ms: status.reorder_wait_ms,
                     registered_addr: status.peer_registration.map(|r| r.addr.to_string()).unwrap_or_default(),
                     registered_at_unix_ms: status.peer_registration.map_or(0, |r| r.registered_at_unix_ms),
+                    counters: Some(crate::status::counters(&status.counters)),
+                    events: crate::status::events(&status.events),
                 }
             })
             .collect();
@@ -302,6 +299,7 @@ impl<D: PacketDevice> Service<D> {
             peers,
             traffic: Some(proto::Traffic { to_peers: to_peers.into(), ordered: ordered.into(), from_peers: from_peers.into(), dropped: dropped.into(), ..Default::default() }),
             pairing_supported: self.pairing.is_some(),
+            relays: self.relays.get().map(|b| crate::status::relays(b.relays_status())).unwrap_or_default(),
         }
     }
 }

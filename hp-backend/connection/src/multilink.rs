@@ -308,11 +308,95 @@ pub(crate) struct LiveLink {
     pub opened_at: Instant,
     /// `Active` или `Draining`: сливаемая дыра принимает, но для отправки не выбирается.
     pub state: HoleState,
+    /// Через какой релей идёт дыра (VPS: у сервера — имя релея, у клиента — его адрес).
+    pub via: Option<Arc<str>>,
+}
+
+/// Что случилось с дырой (счётчики с запуска и последние события набора — для статуса службы).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoleEventKind {
+    /// Дыра встала в реестр.
+    Opened,
+    /// От пира нет пакетов дольше `keepalive_timeout`.
+    Lost,
+    /// Мы попросили пира слить дыру (политика набора, плохая, просроченная).
+    DrainedByUs,
+    /// Пир попросил слить дыру.
+    DrainedByPeer,
+    /// По статистике пира доставлено меньше половины.
+    Bad,
+    /// Пир не подтвердил путь за `CONFIRM_TIMEOUT`.
+    NotConfirmed,
+}
+
+impl HoleEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Opened => "opened",
+            Self::Lost => "lost",
+            Self::DrainedByUs => "drained_by_us",
+            Self::DrainedByPeer => "drained_by_peer",
+            Self::Bad => "bad",
+            Self::NotConfirmed => "not_confirmed",
+        }
+    }
+}
+
+/// Событие дыры: когда (мс Unix), какая, что, через какой релей.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoleEvent {
+    pub at_unix_ms: u64,
+    pub slot: SlotId,
+    pub kind: HoleEventKind,
+    pub via: Option<Arc<str>>,
+}
+
+/// Счётчики событий дыр с запуска (32 бита: 64-битных атомиков на MIPS32 нет, а здесь и не нужно).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoleCounters {
+    pub opened: u32,
+    pub lost: u32,
+    pub drained_by_us: u32,
+    pub drained_by_peer: u32,
+    pub bad: u32,
+    pub not_confirmed: u32,
+}
+
+/// Сколько последних событий дыр помнит набор (только память, на диск ничего не пишется).
+const RECENT_EVENTS: usize = 32;
+
+/// Журнал событий дыр набора в памяти: счётчики и кольцо последних.
+#[derive(Default)]
+struct HoleLog {
+    counters: HoleCounters,
+    recent: std::collections::VecDeque<HoleEvent>,
+}
+
+impl HoleLog {
+    fn record(&mut self, slot: SlotId, kind: HoleEventKind, via: Option<Arc<str>>) {
+        let c = &mut self.counters;
+        let counter = match kind {
+            HoleEventKind::Opened => &mut c.opened,
+            HoleEventKind::Lost => &mut c.lost,
+            HoleEventKind::DrainedByUs => &mut c.drained_by_us,
+            HoleEventKind::DrainedByPeer => &mut c.drained_by_peer,
+            HoleEventKind::Bad => &mut c.bad,
+            HoleEventKind::NotConfirmed => &mut c.not_confirmed,
+        };
+        *counter = counter.wrapping_add(1);
+        if self.recent.len() >= RECENT_EVENTS {
+            self.recent.pop_front();
+        }
+        let at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        self.recent.push_back(HoleEvent { at_unix_ms, slot, kind, via });
+    }
 }
 
 /// Общий реестр живых дыр. `index` — тот самый `Map<PeerLinkId, SlotId>`.
 #[derive(Default)]
 pub(crate) struct LinkRegistry {
+    /// События дыр набора (счётчики и последние) — для статуса.
+    log: HoleLog,
     by_slot: HashMap<SlotId, LiveLink>,
     index: HashMap<PeerLinkId, SlotId>,
     /// Последний отчёт пира по дыре и наши счётчики на момент его прихода — для потерь.
@@ -353,6 +437,8 @@ pub struct HoleStatus {
     pub age: Duration,
     /// `Active` — в работе, `Draining` — сливается (данные по ней уже не шлём).
     pub state: HoleState,
+    /// Через какой релей идёт дыра (VPS); `None` — напрямую.
+    pub via: Option<Arc<str>>,
 }
 
 /// Снимок набора дыр: общее состояние и живые дыры по порядку слотов.
@@ -365,6 +451,9 @@ pub struct LinkStatus {
     pub reorder_wait_ms: u32,
     /// Последняя регистрация пира на MQTT-брокере; `None` — не было или режим без MQTT (VPS).
     pub peer_registration: Option<PeerRegistration>,
+    /// События дыр с запуска набора и последние из них (старые — первыми).
+    pub counters: HoleCounters,
+    pub events: Vec<HoleEvent>,
 }
 
 impl LinkStatus {
@@ -375,6 +464,12 @@ impl LinkStatus {
 }
 
 impl LinkRegistry {
+    /// Событие дыры `slot` (через какой релей она шла — по реестру, если она ещё в нём).
+    pub(crate) fn record(&mut self, slot: SlotId, kind: HoleEventKind) {
+        let via = self.by_slot.get(&slot).and_then(|l| l.via.clone());
+        self.log.record(slot, kind, via);
+    }
+
     fn insert(&mut self, link_id: PeerLinkId, link: LiveLink) {
         self.reports.remove(&link.slot);
         self.index.insert(link_id, link.slot);
@@ -466,6 +561,7 @@ impl LinkRegistry {
                     loss_in: report.and_then(|r| loss(r.peer_sent, r.my_received)),
                     age: link.opened_at.elapsed(),
                     state: link.state,
+                    via: link.via.clone(),
                 }
             })
             .collect();
@@ -851,11 +947,17 @@ impl MultiLink {
 
     /// Снимок состояния: общее состояние и живые дыры со счётчиками и потерями.
     pub fn status(&self) -> LinkStatus {
+        let (holes, counters, events) = {
+            let registry = self.registry.lock().unwrap();
+            (registry.holes(), registry.log.counters, registry.log.recent.iter().cloned().collect())
+        };
         LinkStatus {
             state: self.state.current(),
-            holes: self.registry.lock().unwrap().holes(),
+            holes,
             reorder_wait_ms: self.reorder_wait_ms.load(Ordering::Relaxed),
             peer_registration: self.registration.as_ref().and_then(|source| source()),
+            counters,
+            events,
         }
     }
 
@@ -1087,6 +1189,7 @@ async fn control_loop(
                 for stat in peer_stats {
                     registry.lock().unwrap().record_report(&stat);
                     if is_link_bad(&registry, &stat) {
+                        registry.lock().unwrap().record(stat.slot, HoleEventKind::Bad);
                         log::warn!(
                             "{label}слот {}: пир отправил {}, мы получили {} — дыра плохая, {}",
                             stat.slot,
@@ -1299,6 +1402,7 @@ impl HoleFactory {
             ctl: self.ctl.clone(),
             dynamic,
             confirm_peer,
+            via: None,
         }
     }
 }
@@ -1317,6 +1421,8 @@ pub(crate) struct SlotBase {
     /// Данные по дыре пойдут, только когда пир сам пришлёт пакет после пробива (сервер: из одного
     /// `Punch` не видно, доходят ли до клиента наши ответы).
     confirm_peer: bool,
+    /// Через какой релей идёт дыра (VPS): режим ставит до `hold`, видно в статусе и событиях.
+    pub via: Option<Arc<str>>,
 }
 
 impl Drop for SlotBase {
@@ -1351,7 +1457,8 @@ impl SlotBase {
         {
             let state = if warming { HoleState::Warming } else { HoleState::Active };
             let mut reg = self.registry.lock().unwrap();
-            reg.insert(link_id, LiveLink { slot, sender: link.sender.clone(), opened_at: Instant::now(), state });
+            reg.insert(link_id, LiveLink { slot, sender: link.sender.clone(), opened_at: Instant::now(), state, via: self.via.clone() });
+            reg.record(slot, HoleEventKind::Opened);
             log::info!("{label}слот {slot}: дыра открыта {} <-> {} (живых дыр: {})", link.local_addr, link.peer_addr, reg.live_count());
         }
         self.phase(SlotPhase::Connected);
@@ -1366,6 +1473,7 @@ impl SlotBase {
             tokio::select! {
                 _ = link.lost() => {
                     log::warn!("{label}слот {slot}: дыра потеряна{}", if self.dynamic { "" } else { ", перерегистрация" });
+                    self.registry.lock().unwrap().record(slot, HoleEventKind::Lost);
                     break None;
                 }
                 command = self.cmd_rx.recv() => {
@@ -1385,6 +1493,7 @@ impl SlotBase {
                         log::debug!("{label}слот {slot}: пир подтвердил дыру за {:?}", opened.elapsed());
                     } else if opened.elapsed() >= CONFIRM_TIMEOUT {
                         log::warn!("{label}слот {slot}: пир не подтвердил дыру за {CONFIRM_TIMEOUT:?} (ответы не доходят?), закрываем");
+                        self.registry.lock().unwrap().record(slot, HoleEventKind::NotConfirmed);
                         break None;
                     }
                 }
@@ -1420,10 +1529,12 @@ impl SlotBase {
         let (mut fsm, mut actions) = match command {
             HoleCmd::Retire => {
                 log::info!("{label}слот {slot}: просим пира слить дыру");
+                self.registry.lock().unwrap().record(slot, HoleEventKind::DrainedByUs);
                 crate::drain::Drain::request(now)
             }
             HoleCmd::PeerDrain => {
                 log::info!("{label}слот {slot}: пир просит слить дыру, подтверждаем");
+                self.registry.lock().unwrap().record(slot, HoleEventKind::DrainedByPeer);
                 crate::drain::Drain::receive(now)
             }
         };

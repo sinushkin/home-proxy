@@ -162,6 +162,25 @@ fn peer_status(name: String, status: LinkStatus) -> proto::PeerStatus {
                 loss_in: h.loss_in.unwrap_or(-1.0),
                 age_secs: h.age.as_secs().min(u64::from(u32::MAX)) as u32,
                 draining: h.state == connection::holes::HoleState::Draining,
+                via: h.via.as_deref().unwrap_or_default().to_string(),
+            })
+            .collect(),
+        counters: Some(proto::HoleCounters {
+            opened: status.counters.opened,
+            lost: status.counters.lost,
+            drained_by_us: status.counters.drained_by_us,
+            drained_by_peer: status.counters.drained_by_peer,
+            bad: status.counters.bad,
+            not_confirmed: status.counters.not_confirmed,
+        }),
+        events: status
+            .events
+            .iter()
+            .map(|e| proto::HoleEvent {
+                at_unix_ms: e.at_unix_ms,
+                slot: e.slot,
+                kind: e.kind.as_str().into(),
+                via: e.via.as_deref().unwrap_or_default().to_string(),
             })
             .collect(),
         kind: "vps".into(),

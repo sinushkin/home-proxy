@@ -182,6 +182,8 @@ async fn run(settings: Settings) -> Result<()> {
     if !relays.is_empty() {
         log::info!("vps-server: релеев {}, доля новых дыр клиентов через них {share}%", relays.len());
     }
+    let mut common = common;
+    common.relays = Some(bootstrap.clone());
     let discovery = Discovery::VpsServer { public_ip, bootstrap };
     let path = clients_file(&settings);
     log::info!("vps-server: клиенты из {}", path.display());

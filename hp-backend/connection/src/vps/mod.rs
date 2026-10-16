@@ -240,6 +240,11 @@ impl Bootstrap {
         self
     }
 
+    /// Релеи процесса для статуса службы: кто, где, на связи ли, его дыры к серверу.
+    pub fn relays_status(&self) -> Vec<relay::RelayInfo> {
+        self.relays.status()
+    }
+
     /// Запрос знакомства, пришедший через релей `relay`: дальше — как пришедший напрямую.
     async fn inject(&self, packet: &[u8], from: SocketAddr, relay: String) {
         if packet.len() <= NAME_LEN {
@@ -598,6 +603,7 @@ impl ServerHole {
             Some((relays, name)) => match relays.open(name, port).await {
                 Some(endpoint) => {
                     log::info!("{label}дыра {slot}: через релей {name}, клиенту — {endpoint}");
+                    self.base.via = Some(Arc::from(name.as_str()));
                     endpoint
                 }
                 None => {
@@ -862,6 +868,7 @@ impl ClientHole {
 
     async fn serve(&mut self) {
         let (slot, label) = (self.base.slot, self.base.label.clone());
+        self.base.via = self.relay.map(|relay| Arc::from(relay.to_string()));
         // Asking: свой сокет (новый локальный адрес на каждую дыру) и сессия; спрашиваем, пока не
         // залинкуемся.
         self.base.phase(SlotPhase::Rendezvous);

@@ -307,7 +307,10 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
   строку печатает `hp-server|hp-router|vps-client --connection-string` (`--new-connection-string` —
   новый ключ); службы с управлением: `hp-server` (и `vps-server`), `hp-router`, `vps-client`
   (`CONTROL_ADDR`, по умолчанию выключено; один «пир» — VPS-сервер, пары не выпускает). В статусе у
-  каждой дыры номер, адрес, возраст (`age_secs`), признак слива (`draining`), потери; `live` —
+  каждой дыры номер, адрес, возраст (`age_secs`), признак слива (`draining`), потери, `via` (через какой
+  релей); у пира — счётчики событий дыр с запуска и последние 32 события (`HoleCounters`, `HoleEvent`;
+  только память, `LinkStatus::{counters,events}`, `hpctl events`); у VPS-сервера — релеи (`RelayStatus`);
+  перевод `LinkStatus` → proto — `hp-server/src/status.rs`; `live` —
   дыры в работе (`LinkStatus::in_work`), трей считает набор здоровым при ≥ 4. `control/tray/` — `hp-tray`, трей на Slint (winit +
   программный рендер): значок `ksni` (Linux) / `tray-icon` (Windows), окно со статусом, телефонами,
   дырами и потерями, QR сопряжения. Строки подключения трей получает от пользователя (первый запуск,

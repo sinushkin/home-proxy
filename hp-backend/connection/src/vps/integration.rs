@@ -335,6 +335,21 @@ async fn relay_comes_to_the_server_and_carries_new_client_holes() {
     let got = tokio::time::timeout(Duration::from_secs(2), client_rx.recv()).await.unwrap().unwrap();
     assert_eq!(got.payload, b"pong");
 
+    // Статус из памяти: дыры через релей помечены (у клиента — адрес релея, у сервера — его имя),
+    // релей в списке сервера на связи, события дыр считаются.
+    let relay_name = crate::auth::peer_name(&relay_id);
+    let relay_addr = SocketAddr::from(([127, 0, 0, 1], relay_bootstrap)).to_string();
+    let client_status = client.status();
+    assert!(client_status.holes.iter().any(|h| h.via.as_deref() == Some(relay_addr.as_str())), "у клиента дыра через релей помечена");
+    assert!(client_status.counters.opened >= 2 && !client_status.events.is_empty());
+    wait_until("у сервера дыра через релей помечена", 10, || {
+        server.status().holes.iter().any(|h| h.via.as_deref() == Some(relay_name.as_str()))
+    })
+    .await;
+    let relays = bootstrap.relays_status();
+    assert_eq!(relays.len(), 1);
+    assert!(relays[0].alive && relays[0].public.is_some() && relays[0].link.as_ref().is_some_and(|l| l.in_work() > 0));
+
     // Релей пропал: через ~10 с тишины сервер убирает его и сразу сообщает клиенту пустой список.
     drop(_relay);
     wait_until("клиент узнал, что релея больше нет", 20, || client.relay().borrow().is_none()).await;

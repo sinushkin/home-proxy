@@ -44,6 +44,7 @@ pub mod addresses;
 pub mod bypass;
 pub mod service;
 pub mod settings;
+pub mod status;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,6 +116,8 @@ pub struct Common {
     /// Способ встречи для телефонов из `peers.state` и новых сопряжений (STUN + MQTT); `None` —
     /// сопряжение не поддерживается (VPS).
     pub pairing: Option<Discovery>,
+    /// VPS-сервер: его порт знакомства — релеи в статусе управления; `None` — релеев нет.
+    pub relays: Option<connection::vps::Bootstrap>,
     /// hp-stats (фича `stats`, PLAN-ML.md): настройки сбора статистики пакетов вниз; `None` —
     /// `STATS_FILE` не задан, сбор выключен (даже если бинарь собран с фичей).
     #[cfg(feature = "stats")]
@@ -178,6 +181,7 @@ impl Common {
             key_file: settings.resolve(get("CONTROL_KEY_FILE").as_deref().unwrap_or(hp_control::KEY_FILE).trim()),
             peers_file: Some(settings.resolve(get("PEERS_FILE").as_deref().unwrap_or("peers.state").trim())),
             pairing: None,
+            relays: None,
             #[cfg(feature = "stats")]
             stats: match get("STATS_FILE").as_deref().map(str::trim) {
                 None | Some("") => None,
@@ -440,6 +444,9 @@ async fn run<D: hp_tun::device::PacketDevice>(
         #[cfg(feature = "stats")]
         stats_handle,
     ));
+    if let Some(bootstrap) = common.relays.clone() {
+        service.set_relays(bootstrap);
+    }
     for (peer, discovery) in common.peers.iter().zip(discoveries) {
         service.add_configured(*peer, discovery).await?;
     }

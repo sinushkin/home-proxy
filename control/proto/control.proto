@@ -50,6 +50,18 @@ message Status {
   repeated PeerStatus peers = 5;
   Traffic traffic = 6;
   bool pairing_supported = 7;
+  // VPS-сервер: релеи vps-relay (приходят к серверу сами; см. connection::vps::relay).
+  repeated RelayStatus relays = 8;
+}
+
+// Релей VPS-сервера.
+message RelayStatus {
+  string name = 1;           // первая группа GUID релея
+  string addr = 2;           // порт знакомства релея для клиентов (пусто — ещё не сообщил)
+  bool alive = 3;            // на связи (пакеты за последние 10 с): только такие уходят клиентам
+  uint32 live = 4;           // дыр релея к серверу в работе
+  repeated HoleStatus holes = 5;
+  HoleCounters counters = 6;
 }
 
 // Пир (телефон или роутер). Полные GUID — секрет пары и сюда не входят, только имя.
@@ -71,6 +83,25 @@ message PeerStatus {
   // увидел STUN) и время по часам пира, мс Unix. Пусто/0 — записи не было (или режим без MQTT).
   string registered_addr = 12;
   uint64 registered_at_unix_ms = 13;
+  // События дыр с запуска набора (только память службы) и последние из них, старые — первыми.
+  HoleCounters counters = 14;
+  repeated HoleEvent events = 15;
+}
+
+message HoleCounters {
+  uint32 opened = 1;
+  uint32 lost = 2;           // от пира нет пакетов
+  uint32 drained_by_us = 3;  // мы попросили слить (политика набора, плохая, срок)
+  uint32 drained_by_peer = 4;
+  uint32 bad = 5;            // по статистике пира доставлено меньше половины
+  uint32 not_confirmed = 6;  // пир не подтвердил путь
+}
+
+message HoleEvent {
+  uint64 at_unix_ms = 1;
+  uint32 slot = 2;
+  string kind = 3;           // opened | lost | drained_by_us | drained_by_peer | bad | not_confirmed
+  string via = 4;            // через какой релей шла дыра (пусто — напрямую)
 }
 
 message HoleStatus {
@@ -85,6 +116,8 @@ message HoleStatus {
   uint32 age_secs = 7;
   // Дыра сливается: данные по ней уже не идут, она ещё принимает последние пакеты.
   bool draining = 8;
+  // Через какой релей идёт дыра (VPS: у сервера — имя релея, у клиента — его адрес); пусто — напрямую.
+  string via = 9;
 }
 
 // Пакеты: к пирам (телефонам) и от них, TCP с номером в потоке, отброшенные. У роутера ещё

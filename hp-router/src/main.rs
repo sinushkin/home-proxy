@@ -446,20 +446,9 @@ fn peer_status(name: String, kind: &str, status: LinkStatus) -> proto::PeerStatu
         .into(),
         live: status.in_work() as u32,
         target: TARGET_LINKS,
-        holes: status
-            .holes
-            .iter()
-            .map(|h| proto::HoleStatus {
-                slot: h.slot,
-                peer_addr: h.peer_addr.map(|a| a.to_string()).unwrap_or_default(),
-                sent: h.sent,
-                received: h.received,
-                loss_out: h.loss_out.unwrap_or(-1.0),
-                loss_in: h.loss_in.unwrap_or(-1.0),
-                age_secs: h.age.as_secs().min(u64::from(u32::MAX)) as u32,
-                draining: h.state == connection::holes::HoleState::Draining,
-            })
-            .collect(),
+        holes: hp_server::status::holes(&status),
+        counters: Some(hp_server::status::counters(&status.counters)),
+        events: hp_server::status::events(&status.events),
         kind: kind.into(),
         reorder_wait_ms: status.reorder_wait_ms,
         registered_addr: status.peer_registration.map(|r| r.addr.to_string()).unwrap_or_default(),
