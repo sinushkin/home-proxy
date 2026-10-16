@@ -727,6 +727,8 @@ pub(crate) async fn start_client(label: &crate::label::Label, config: ClientConf
         hole_age: config.hole_age,
         relay: config.relay,
         next_relay: 0,
+        blacklist: paths::Blacklist::default(),
+        last_check: Instant::now(),
         holes: HashMap::new(),
         // Номера монотонные и не переиспользуются; старт случайный (до миллиона — чтобы в статусе
         // номера были короткими), чтобы перезапущенный клиент не пересёкся с номерами прошлого запуска.
@@ -764,6 +766,9 @@ struct Manager {
     relay: watch::Receiver<Option<crate::multilink::RelayGrant>>,
     /// Какой релей из списка следующий (по кругу).
     next_relay: usize,
+    /// Пути (напрямую, через релей) с потерями вдвое выше лучшего: новых дыр на них не открываем.
+    blacklist: paths::Blacklist,
+    last_check: Instant,
     holes: HashMap<SlotId, HoleRec>,
     next_id: SlotId,
     last_open: Instant,
@@ -789,6 +794,10 @@ impl Manager {
 
     fn evaluate(&mut self) {
         let now = Instant::now();
+        if now.duration_since(self.last_check) >= paths::CHECK {
+            self.last_check = now;
+            self.check_paths(now);
+        }
         let infos = {
             let registry = self.factory.registry.lock().unwrap();
             crate::holes::snapshot(&registry, self.holes.iter().map(|(&id, rec)| (id, rec.opened, rec.max_age)), now)
@@ -808,18 +817,54 @@ impl Manager {
         }
     }
 
+    /// Раз в минуту: потери по путям (напрямую, через каждый релей); путь вдвое хуже лучшего — в
+    /// чёрный список.
+    fn check_paths(&mut self, now: Instant) {
+        let label = &self.factory.label;
+        for route in self.blacklist.expire(now) {
+            log::info!("{label}путь {}: срок чёрного списка вышел, снова открываем дыры", paths::route_name(route));
+        }
+        let holes = self.factory.registry.lock().unwrap().holes();
+        let losses = paths::path_losses(&holes);
+        if losses.len() > 1 {
+            let text: Vec<String> = losses.iter().map(|p| format!("{} {:.1}% ({} пак.)", paths::route_name(p.route), p.loss * 100.0, p.sample)).collect();
+            log::info!("{label}потери по путям: {}", text.join("; "));
+        }
+        for (route, loss, best) in paths::judge(&losses) {
+            if !self.blacklist.banned(route, now) {
+                log::warn!(
+                    "{label}путь {}: потери {:.1}% против лучших {:.1}% — в чёрный список, новых дыр на нём не открываем",
+                    paths::route_name(route),
+                    loss * 100.0,
+                    best * 100.0
+                );
+            }
+            self.blacklist.ban(route, now);
+        }
+    }
+
     fn open(&mut self, now: Instant) {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.last_open = now;
         let max_age = jittered(self.hole_age.0, self.hole_age.1);
         let relayed = self.holes.values().filter(|h| h.via_relay).count();
-        let relay = {
+        let (relays, share) = {
             let grant = self.relay.borrow();
-            grant
-                .as_ref()
-                .filter(|g| g.valid(now) && relay_wanted(g.share, relayed, self.holes.len()))
-                .map(|g| g.relays[self.next_relay % g.relays.len()])
+            match grant.as_ref().filter(|g| g.valid(now)) {
+                Some(g) => (g.relays.clone(), g.share),
+                None => (Vec::new(), 0),
+            }
+        };
+        // Чёрный список: сервер напрямую плохой — все новые дыры через релеи; релей плохой — мимо
+        // него; плохо всё — список не действует.
+        let (direct_ok, relays_ok) = self.blacklist.allowed(&relays, now);
+        let relay = if relays_ok.is_empty() {
+            None
+        } else if !direct_ok || relay_wanted(share, relayed, self.holes.len()) {
+            Some(relays_ok[self.next_relay % relays_ok.len()])
+        } else {
+            None
         };
         if relay.is_some() {
             self.next_relay = self.next_relay.wrapping_add(1);
@@ -947,6 +992,7 @@ impl ClientHole {
     }
 }
 
+mod paths;
 pub mod relay;
 
 #[cfg(test)]

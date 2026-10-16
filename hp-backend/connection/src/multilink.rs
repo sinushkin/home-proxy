@@ -545,7 +545,7 @@ impl LinkRegistry {
         }
     }
 
-    fn holes(&self) -> Vec<HoleStatus> {
+    pub(crate) fn holes(&self) -> Vec<HoleStatus> {
         let mut holes: Vec<HoleStatus> = self
             .by_slot
             .values()
