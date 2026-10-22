@@ -95,6 +95,16 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(12);
 /// Сколько недавно закрытых номеров дыр помнит актор клиента (запоздалый запрос их не воскресит).
 const CLOSED_MEMORY: usize = 256;
 
+/// Клиент молчит (ни запросов знакомства, ни пакетов по дырам) дольше — сервер забывает его целиком
+/// (дыры, закрытые номера, время запуска) и ждёт знакомства с нуля. Keep-alive идёт каждые 2..10 с.
+const CLIENT_SILENCE: Duration = Duration::from_secs(20);
+
+/// Как часто дыра сообщает актору, когда от клиента был последний пакет.
+/// Не чаще раза в это время пишем в лог об отброшенных запросах прошлого экземпляра.
+const STALE_LOG_EVERY: Duration = Duration::from_secs(10);
+
+const HEARD_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Как часто менеджер набора зовёт политику.
 const MANAGE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -300,6 +310,8 @@ enum HoleMsg {
     /// Задача дыры закончилась. `retry` — по нашей вине (не нашёлся порт): номер не «закрыт»,
     /// следующий запрос клиента заведёт дыру заново.
     Ended { slot: SlotId, epoch: u32, retry: bool },
+    /// Последний валидный пакет клиента по живой дыре пришёл в `at`.
+    Heard { at: Instant },
 }
 
 /// Регистрирует клиента на общем порту знакомства и запускает его актор (он заводит дыры).
@@ -325,6 +337,7 @@ pub(crate) async fn start_server(label: &crate::label::Label, config: ServerConf
         holes: HashMap::new(),
         // С запасом на сливаемые дыры: клиент открывает замену, пока старая ещё закрывается.
         core: KnockCore::new(config.pool.max_total * 2),
+        stale_logged: None,
     };
     let mut tasks = vec![AbortOnDrop(tokio::spawn(actor.run(knocks, msg_rx, guard)))];
     // Клиентам — разрешение релеев; самим релеям — нет.
@@ -375,6 +388,9 @@ async fn listen(socket: Arc<UdpSocket>, mut commands: mpsc::Receiver<Command>) {
 enum KnockAction {
     /// Запрос не по делу — отбросить молча.
     Ignore,
+    /// Запрос прошлого экземпляра клиента: его время запуска (`started_ms`) меньше запомненного
+    /// (`known_ms`). Бывает у перезапущенного клиента с отстающими часами (роутер без RTC).
+    Stale { started_ms: u64, known_ms: u64 },
     /// Дыра с таким номером и сессией уже есть — ответить её записью, если готова.
     Existing,
     /// Завести дыру (`replace` — прошлая дыра с этим номером брошена клиентом и ей на смену).
@@ -399,11 +415,31 @@ struct KnockCore {
     max_holes: usize,
     /// Время запуска процесса клиента по его последнему запросу (`0` — ещё не знаем).
     client_started: u64,
+    /// Когда в последний раз слышали клиента (принятый запрос или пакет по дыре).
+    heard_at: Instant,
 }
 
 impl KnockCore {
     fn new(max_holes: usize) -> Self {
-        Self { holes: HashMap::new(), closed: VecDeque::new(), next_epoch: 0, max_holes, client_started: 0 }
+        Self { holes: HashMap::new(), closed: VecDeque::new(), next_epoch: 0, max_holes, client_started: 0, heard_at: Instant::now() }
+    }
+
+    /// По дыре пришёл пакет клиента в `at`.
+    fn heard(&mut self, at: Instant) {
+        self.heard_at = self.heard_at.max(at);
+    }
+
+    /// Клиент молчит дольше `CLIENT_SILENCE` — забыть его целиком. `true`, если было что забывать
+    /// (тогда оболочка закрывает и задачи дыр).
+    fn reset_if_silent(&mut self, now: Instant) -> bool {
+        let known = self.client_started != 0 || !self.holes.is_empty();
+        if !known || now.saturating_duration_since(self.heard_at) <= CLIENT_SILENCE {
+            return false;
+        }
+        self.holes.clear();
+        self.closed.clear();
+        self.client_started = 0;
+        true
     }
 
     fn knock(&mut self, slot: SlotId, session: Uuid, started_ms: u64) -> KnockDecision {
@@ -416,9 +452,10 @@ impl KnockCore {
             self.closed.clear();
             self.client_started = started_ms;
         } else if started_ms != 0 && started_ms < self.client_started {
-            // Запоздалый запрос прошлого экземпляра клиента.
-            return KnockDecision { restarted: false, action: KnockAction::Ignore };
+            // Запоздалый запрос прошлого экземпляра клиента (молчание клиента не прерывает).
+            return KnockDecision { restarted: false, action: KnockAction::Stale { started_ms, known_ms: self.client_started } };
         }
+        self.heard_at = Instant::now();
         let ignore = |restarted| KnockDecision { restarted, action: KnockAction::Ignore };
         if self.closed.contains(&(slot, session)) {
             return ignore(restarted);
@@ -479,10 +516,13 @@ struct ClientActor {
     holes: HashMap<SlotId, ServerHoleRec>,
     /// Решения по запросам знакомства (чистое ядро).
     core: KnockCore,
+    /// Когда последний раз писали в лог о запросе прошлого экземпляра (раз в `STALE_LOG_EVERY`).
+    stale_logged: Option<Instant>,
 }
 
 impl ClientActor {
     async fn run(mut self, mut knocks: mpsc::Receiver<Knock>, mut messages: mpsc::UnboundedReceiver<HoleMsg>, _registration: Unregistration) {
+        let mut silence = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 knock = knocks.recv() => match knock {
@@ -490,7 +530,17 @@ impl ClientActor {
                     None => return,
                 },
                 Some(message) = messages.recv() => self.on_message(message),
+                _ = silence.tick() => self.forget_if_silent(),
             }
+        }
+    }
+
+    /// Клиент молчит дольше `CLIENT_SILENCE`: забываем его целиком, чтобы он начал знакомство с нуля.
+    fn forget_if_silent(&mut self) {
+        let holes = self.holes.len();
+        if self.core.reset_if_silent(Instant::now()) {
+            self.holes.clear();
+            log::info!("клиент молчит больше {CLIENT_SILENCE:?}: сбрасываем его (дыр: {holes}), ждём знакомства заново");
         }
     }
 
@@ -501,6 +551,7 @@ impl ClientActor {
                     hole.offer = Some(record);
                 }
             }
+            HoleMsg::Heard { at } => self.core.heard(at),
             HoleMsg::Ended { slot, epoch, retry } => {
                 if self.core.on_ended(slot, epoch, retry) {
                     self.holes.remove(&slot);
@@ -521,6 +572,16 @@ impl ClientActor {
         }
         match decision.action {
             KnockAction::Ignore => return,
+            KnockAction::Stale { started_ms, known_ms } => {
+                if self.stale_logged.is_none_or(|at| at.elapsed() >= STALE_LOG_EVERY) {
+                    self.stale_logged = Some(Instant::now());
+                    log::warn!(
+                        "запрос знакомства отброшен: время запуска клиента {started_ms} меньше запомненного {known_ms} \
+                         (часы клиента отстают или это запоздалый запрос прошлого экземпляра); сброс — после {CLIENT_SILENCE:?} тишины"
+                    );
+                }
+                return;
+            }
             KnockAction::Existing => {}
             KnockAction::Spawn { epoch, replace } => {
                 if replace {
@@ -562,6 +623,17 @@ impl ClientActor {
         };
         let task = AbortOnDrop(tokio::spawn(hole.run(client_session)));
         self.holes.insert(slot, ServerHoleRec { epoch, offer: None, _task: task });
+    }
+}
+
+/// Раз в `HEARD_INTERVAL` сообщает актору клиента, когда по дыре был последний пакет пира.
+async fn report_heard(last_seen: Arc<Mutex<Instant>>, messages: mpsc::UnboundedSender<HoleMsg>) {
+    loop {
+        tokio::time::sleep(HEARD_INTERVAL).await;
+        let at = *last_seen.lock().unwrap();
+        if messages.send(HoleMsg::Heard { at }).is_err() {
+            return;
+        }
     }
 }
 
@@ -638,7 +710,8 @@ impl ServerHole {
             },
             _ = self.base.cmd_rx.recv() => return false,
         };
-        self.base.hold(link, std::future::pending()).await;
+        let heard = report_heard(link.last_seen(), self.messages.clone());
+        self.base.hold(link, heard).await;
         drop(port_lease);
         false
     }
@@ -1163,11 +1236,42 @@ mod tests {
         assert!(decision.restarted, "время запуска выросло — клиент перезапущен");
         assert!(matches!(decision.action, KnockAction::Spawn { .. }));
         assert_eq!(core.holes.len(), 1, "прошлые дыры закрыты");
-        assert_eq!(core.knock(1, old, 1_000).action, KnockAction::Ignore, "запоздалый запрос прошлого экземпляра");
+        assert_eq!(
+            core.knock(1, old, 1_000).action,
+            KnockAction::Stale { started_ms: 1_000, known_ms: 2_000 },
+            "запоздалый запрос прошлого экземпляра"
+        );
         // Прошлая версия клиента время запуска не шлёт (0) — на решение это не влияет.
         assert!(matches!(core.knock(5, Uuid::new_v4(), 0).action, KnockAction::Spawn { .. }));
         // Первый запрос вообще — не «перезапуск».
         assert!(!knock_core().knock(1, Uuid::new_v4(), 777).restarted);
+    }
+
+    #[test]
+    fn a_silent_client_is_forgotten_and_may_start_with_an_earlier_clock() {
+        let mut core = knock_core();
+        core.knock(1, Uuid::new_v4(), 5_000);
+        let now = core.heard_at;
+        assert!(!core.reset_if_silent(now + CLIENT_SILENCE), "ровно предел — ещё не молчание");
+        // Пакеты по дырам молчание прерывают.
+        core.heard(now + Duration::from_secs(15));
+        assert!(!core.reset_if_silent(now + Duration::from_secs(30)));
+        assert!(core.reset_if_silent(now + Duration::from_secs(36)));
+        assert!(core.holes.is_empty() && core.client_started == 0);
+        assert!(!core.reset_if_silent(now + Duration::from_secs(60)), "забывать больше нечего");
+        // Клиент вернулся с часами, отстающими от прошлого запуска, — его принимают.
+        let decision = core.knock(1, Uuid::new_v4(), 1_000);
+        assert!(!decision.restarted);
+        assert!(matches!(decision.action, KnockAction::Spawn { .. }));
+    }
+
+    #[test]
+    fn stale_knocks_do_not_keep_a_silent_client_alive() {
+        let mut core = knock_core();
+        core.knock(1, Uuid::new_v4(), 5_000);
+        core.heard_at = Instant::now() - Duration::from_secs(25);
+        assert!(matches!(core.knock(2, Uuid::new_v4(), 1_000).action, KnockAction::Stale { .. }));
+        assert!(core.reset_if_silent(Instant::now()), "отброшенный запрос тишину не прерывает");
     }
 
     #[test]

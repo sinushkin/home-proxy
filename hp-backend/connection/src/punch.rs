@@ -377,6 +377,11 @@ impl PeerLink {
         self.confirmed.load(Ordering::Relaxed)
     }
 
+    /// Когда от пира приходил последний валидный пакет (общий счётчик с задачей приёма).
+    pub(crate) fn last_seen(&self) -> Arc<Mutex<Instant>> {
+        self.last_seen.clone()
+    }
+
     /// Завершается, когда от пира не приходило ни одного валидного пакета
     /// `keepalive_timeout`.
     pub async fn lost(&self) {
