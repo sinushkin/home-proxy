@@ -91,6 +91,11 @@ const PUNCH_WINDOW: Duration = Duration::from_secs(30);
 /// Сколько клиент ждёт, пока дыра откроется (ответ сервера и пробив), прежде чем бросить её и открыть
 /// другую: бывает, что по новой паре портов ответы не доходят.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(12);
+/// Сколько прямых дыр подряд не открылись, чтобы считать прямой путь недоступным: новые дыры идут
+/// через релей (если он разрешён), чтобы набор не вымер, пока доля релейных уже «выполнена».
+const DIRECT_FAIL_LIMIT: u32 = 3;
+/// Пока прямой путь считается недоступным, каждая такая по счёту новая дыра — пробная, напрямую.
+const DIRECT_PROBE_EVERY: u32 = 4;
 
 /// Сколько недавно закрытых номеров дыр помнит актор клиента (запоздалый запрос их не воскресит).
 const CLOSED_MEMORY: usize = 256;
@@ -800,6 +805,8 @@ pub(crate) async fn start_client(label: &crate::label::Label, config: ClientConf
         hole_age: config.hole_age,
         relay: config.relay,
         next_relay: 0,
+        direct_fails: 0,
+        opens: 0,
         blacklist: paths::Blacklist::default(),
         last_check: Instant::now(),
         holes: HashMap::new(),
@@ -839,6 +846,10 @@ struct Manager {
     relay: watch::Receiver<Option<crate::multilink::RelayGrant>>,
     /// Какой релей из списка следующий (по кругу).
     next_relay: usize,
+    /// Подряд не открывшихся прямых дыр (сбрасывается, когда живёт прямая дыра, прошедшая `OPEN_TIMEOUT`).
+    direct_fails: u32,
+    /// Сколько дыр открыто (для пробных прямых дыр при недоступном прямом пути).
+    opens: u32,
     /// Пути (напрямую, через релей) с потерями вдвое выше лучшего: новых дыр на них не открываем.
     blacklist: paths::Blacklist,
     last_check: Instant,
@@ -857,11 +868,30 @@ impl Manager {
             tokio::select! {
                 _ = ticker.tick() => self.evaluate(),
                 Some(slot) = ended.recv() => {
-                    self.holes.remove(&slot);
+                    if let Some(rec) = self.holes.remove(&slot) {
+                        self.note_end(&rec);
+                    }
                     // Не ждём очередного тика: замена нужна сразу, если дыр не хватает.
                     self.evaluate();
                 }
             }
+        }
+    }
+
+    /// Дыра закончилась: прямая, прожившая меньше `OPEN_TIMEOUT`, — не открылась (старые дыры
+    /// сливаются по возрасту/потерям и живут минуты).
+    fn note_end(&mut self, rec: &HoleRec) {
+        if rec.via_relay || rec.opened.elapsed() >= OPEN_TIMEOUT + Duration::from_secs(2) {
+            return;
+        }
+        self.direct_fails = self.direct_fails.saturating_add(1);
+        if self.direct_fails == DIRECT_FAIL_LIMIT {
+            log::info!(
+                "{}прямой путь не открывается {} раз подряд — новые дыры через релей, каждая {}-я пробная напрямую",
+                self.factory.label,
+                DIRECT_FAIL_LIMIT,
+                DIRECT_PROBE_EVERY
+            );
         }
     }
 
@@ -932,13 +962,33 @@ impl Manager {
         // Чёрный список: сервер напрямую плохой — все новые дыры через релеи; релей плохой — мимо
         // него; плохо всё — список не действует.
         let (direct_ok, relays_ok) = self.blacklist.allowed(&relays, now);
+        // Прямая дыра, прожившая дольше `OPEN_TIMEOUT`, открылась: прямой путь жив.
+        if self.holes.values().any(|h| !h.via_relay && now.duration_since(h.opened) > OPEN_TIMEOUT + Duration::from_secs(2)) {
+            if self.direct_fails >= DIRECT_FAIL_LIMIT {
+                log::info!("{}прямой путь снова открывает дыры", self.factory.label);
+            }
+            self.direct_fails = 0;
+        }
+        self.opens = self.opens.wrapping_add(1);
+        let direct_failing = self.direct_fails >= DIRECT_FAIL_LIMIT;
+        let probe = direct_failing && self.opens % DIRECT_PROBE_EVERY == 0;
+        let by_share = relay_wanted(share, relayed, self.holes.len());
         let relay = if relays_ok.is_empty() {
             None
-        } else if !direct_ok || relay_wanted(share, relayed, self.holes.len()) {
+        } else if !direct_ok || (direct_failing && !probe) || by_share {
             Some(relays_ok[self.next_relay % relays_ok.len()])
         } else {
             None
         };
+        log::debug!(
+            "{}дыра {id}: путь {} (в наборе {} из них релейных {relayed}, доля {share}%, по доле релей {by_share}, релеев разрешено {} годных {}, прямой годен {direct_ok}, прямых неудач подряд {}, пробная {probe})",
+            self.factory.label,
+            relay.map_or_else(|| "напрямую".to_string(), |r| format!("релей {r}")),
+            self.holes.len(),
+            relays.len(),
+            relays_ok.len(),
+            self.direct_fails,
+        );
         if relay.is_some() {
             self.next_relay = self.next_relay.wrapping_add(1);
         }
