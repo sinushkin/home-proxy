@@ -9,6 +9,6 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
-# Телефон работает только в P2P-режиме.
-connection = { path = "../connection", default-features = false, features = ["p2p"] }
+# Два режима: P2P к роутеру/ПК (`p2p`) и клиент VPS-сервера с релеями (`vps`).
+connection = { path = "../connection", default-features = false, features = ["p2p", "vps"] }
 hp-tun = { path = "../tun" }

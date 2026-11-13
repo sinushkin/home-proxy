@@ -1,4 +1,6 @@
-//! Клиент телефона: набор из 10 дыр к роутеру (или ПК) и мост TUN ↔ дыры без WireGuard. Это
+//! Клиент телефона: набор из 10 дыр к роутеру (или ПК) и мост TUN ↔ дыры без WireGuard. Режимов
+//! два (`Mode`): «через дом» — P2P к роутеру/ПК (STUN + MQTT), и «VPS» — клиент VPS-сервера с белым
+//! IP (как `vps-client`, в том числе через релеи сервера). Это
 //! ядро библиотеки для Android (`../android-lib`, приложение — `../../android-vpn`), отдельно от
 //! JNI, чтобы его можно было проверять на обычном хосте.
 //!
@@ -10,6 +12,7 @@
 
 pub use connection::multilink::DEFAULT_REORDER_WAIT;
 pub use connection::stun::parse_servers as parse_stun_servers;
+pub use connection::vps::parse_server as parse_vps_server;
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -22,17 +25,28 @@ use connection::proto::AddressKind;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Как телефон находит свой сервер.
+#[derive(Clone)]
+pub enum Mode {
+    /// Через дом: P2P к роутеру или ПК, рандеву по STUN + MQTT.
+    Home {
+        /// Один или несколько STUN-серверов.
+        stun_addrs: Vec<SocketAddr>,
+        mqtt_addr: SocketAddr,
+        /// PEM с CA-сертификатом MQTT-брокера.
+        mqtt_ca_pem: Vec<u8>,
+    },
+    /// VPS-сервер с белым IP (`ip:порт знакомства`); сервер сам разрешает релеи.
+    Vps { server: SocketAddr },
+}
+
 /// Настройки клиента.
 #[derive(Clone)]
 pub struct ClientConfig {
-    /// Один или несколько STUN-серверов.
-    pub stun_addrs: Vec<SocketAddr>,
-    pub mqtt_addr: SocketAddr,
-    /// PEM с CA-сертификатом MQTT-брокера.
-    pub mqtt_ca_pem: Vec<u8>,
+    pub mode: Mode,
     /// GUID телефона.
     pub my_id: Uuid,
-    /// GUID роутера или ПК, которого ищем (набор дыр «к этому телефону»).
+    /// GUID роутера или ПК (режим «через дом») либо VPS-сервера, к которому идём.
     pub peer_id: Uuid,
     /// Сколько миллисекунд ждать недостающий TCP-пакет при восстановлении порядка
     /// (0 — не восстанавливать).
@@ -87,10 +101,13 @@ pub struct Client {
 
 impl Client {
     pub async fn start(config: ClientConfig) -> Result<Self> {
-        let discovery = Discovery::StunMqtt {
-            stun_addrs: config.stun_addrs,
-            mqtt_addr: config.mqtt_addr,
-            mqtt_ca_pem: config.mqtt_ca_pem,
+        // Телефон за роутером получает адрес из диапазона телефонов; сам по себе у VPS-сервера —
+        // обычного клиента (`Host`), как `vps-client`.
+        let (discovery, kind) = match config.mode {
+            Mode::Home { stun_addrs, mqtt_addr, mqtt_ca_pem } => {
+                (Discovery::StunMqtt { stun_addrs, mqtt_addr, mqtt_ca_pem }, AddressKind::Phone)
+            }
+            Mode::Vps { server } => (Discovery::VpsClient { server }, AddressKind::Host),
         };
         let options = MultiLinkOptions {
             reorder_wait: std::time::Duration::from_millis(u64::from(config.reorder_wait_ms)),
@@ -102,7 +119,7 @@ impl Client {
         let attached = Arc::new(Mutex::new(None));
         tokio::spawn(switch(incoming, attached.clone()));
         let address = Arc::new(Mutex::new(None));
-        tokio::spawn(obtain_address(multilink.clone(), address.clone()));
+        tokio::spawn(obtain_address(multilink.clone(), address.clone(), kind));
         log::info!("клиент запущен: дыры к {}", connection::auth::peer_name(&config.peer_id));
         Ok(Self { multilink, attached, address })
     }
@@ -146,13 +163,13 @@ impl Client {
 
 /// Просит адрес у сервера, запоминает его и дальше повторяет запрос раз в полминуты (сервер после
 /// перезапуска восстановит по нему маршрут; адрес выдастся тот же).
-async fn obtain_address(link: Arc<MultiLink>, address: Arc<Mutex<Option<hp_tun::bridge::Assigned>>>) {
+async fn obtain_address(link: Arc<MultiLink>, address: Arc<Mutex<Option<hp_tun::bridge::Assigned>>>, kind: AddressKind) {
     let Some(control) = link.take_control() else { return };
     // Данные читает `switch`; сюда — пустой канал, живой, пока ждём.
     let (_keep, mut no_data) = mpsc::channel::<Incoming>(1);
-    let (assigned, _control) = hp_tun::bridge::request_address(&link, control, &mut no_data, AddressKind::Phone).await;
+    let (assigned, _control) = hp_tun::bridge::request_address(&link, control, &mut no_data, kind).await;
     *address.lock().unwrap() = Some(assigned);
-    let _ = hp_tun::bridge::spawn_address_refresh(link, AddressKind::Phone, None).await;
+    let _ = hp_tun::bridge::spawn_address_refresh(link, kind, None).await;
 }
 
 /// Пакеты от пира — в текущий мост с TUN; пока TUN нет, отбрасываются.

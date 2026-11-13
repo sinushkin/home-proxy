@@ -20,6 +20,26 @@ class Settings(context: Context) {
         get() = prefs.getString("peerId", "") ?: ""
         set(value) = prefs.edit().putString("peerId", value).apply()
 
+    /**
+     * Режим работы. false — «через дом»: P2P к роутеру или ПК (STUN, MQTT, GUID пира). true — «VPS»:
+     * клиент VPS-сервера с белым IP, дальше сервер сам ведёт долю дыр через свои релеи. Настройки
+     * режимов хранятся отдельно, переключение их не теряет. Мой GUID общий: его надо внести в
+     * `clients.txt` VPS-сервера.
+     */
+    var vpsMode: Boolean
+        get() = prefs.getBoolean("vpsMode", false)
+        set(value) = prefs.edit().putBoolean("vpsMode", value).apply()
+
+    /** VPS-сервер: `ip[:порт знакомства]`. */
+    var vpsServer: String
+        get() = prefs.getString("vpsServer", "") ?: ""
+        set(value) = prefs.edit().putString("vpsServer", value).apply()
+
+    /** GUID VPS-сервера. */
+    var vpsServerId: String
+        get() = prefs.getString("vpsServerId", "") ?: ""
+        set(value) = prefs.edit().putString("vpsServerId", value).apply()
+
 
     /** GUID телефона: создаётся при первом запуске и дальше не меняется. */
     var myId: String
@@ -49,6 +69,7 @@ class Settings(context: Context) {
      * Принимает настройки из intent (для проверки из adb):
      * `am start -n ru.homeproxy/.MainActivity --es stun ip:порт --es mqtt ip:порт
      * --es peerId GUID [--es myId GUID]
+     * [--ez vpsMode true --es vpsServer ip[:порт] --es vpsServerId GUID]
      * [--ei reorderMs 30] [--ei dataHoles 1] --ez autostart true [--ez vpn true]`.
      */
     fun applyExtras(intent: android.content.Intent) {
@@ -56,6 +77,9 @@ class Settings(context: Context) {
         intent.getStringExtra("mqtt")?.let { mqtt = it }
         intent.getStringExtra("peerId")?.let { peerId = it }
         intent.getStringExtra("myId")?.let { myId = it }
+        if (intent.hasExtra("vpsMode")) vpsMode = intent.getBooleanExtra("vpsMode", false)
+        intent.getStringExtra("vpsServer")?.let { vpsServer = it }
+        intent.getStringExtra("vpsServerId")?.let { vpsServerId = it }
         if (intent.hasExtra("reorderMs")) reorderMs = intent.getIntExtra("reorderMs", DEFAULT_REORDER_MS)
         if (intent.hasExtra("dataHoles")) dataHoles = intent.getIntExtra("dataHoles", 0)
     }
@@ -68,10 +92,17 @@ class Settings(context: Context) {
         get() = prefs.getInt("dataHoles", 0)
         set(value) = prefs.edit().putInt("dataHoles", value).apply()
 
-    fun toConfig() = HomeProxy.Config(
-        stun = stun, mqtt = mqtt, caPem = caPem(), myId = myId, peerId = peerId,
-        reorderMs = reorderMs, dataHoles = dataHoles,
-    )
+    fun toConfig() = if (vpsMode) {
+        HomeProxy.Config(
+            vps = vpsServer, stun = "", mqtt = "", caPem = "", myId = myId, peerId = vpsServerId,
+            reorderMs = reorderMs, dataHoles = dataHoles,
+        )
+    } else {
+        HomeProxy.Config(
+            vps = "", stun = stun, mqtt = mqtt, caPem = caPem(), myId = myId, peerId = peerId,
+            reorderMs = reorderMs, dataHoles = dataHoles,
+        )
+    }
 
     companion object {
         // Предел буфера порядка (connection::reorder::MAX_WAIT) — не адаптивное начальное

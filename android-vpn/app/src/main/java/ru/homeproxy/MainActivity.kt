@@ -29,6 +29,11 @@ class MainActivity : Activity() {
     private lateinit var stun: EditText
     private lateinit var mqtt: EditText
     private lateinit var peerId: EditText
+    private lateinit var vpsServer: EditText
+    private lateinit var vpsServerId: EditText
+    private lateinit var modeButton: Button
+    private lateinit var homeGroup: LinearLayout
+    private lateinit var vpsGroup: LinearLayout
     private lateinit var status: TextView
     private lateinit var connectButton: Button
     private lateinit var vpnOnButton: Button
@@ -60,11 +65,16 @@ class MainActivity : Activity() {
             setTextIsSelectable(true)
         }
         column.addView(myIdView)
-        stun = field(column, "STUN (ip:порт)", settings.stun)
-        mqtt = field(column, "MQTT, TLS (ip:порт)", settings.mqtt)
-        peerId = field(column, "GUID пира (ПК или роутера)", settings.peerId)
-
-        button(column, "Сканировать QR (сопряжение)") { scanQr() }
+        modeButton = button(column, "") { toggleMode() }
+        homeGroup = group(column)
+        stun = field(homeGroup, "STUN (ip:порт)", settings.stun)
+        mqtt = field(homeGroup, "MQTT, TLS (ip:порт)", settings.mqtt)
+        peerId = field(homeGroup, "GUID пира (ПК или роутера)", settings.peerId)
+        button(homeGroup, "Сканировать QR (сопряжение)") { scanQr() }
+        vpsGroup = group(column)
+        vpsServer = field(vpsGroup, "VPS-сервер (ip[:порт знакомства])", settings.vpsServer)
+        vpsServerId = field(vpsGroup, "GUID VPS-сервера (мой GUID — в clients.txt сервера)", settings.vpsServerId)
+        showMode()
         connectButton = button(column, "1. Подключить (дыры и keep-alive)") { connect() }
         vpnOnButton = button(column, "2. Включить VPN") { startVpn() }
         vpnOffButton = button(column, "Выключить VPN") { VpnController.stop(applicationContext) }
@@ -154,7 +164,29 @@ class MainActivity : Activity() {
         vpnOffButton.isEnabled = VpnController.isUp
     }
 
+    private fun group(parent: LinearLayout) =
+        LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }.also { parent.addView(it) }
+
+    /** Показывает поля текущего режима и подпись кнопки переключения. */
+    private fun showMode() {
+        val vps = settings.vpsMode
+        homeGroup.visibility = if (vps) android.view.View.GONE else android.view.View.VISIBLE
+        vpsGroup.visibility = if (vps) android.view.View.VISIBLE else android.view.View.GONE
+        modeButton.text = if (vps) "Режим: VPS (+ релей). Переключить на «через дом»"
+        else "Режим: через дом (P2P). Переключить на VPS (+ релей)"
+    }
+
+    /** Переключение режима: сначала всё останавливаем, настройки обоих режимов остаются. */
+    private fun toggleMode() {
+        save()
+        stopAll()
+        settings.vpsMode = !settings.vpsMode
+        showMode()
+    }
+
     private fun save() {
+        settings.vpsServer = vpsServer.text.toString().trim()
+        settings.vpsServerId = vpsServerId.text.toString().trim()
         settings.stun = stun.text.toString().trim()
         settings.mqtt = mqtt.text.toString().trim()
         settings.peerId = peerId.text.toString().trim()

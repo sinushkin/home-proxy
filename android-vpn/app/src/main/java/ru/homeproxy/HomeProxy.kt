@@ -4,7 +4,7 @@ package ru.homeproxy
  * Обёртка над libhomeproxy.so (Rust, hp-backend/android-lib). Имена native-методов
  * связаны с именем пакета: Java_ru_homeproxy_HomeProxy_*.
  *
- * Клиент держит 10 UDP-дыр к роутеру (или ПК). VPN — свой: дескриптор TUN от
+ * Клиент держит 10 UDP-дыр к роутеру (или ПК) либо к VPS-серверу (режим VPS, «обычный + релей»). VPN — свой: дескриптор TUN от
  * [HpVpnService] отдаётся клиенту, IP-пакеты идут по дырам как есть, без WireGuard.
  */
 object HomeProxy {
@@ -13,7 +13,7 @@ object HomeProxy {
     }
 
     @JvmStatic private external fun nativeStart(
-        stun: String, mqtt: String, caPem: String, myId: String, peerId: String,
+        vps: String, stun: String, mqtt: String, caPem: String, myId: String, peerId: String,
         reorderMs: Int, dataHoles: Int,
     ): String?
 
@@ -27,7 +27,8 @@ object HomeProxy {
 
     /** Запускает клиента. Возвращает null при успехе, иначе текст ошибки. */
     fun start(config: Config): String? = nativeStart(
-        config.stun, config.mqtt, config.caPem, config.myId, config.peerId, config.reorderMs, config.dataHoles,
+        config.vps, config.stun, config.mqtt, config.caPem, config.myId, config.peerId,
+        config.reorderMs, config.dataHoles,
     )
 
     fun stop() = nativeStop()
@@ -62,13 +63,15 @@ object HomeProxy {
     fun liveHoles(): Int = nativeLiveHoles()
 
     data class Config(
+        /** `ip[:порт]` VPS-сервера: непустой — режим VPS (с релеями сервера), STUN/MQTT/CA не нужны. */
+        val vps: String,
         val stun: String,
         val mqtt: String,
         /** PEM с CA-сертификатом MQTT-брокера. */
         val caPem: String,
         /** GUID телефона. */
         val myId: String,
-        /** GUID роутера или ПК (набор дыр «к этому телефону»). */
+        /** GUID роутера или ПК (режим «через дом»), либо VPS-сервера (режим VPS). */
         val peerId: String,
         /** Сколько мс ждать недостающий TCP-пакет при восстановлении порядка (0 — не восстанавливать). */
         val reorderMs: Int,

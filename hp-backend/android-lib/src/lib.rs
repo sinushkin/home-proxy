@@ -14,7 +14,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Mutex, Once};
 
 use anyhow::{Context, Result};
-use hp_client::{Client, ClientConfig};
+use hp_client::{Client, ClientConfig, Mode};
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
@@ -41,24 +41,35 @@ fn init_logging() {
     });
 }
 
-/// Разбирает настройки из строк, пришедших из Kotlin.
+/// Разбирает настройки из строк, пришедших из Kotlin. Непустой `vps` (`ip[:порт]`) — режим VPS
+/// (STUN, MQTT и CA не нужны и не разбираются), иначе — «через дом».
 fn parse_config(
+    vps: &str,
     stun: &str,
     mqtt: &str,
     ca_pem: &str,
     my_id: &str,
     peer_id: &str,
 ) -> Result<ClientConfig> {
-    anyhow::ensure!(
-        ca_pem.contains("-----BEGIN CERTIFICATE-----"),
-        "CA-сертификат брокера не похож на PEM"
-    );
+    let (mode, peer_what) = if vps.trim().is_empty() {
+        anyhow::ensure!(
+            ca_pem.contains("-----BEGIN CERTIFICATE-----"),
+            "CA-сертификат брокера не похож на PEM"
+        );
+        let mode = Mode::Home {
+            stun_addrs: hp_client::parse_stun_servers(stun)?,
+            mqtt_addr: mqtt.trim().parse::<SocketAddr>().context("MQTT: ожидается ip:порт")?,
+            mqtt_ca_pem: ca_pem.as_bytes().to_vec(),
+        };
+        (mode, "GUID роутера некорректен")
+    } else {
+        let server = hp_client::parse_vps_server(vps.trim()).context("VPS-сервер: ожидается ip или ip:порт")?;
+        (Mode::Vps { server }, "GUID VPS-сервера некорректен")
+    };
     Ok(ClientConfig {
-        stun_addrs: hp_client::parse_stun_servers(stun)?,
-        mqtt_addr: mqtt.trim().parse::<SocketAddr>().context("MQTT: ожидается ip:порт")?,
-        mqtt_ca_pem: ca_pem.as_bytes().to_vec(),
+        mode,
         my_id: my_id.trim().parse::<Uuid>().context("мой GUID некорректен")?,
-        peer_id: peer_id.trim().parse::<Uuid>().context("GUID роутера некорректен")?,
+        peer_id: peer_id.trim().parse::<Uuid>().context(peer_what)?,
         reorder_wait_ms: hp_client::DEFAULT_REORDER_WAIT.as_millis() as u32,
         data_holes: 0,
     })
@@ -168,12 +179,14 @@ fn to_jstring(env: &mut JNIEnv, text: &str) -> jstring {
     env.new_string(text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
-/// `HomeProxy.nativeStart(stun, mqtt, caPem, myId, peerId, reorderMs, dataHoles): String?`
+/// `HomeProxy.nativeStart(vps, stun, mqtt, caPem, myId, peerId, reorderMs, dataHoles): String?`
+/// `vps` — `ip[:порт]` VPS-сервера (режим VPS), пусто — режим «через дом» (STUN/MQTT).
 /// Возвращает null при успехе, иначе текст ошибки.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeStart<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
+    vps: JString<'local>,
     stun: JString<'local>,
     mqtt: JString<'local>,
     ca_pem: JString<'local>,
@@ -187,6 +200,7 @@ pub extern "system" fn Java_ru_homeproxy_HomeProxy_nativeStart<'local>(
         |message| Err(anyhow::anyhow!(message)),
         || {
             let mut config = parse_config(
+                &read(&mut env, &vps)?,
                 &read(&mut env, &stun)?,
                 &read(&mut env, &mqtt)?,
                 &read(&mut env, &ca_pem)?,
@@ -294,20 +308,35 @@ mod tests {
 
     #[test]
     fn valid_settings_parse_and_trim() {
-        let config = parse_config(" 1.2.3.4:3478 , 5.6.7.8:19302", "1.2.3.4:8883\n", CA, &format!(" {A}"), B).unwrap();
-        assert_eq!(config.stun_addrs.len(), 2);
-        assert_eq!(config.stun_addrs[0].to_string(), "1.2.3.4:3478");
+        let config = parse_config("", " 1.2.3.4:3478 , 5.6.7.8:19302", "1.2.3.4:8883\n", CA, &format!(" {A}"), B).unwrap();
+        let Mode::Home { stun_addrs, .. } = &config.mode else { panic!("ожидался режим «через дом»") };
+        assert_eq!(stun_addrs.len(), 2);
+        assert_eq!(stun_addrs[0].to_string(), "1.2.3.4:3478");
         assert_eq!(config.my_id.to_string(), A);
+    }
+
+    #[test]
+    fn vps_mode_needs_only_the_server_and_both_guids() {
+        let config = parse_config(" 203.0.113.10:40600 ", "", "", "", A, B).unwrap();
+        let Mode::Vps { server } = config.mode else { panic!("ожидался режим VPS") };
+        assert_eq!(server.to_string(), "203.0.113.10:40600");
+        let config = parse_config("203.0.113.10", "", "", "", A, B).unwrap();
+        let Mode::Vps { server } = config.mode else { panic!("ожидался режим VPS") };
+        assert_eq!(server.port(), 40000, "порт знакомства по умолчанию");
+        let error = format!("{:#}", parse_config("не адрес", "", "", "", A, B).err().expect("должна быть ошибка"));
+        assert!(error.contains("VPS-сервер"), "{error}");
+        let error = format!("{:#}", parse_config("203.0.113.10", "", "", "", A, "x").err().expect("должна быть ошибка"));
+        assert!(error.contains("GUID VPS-сервера"), "{error}");
     }
 
     #[test]
     fn each_bad_field_is_named_in_the_error() {
         let cases = [
-            (parse_config("nope", "1.2.3.4:1", CA, A, B), "STUN"),
-            (parse_config("1.2.3.4:1", "1.2.3.4", CA, A, B), "MQTT"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", "text", A, B), "CA"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, "x", B), "мой GUID"),
-            (parse_config("1.2.3.4:1", "1.2.3.4:1", CA, A, "x"), "GUID роутера"),
+            (parse_config("", "nope", "1.2.3.4:1", CA, A, B), "STUN"),
+            (parse_config("", "1.2.3.4:1", "1.2.3.4", CA, A, B), "MQTT"),
+            (parse_config("", "1.2.3.4:1", "1.2.3.4:1", "text", A, B), "CA"),
+            (parse_config("", "1.2.3.4:1", "1.2.3.4:1", CA, "x", B), "мой GUID"),
+            (parse_config("", "1.2.3.4:1", "1.2.3.4:1", CA, A, "x"), "GUID роутера"),
         ];
         for (result, expected) in cases {
             let error = format!("{:#}", result.err().expect("должна быть ошибка"));
