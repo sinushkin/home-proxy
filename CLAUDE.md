@@ -228,12 +228,14 @@ github.com/sinushkin/home-proxy. Всё, что попадает в git, вид�
       каталоги под фичами Cargo: `p2p/` (фича `p2p`: `mod.rs`, `mqtt.rs`, `stun.rs`; тянет `rumqttc`)
       и `vps/` (фича `vps`); обе включены по умолчанию. `discovery.rs` — тонкий слой с `Discovery` и
       `MultiLink::start_discovery`/`start`/`start_with`, собирающий настройки режима. `vps-client`
-      подключает только `vps` (без MQTT/TLS: на MIPS 1,4 МБ вместо 2,2), клиент телефона — только
-      `p2p`. Внимание: при сборке нескольких пакетов одной командой `cargo` объединяет фичи — клиент
+      подключает только `vps` (без MQTT/TLS: на MIPS 1,4 МБ вместо 2,2), клиент телефона — оба режима
+      (`p2p` + `vps`). Внимание: при сборке нескольких пакетов одной командой `cargo` объединяет фичи — клиент
       роутера собираем отдельно (`PACKAGES=vps-client OpenWRT/build.sh`).
   - `client/` — крейт `hp-client`: клиент телефона (`MultiLink` + мост TUN ↔ дыры,
-    `attach_tun`/`detach_tun`), ядро Android-библиотеки, проверяется на хосте. Раньше тут был
-    UDP-мост для WireGuard на `127.0.0.1`.
+    `attach_tun`/`detach_tun`), ядро Android-библиотеки, проверяется на хосте. Два режима
+    (`Mode`): «через дом» — P2P к роутеру/ПК (STUN + MQTT, адрес `AddressKind::Phone`) и «VPS» —
+    обычный клиент `vps-server` (`Discovery::VpsClient`, адрес `Host`, релеи разрешает сервер;
+    GUID телефона — в `clients.txt` сервера). Раньше тут был UDP-мост для WireGuard на `127.0.0.1`.
   - `android-lib/` — крейт `homeproxy-android`: JNI-обёртка над `hp-client`
     (`libhomeproxy.so`, `Java_ru_homeproxy_HomeProxy_*`); собирается под NDK
     скриптом `android-vpn/build-native.sh`.
