@@ -39,7 +39,87 @@ setup/vps-client-router-vps-server.sh <сервер> <клиент>
 - Проверка: в конце скрипта — не меньше 4 дыр в работе и маршруты; потом `hpctl --connect <строка> status`.
 - Порты: знакомство `40600/udp`, дыры `40601–40699/udp`, туннель `10.94.0.0/24`.
 
-## 1a. Релей vps-relay (второй адрес для части дыр)
+## 1a. Управление клиентом (`hpctl`, трей)
+
+По умолчанию у `vps-client` управление выключено. Включает его `CONTROL_ADDR`: `127.0.0.1:47001`
+(только сама машина) или конкретный адрес LAN (`0.0.0.0` нельзя). Ключ — `control.key` в
+`/etc/vps-client/`, создаётся при первом запросе строки подключения.
+
+**Сразу** — задать при установке клиента:
+
+```bash
+CONTROL_ADDR=127.0.0.1:47001 setup/vps-client.sh <клиент> [сервер]
+```
+
+**Потом** — клиент уже стоит. Либо повторить установку с `CONTROL_ADDR` (GUID и строка в
+`clients.txt` не меняются, конфиг переписывается, служба перезапускается), либо вручную на клиенте:
+
+```bash
+echo 'CONTROL_ADDR=127.0.0.1:47001' >> /etc/vps-client/vps-client.conf
+systemctl restart hp-vps-client        # Linux; на OpenWrt — /etc/init.d/vps-client restart
+```
+
+**Строка подключения и проверка:**
+
+```bash
+# на клиенте (создаёт ключ; --new-connection-string — новый ключ, прежние строки перестают работать)
+vps-client --config /etc/vps-client/vps-client.conf --connection-string
+# на своём ПК: пробросить порт и посмотреть статус (для адреса LAN туннель не нужен)
+ssh -N -L 47001:127.0.0.1:47001 <клиент>
+hpctl --connect 'homeproxy-control://127.0.0.1:47001/<ключ>' status
+```
+
+Та же строка подходит для трея. Строка — секрет. Подробнее — `control/README.md`,
+`vps-client/README.md`.
+
+**Трей на самом клиенте (Linux x86_64 с рабочим столом) — одной командой:**
+
+```bash
+setup/tray.sh <клиент>      # DRY_RUN=1 — только проверки и сборка, на клиенте ничего не меняется
+```
+
+Скрипт собирает `hp-tray` и `hpctl` здесь, копирует их в `~/.local/bin` пользователя ssh, ставит
+user-службу `hp-tray.service` и ярлык автозапуска, добавляет `CONTROL_ADDR=127.0.0.1:47001` в
+`/etc/vps-client/vps-client.conf` (если не задан; `hp-vps-client` при этом перезапускается) и кладёт
+строку подключения в `~/.config/home-proxy/tray.conf`. Туннель не нужен: трей и служба на одной
+машине. Нужны: ssh под пользователем рабочего стола (не root), `sudo` без пароля, поставленный
+`setup/vps-client.sh`. Служба стартует при входе на рабочем столе клиента (по ssh графической сессии
+нет — это не ошибка); без графики пользуйтесь `hpctl` на клиенте. Скрипт доставляет недостающую
+`libxkbcommon-x11-0` (apt-get; `hp-tray` подгружает её через `dlopen`, без неё падает) и кладёт ярлык
+«Home Proxy» (`control/tray/hp-tray.desktop`) на рабочий стол и в меню приложений: он открывает окно
+со статусом. Нужен там, где нет панели со значками трея (например, голый `openbox`: в логе «значок в
+трее недоступен»). Второй экземпляр рядом с фоновой службой работает независимо; ярлык файловый менеджер
+может попросить пометить доверенным.
+
+**Трей на другом ПК (вручную): деплой и запуск как user-service** (Linux, из корня репозитория):
+
+```bash
+cargo build --release -p hp-tray -p hp-control        # hp-tray и hpctl
+install -Dm755 target/release/hp-tray ~/.local/bin/hp-tray
+install -Dm755 target/release/hpctl   ~/.local/bin/hpctl
+install -Dm644 control/tray/hp-tray.service           ~/.config/systemd/user/hp-tray.service
+install -Dm644 control/tray/hp-tray-autostart.desktop ~/.config/autostart/hp-tray.desktop
+systemctl --user daemon-reload
+systemctl --user enable --now hp-tray.service
+
+~/.local/bin/hp-tray --connect '<строка>'   # один раз: строка сохранится в ~/.config/home-proxy/tray.conf
+```
+
+- Служба стартует вместе с графической сессией (`graphical-session.target`) и перезапускается при
+  падении; `--hidden` — только значок. Ярлык автозапуска нужен для сессий без systemd (Plasma с
+  `systemdBoot=false`): он сам запускает `hp-tray.service`.
+- Если трей на этом ПК, клиент удалённый, и в `tray.conf` строка с `127.0.0.1:47001` (так
+  настраивает `setup/tray.sh` для трея на самом клиенте), нужен ssh-туннель
+  `ssh -N -L 47001:127.0.0.1:47001 <клиент>`, пока трей работает: `127.0.0.1` указывает на ту машину,
+  где открыт порт. Туннеля не нужно, если трей стоит на самом клиенте или `CONTROL_ADDR` клиента — его
+  адрес LAN (строка тогда с этим адресом).
+- Ещё одна служба в тот же трей — «Служба…» в окне; убрать — удалить строку из `tray.conf` и
+  `systemctl --user restart hp-tray`.
+- Обновить: снова `install … hp-tray` и `systemctl --user restart hp-tray`. Логи —
+  `journalctl --user -u hp-tray`. Убрать — `systemctl --user disable --now hp-tray` и удалить файлы.
+- Windows — ярлык `hp-tray.exe --hidden` в `shell:startup`.
+
+## 1b. Релей vps-relay (второй адрес для части дыр)
 
 Если путь от сервера к клиентам режется (провайдер или ТСПУ душит трафик с адреса сервера),
 часть дыр клиенты могут вести через релей — ещё одну машину с белым IP, хорошо связанную с сервером

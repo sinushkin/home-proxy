@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Home Proxy
+Comment=Статус vps-client / hp-server: окно со службами, дырами и потерями
+Exec=hp-tray
+Icon=network-vpn
+Terminal=false
+Categories=Network;
