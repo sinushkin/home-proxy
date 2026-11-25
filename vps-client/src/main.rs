@@ -24,6 +24,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -130,8 +131,18 @@ fn print_connection_string(config: Option<&std::path::Path>, new_key: bool) -> R
     Ok(())
 }
 
+/// Просьба включить/выключить VPN от `hpctl`/трея: исполняет главный цикл (маршруты и хуки у него).
+struct VpnCommand {
+    enable: bool,
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 /// Состояние службы для `hpctl` и трея: один «пир» — VPS-сервер.
 struct Control {
+    /// Канал к главному циклу; `None` — `ROUTES=off`, маршрутами управляют вручную, VPN не переключаем.
+    vpn: Option<tokio::sync::mpsc::Sender<VpnCommand>>,
+    /// Весь трафик сейчас идёт в туннель (маршруты /1 стоят).
+    vpn_enabled: Arc<AtomicBool>,
     link: Arc<MultiLink>,
     bridge: Arc<hp_tun::bridge::Bridge>,
     started: Instant,
@@ -203,8 +214,17 @@ impl hp_control::server::Controlled for Control {
             peers: vec![proto::PeerStatus { addresses: vec![self.address.to_string()], ..peer_status(self.server_name.clone(), self.link.status()) }],
             traffic: Some(proto::Traffic { to_peers: u64::from(to_peers), ordered: u64::from(ordered), from_peers: u64::from(from_peers), dropped: u64::from(dropped), ..Default::default() }),
             pairing_supported: false,
+            vpn_supported: self.vpn.is_some(),
+            vpn_enabled: self.vpn_enabled.load(Ordering::Relaxed),
             ..Default::default()
         }
+    }
+
+    async fn set_vpn(&self, enabled: bool) -> Result<()> {
+        let sender = self.vpn.as_ref().context("ROUTES=off: маршрутами управляют вручную, VPN не переключается")?;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        sender.send(VpnCommand { enable: enabled, reply }).await.map_err(|_| anyhow::anyhow!("служба останавливается"))?;
+        answer.await.map_err(|_| anyhow::anyhow!("служба останавливается"))?.map_err(anyhow::Error::msg)
     }
 
     async fn create_pairing(&self) -> Result<proto::Pairing> {
@@ -214,6 +234,24 @@ impl hp_control::server::Controlled for Control {
     fn remove_peer(&self, _name: &str) -> Result<()> {
         anyhow::bail!("vps-client — клиент одного сервера, удалять нечего")
     }
+}
+
+/// VPN как в приложении на телефоне: дыры и keep-alive живут, меняется только то, идёт ли трафик в
+/// туннель (маршруты /1) и DNS (хуки). Порядок как при запуске и остановке службы.
+async fn set_vpn(routes: &mut Routes, hooks: &Hooks, enabled_now: &AtomicBool, enable: bool) -> Result<()> {
+    if enabled_now.load(Ordering::Relaxed) == enable {
+        return Ok(());
+    }
+    if enable {
+        routes.tunnel_up().await?;
+        hooks.up().await;
+    } else {
+        routes.tunnel_down().await;
+        hooks.down().await;
+    }
+    enabled_now.store(enable, Ordering::Relaxed);
+    log::info!("vps-client: VPN {}", if enable { "включён" } else { "выключен (дыры держатся)" });
+    Ok(())
 }
 
 fn env_path(name: &str, default: &str) -> PathBuf {
@@ -293,12 +331,16 @@ async fn run() -> Result<()> {
 
     let _refresh = hp_tun::bridge::spawn_address_refresh(link.clone(), AddressKind::Host, None);
     let bridge = Arc::new(hp_tun::bridge::Bridge::start(tun, link.clone(), incoming));
+    let vpn_enabled = Arc::new(AtomicBool::new(routes.is_some()));
+    let (vpn_tx, mut vpn_rx) = tokio::sync::mpsc::channel::<VpnCommand>(4);
     if let Some(addr) = control_addr()? {
         let key_file = control_key_file();
         hp_control::load_or_create_key(&key_file)?;
         let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("управление: не удалось занять {addr}"))?;
         log::info!("управление: {addr}; строка подключения — vps-client --connection-string");
         let controlled = Arc::new(Control {
+            vpn: routes.is_some().then(|| vpn_tx.clone()),
+            vpn_enabled: vpn_enabled.clone(),
             link: link.clone(),
             bridge: bridge.clone(),
             started: Instant::now(),
@@ -325,6 +367,13 @@ async fn run() -> Result<()> {
                     }
                 }
             }
+            Some(command) = vpn_rx.recv() => {
+                let result = match routes.as_mut() {
+                    Some(routes) => set_vpn(routes, &hooks, &vpn_enabled, command.enable).await,
+                    None => Err(anyhow::anyhow!("ROUTES=off")),
+                };
+                let _ = command.reply.send(result.map_err(|e| format!("{e:#}")));
+            }
             _ = status.tick() => {
                 let now = (link.live_count(), bridge.stats().snapshot());
                 if Some(now) != last {
@@ -341,10 +390,13 @@ async fn run() -> Result<()> {
             }
             signal = shutdown.wait() => {
                 log::info!("vps-client: остановка ({signal}), снимаю маршруты");
-                if let Some(routes) = routes.as_mut() {
-                    routes.tunnel_down().await;
+                // VPN уже выключен из трея/hpctl — маршруты и DNS сняты, повторно не трогаем.
+                if vpn_enabled.load(Ordering::Relaxed) {
+                    if let Some(routes) = routes.as_mut() {
+                        routes.tunnel_down().await;
+                    }
+                    hooks.down().await;
                 }
-                hooks.down().await;
                 return Ok(());
             }
         }

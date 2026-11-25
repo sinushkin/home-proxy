@@ -18,6 +18,7 @@ message ControlMessage {
     Error error = 13;
     RemovePeer remove_peer = 14;
     Done done = 15;
+    SetVpn set_vpn = 16;
   }
 }
 
@@ -52,6 +53,9 @@ message Status {
   bool pairing_supported = 7;
   // VPS-сервер: релеи vps-relay (приходят к серверу сами; см. connection::vps::relay).
   repeated RelayStatus relays = 8;
+  // Служба умеет включать и выключать туннель (маршруты в TUN и DNS), не трогая дыры: vps-client.
+  bool vpn_supported = 9;
+  bool vpn_enabled = 10;   // весь трафик сейчас идёт в туннель
 }
 
 // Релей VPS-сервера.
@@ -156,6 +160,12 @@ message PairingBundle {
 // Удалить пира по имени (телефон перестанет подключаться, его пара забывается).
 message RemovePeer {
   string name = 1;
+}
+
+// Включить или выключить VPN, как в приложении на телефоне: дыры к серверу остаются (keep-alive
+// идут), снимаются маршруты в TUN и хуки DNS. Ответ — Done или Error.
+message SetVpn {
+  bool enabled = 1;
 }
 
 message Done {}

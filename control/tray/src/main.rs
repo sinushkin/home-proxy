@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hp_control::proto::control_message::Body;
-use hp_control::proto::{CreatePairing, RemovePeer, Status, Subscribe};
+use hp_control::proto::{CreatePairing, RemovePeer, SetVpn, Status, Subscribe};
 use hp_control::Client;
 use slint::ComponentHandle;
 use tokio::sync::watch;
@@ -327,6 +327,32 @@ fn main() -> Result<()> {
                             }
                         }
                         Err(e) => window.set_error(format!("Добавить телефон: {e:#}").into()),
+                    }
+                });
+            });
+        }
+    });
+
+    window.on_set_vpn({
+        let (ui, state, runtime) = (window.as_weak(), state.clone(), runtime.handle().clone());
+        move |enabled| {
+            if let Some(window) = ui.upgrade() {
+                window.set_vpn_busy(true);
+                window.set_error(Default::default());
+            }
+            let target = state.lock().unwrap().services.iter().find(|s| s.status.as_ref().is_some_and(|st| st.vpn_supported)).map(|s| s.conn.clone());
+            let ui = ui.clone();
+            runtime.spawn(async move {
+                let result = async {
+                    let mut client = connect(target).await?;
+                    client.request(Body::SetVpn(SetVpn { enabled })).await
+                }
+                .await;
+                let _ = ui.upgrade_in_event_loop(move |window| {
+                    window.set_vpn_busy(false);
+                    // Новое состояние придёт со следующим статусом (раз в секунду).
+                    if let Err(e) = result {
+                        window.set_error(format!("{} VPN: {e:#}", if enabled { "Запустить" } else { "Остановить" }).into());
                     }
                 });
             });

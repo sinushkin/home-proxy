@@ -258,7 +258,7 @@ fn headline(status: &Status) -> String {
     let real = phones(status);
     if status.service == "vps-client" {
         match status.peers.iter().find(|p| is_vps(p)) {
-            Some(vps) => format!("VPS {}: {}/{} дыр в работе", vps.name, vps.live, vps.target),
+            Some(vps) => format!("VPS {}: {}/{} дыр в работе{}", vps.name, vps.live, vps.target, if status.vpn_supported && !status.vpn_enabled { " · VPN выключен" } else { "" }),
             None => "Нет данных о VPS".to_string(),
         }
     } else if real.is_empty() {
@@ -323,6 +323,10 @@ pub fn render(window: &MainWindow, state: &UiState) {
     window.set_details(live.iter().map(|(s, st)| prefixed(s, details(st))).collect::<Vec<_>>().join("\n").into());
     window.set_traffic(live.iter().map(|(s, st)| prefixed(s, traffic(st))).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n").into());
     window.set_pairing_supported(live.iter().any(|(_, st)| st.pairing_supported));
+    // Кнопка «Запустить/Остановить VPN» — у первой службы, которая это умеет (vps-client).
+    let vpn = live.iter().find(|(_, st)| st.vpn_supported);
+    window.set_vpn_supported(vpn.is_some());
+    window.set_vpn_enabled(vpn.is_some_and(|(_, st)| st.vpn_enabled));
 
     let rows: Vec<PeerRow> = cards(state)
         .into_iter()

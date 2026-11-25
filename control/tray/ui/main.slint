@@ -177,6 +177,11 @@ export component MainWindow inherits Window {
     in property <[PeerRow]> peers;
     in property <bool> pairing-supported: true;
     in property <bool> connected: false;
+    // VPN как в приложении на телефоне: дыры держатся, в туннель идёт трафик или нет (vps-client).
+    in property <bool> vpn-supported: false;
+    in property <bool> vpn-enabled: false;
+    in property <bool> vpn-busy: false;
+    callback set-vpn(bool);
 
     in property <bool> qr-visible: false;
     in property <image> qr-image;
@@ -246,6 +251,12 @@ export component MainWindow inherits Window {
             Button {
                 text: "Служба…";
                 clicked => { root.open-setup(); }
+            }
+            if root.vpn-supported: Button {
+                text: root.vpn-busy ? "…" : root.vpn-enabled ? "Остановить VPN" : "Запустить VPN";
+                primary: !root.vpn-enabled;
+                enabled: root.connected && !root.vpn-busy;
+                clicked => { root.set-vpn(!root.vpn-enabled); }
             }
             Rectangle { horizontal-stretch: 1; }
             // Сопряжение телефонов есть не у каждой службы (у vps-client его нет) — кнопку не показываем.

@@ -4,6 +4,7 @@
 //!   hpctl … events [N]      — последние события дыр по пирам (из памяти службы, по умолчанию 20)
 //!   hpctl … pair            — ссылка сопряжения нового телефона (секрет! для QR: qrencode -t ansiutf8)
 //!   hpctl … remove <имя>    — удалить сопряжённый телефон
+//!   hpctl … vpn on|off      — включить/выключить VPN (vps-client): дыры остаются, маршруты в туннель снимаются
 //!
 //! Строка подключения — `--connect` или переменная `HP_CONTROL`. На той же машине, что и
 //! служба, можно вместо неё указать ключ службы: `--addr ip:порт --key-file control.key`.
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use hp_control::proto::control_message::Body;
-use hp_control::proto::{CreatePairing, GetStatus, RemovePeer};
+use hp_control::proto::{CreatePairing, GetStatus, RemovePeer, SetVpn};
 use hp_control::Client;
 
 fn now_unix_ms() -> u64 {
@@ -61,7 +62,7 @@ fn time_text(unix_ms: u64) -> String {
 }
 
 fn usage() -> ! {
-    eprintln!("использование: hpctl [--connect строка | --addr ip:порт --key-file путь] status | events [N] | pair | remove <имя>");
+    eprintln!("использование: hpctl [--connect строка | --addr ip:порт --key-file путь] status | events [N] | pair | remove <имя> | vpn on|off");
     std::process::exit(2);
 }
 
@@ -92,6 +93,9 @@ async fn main() -> Result<()> {
         ["status"] => {
             let Body::Status(s) = client.request(Body::GetStatus(GetStatus {})).await? else { anyhow::bail!("ждали Status") };
             println!("{} {} · режим {} · дыры через {} · работает {} с", welcome.service, welcome.build, s.mode, if s.bind.is_empty() { "любой адрес" } else { &s.bind }, s.uptime_s);
+            if s.vpn_supported {
+                println!("VPN: {}", if s.vpn_enabled { "включён (весь трафик в туннеле)" } else { "выключен (дыры держатся, трафик идёт мимо туннеля)" });
+            }
             if let Some(t) = s.traffic {
                 println!("пакетов к пирам {} (TCP по порядку {}), от пиров {}, отброшено {}", t.to_peers, t.ordered, t.from_peers, t.dropped);
             }
@@ -141,6 +145,11 @@ async fn main() -> Result<()> {
         ["remove", name] => {
             client.request(Body::RemovePeer(RemovePeer { name: name.to_string() })).await?;
             println!("удалён {name}");
+        }
+        ["vpn", state @ ("on" | "off")] => {
+            let enabled = *state == "on";
+            client.request(Body::SetVpn(SetVpn { enabled })).await?;
+            println!("VPN {}", if enabled { "включён" } else { "выключен" });
         }
         _ => usage(),
     }

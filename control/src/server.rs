@@ -29,6 +29,11 @@ pub trait Controlled: Send + Sync + 'static {
     fn status(&self) -> Status;
     fn create_pairing(&self) -> impl Future<Output = Result<Pairing>> + Send;
     fn remove_peer(&self, name: &str) -> Result<()>;
+    /// Включить или выключить VPN (маршруты в туннель), дыры остаются. По умолчанию служба этого не
+    /// умеет (`Status::vpn_supported` ложно).
+    fn set_vpn(&self, _enabled: bool) -> impl Future<Output = Result<()>> + Send {
+        async { anyhow::bail!("служба не управляет VPN") }
+    }
 }
 
 pub async fn serve<C: Controlled>(listener: TcpListener, key_file: PathBuf, controlled: Arc<C>) {
@@ -114,8 +119,77 @@ async fn connection<C: Controlled>(stream: TcpStream, from: SocketAddr, key: &st
                 Ok(()) => Body::Done(proto::Done {}),
                 Err(e) => Body::Error(proto::Error { message: format!("{e:#}") }),
             },
+            Body::SetVpn(v) => match controlled.set_vpn(v.enabled).await {
+                Ok(()) => Body::Done(proto::Done {}),
+                Err(e) => Body::Error(proto::Error { message: format!("{e:#}") }),
+            },
             _ => Body::Error(proto::Error { message: "запрос не поддерживается".into() }),
         };
         writer.send(&message(reply)).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::proto::SetVpn;
+    use crate::Client;
+
+    /// Служба с VPN-переключателем и служба без него: по умолчанию `set_vpn` отказывает.
+    struct Switch(Option<AtomicBool>);
+
+    impl Controlled for Switch {
+        fn service(&self) -> &'static str {
+            "test"
+        }
+        fn status(&self) -> Status {
+            Status {
+                vpn_supported: self.0.is_some(),
+                vpn_enabled: self.0.as_ref().is_some_and(|v| v.load(Ordering::Relaxed)),
+                ..Default::default()
+            }
+        }
+        async fn create_pairing(&self) -> Result<Pairing> {
+            anyhow::bail!("нет")
+        }
+        fn remove_peer(&self, _name: &str) -> Result<()> {
+            anyhow::bail!("нет")
+        }
+        async fn set_vpn(&self, enabled: bool) -> Result<()> {
+            self.0.as_ref().context("служба не управляет VPN")?.store(enabled, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    async fn start(service: Switch) -> (Client, PathBuf) {
+        let key_file = std::env::temp_dir().join(format!("hp-control-test-{}-{}.key", std::process::id(), crate::new_key().len() + service.0.is_some() as usize));
+        let key = load_or_create_key(&key_file).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, key_file.clone(), Arc::new(service)));
+        let (client, _) = Client::connect(addr, &key).await.unwrap();
+        (client, key_file)
+    }
+
+    #[tokio::test]
+    async fn set_vpn_switches_the_service_and_shows_in_status() {
+        let (mut client, key_file) = start(Switch(Some(AtomicBool::new(true)))).await;
+        let Body::Status(s) = client.request(Body::GetStatus(proto::GetStatus {})).await.unwrap() else { panic!("ждали Status") };
+        assert!(s.vpn_supported && s.vpn_enabled);
+        assert!(matches!(client.request(Body::SetVpn(SetVpn { enabled: false })).await.unwrap(), Body::Done(_)));
+        let Body::Status(s) = client.request(Body::GetStatus(proto::GetStatus {})).await.unwrap() else { panic!("ждали Status") };
+        assert!(s.vpn_supported && !s.vpn_enabled);
+        let _ = std::fs::remove_file(key_file);
+    }
+
+    #[tokio::test]
+    async fn set_vpn_is_refused_by_a_service_without_it() {
+        let (mut client, key_file) = start(Switch(None)).await;
+        let error = client.request(Body::SetVpn(SetVpn { enabled: true })).await.unwrap_err();
+        assert!(format!("{error:#}").contains("не управляет VPN"), "{error:#}");
+        let _ = std::fs::remove_file(key_file);
     }
 }

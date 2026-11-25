@@ -300,6 +300,7 @@ impl<D: PacketDevice> Service<D> {
             traffic: Some(proto::Traffic { to_peers: to_peers.into(), ordered: ordered.into(), from_peers: from_peers.into(), dropped: dropped.into(), ..Default::default() }),
             pairing_supported: self.pairing.is_some(),
             relays: self.relays.get().map(|b| crate::status::relays(b.relays_status())).unwrap_or_default(),
+            ..Default::default()
         }
     }
 }
